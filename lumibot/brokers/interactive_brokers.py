@@ -93,6 +93,7 @@ class InteractiveBrokers(InteractiveBrokersData, Broker):
                 right=broker_position["right"],
                 multiplier=broker_position["multiplier"],
                 currency=broker_position["currency"],
+                cost=broker_position["cost"],
             )
         elif broker_position["asset_type"] == "forex":
             asset = Asset(
