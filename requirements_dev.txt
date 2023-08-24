@@ -1,15 +1,15 @@
-# Include the main project requirements
--r requirements.txt
-
 # Unit Test modules
 pytest
 pytest-mock
 coverage
 
 # Linting modules
-flake8
+ruff
 isort
 
 # Security checkers
 bandit
 safety
+
+# Secret Storage
+python-dotenv

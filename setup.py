@@ -28,14 +28,14 @@ setuptools.setup(
     url="https://github.com/Lumiwealth/lumibot",
     packages=setuptools.find_packages(),
     install_requires=[
-        "polygon==1.1.0",
+        "polygon-api-client",
         "alpaca_trade_api>=2.3.0,<3.0.0",
         "alpha_vantage",
         "ibapi==9.81.1.post1",
         "yfinance>=0.2.18",
         "matplotlib>=3.3.3",
         "quandl",
-        "pandas>=1.4.0,<2.0.0",  # pandas v2 currently causing issues with quant stats (v0.0.59)
+        "pandas>=2.0.0",
         "pandas_datareader",
         "pandas_market_calendars>=4.1.2",
         "plotly",
@@ -49,7 +49,8 @@ setuptools.setup(
         "bcrypt",
         "pytest",
         "scipy==1.10.1", # Newer versions of scipy are currently causing issues
-        "quantstats==0.0.59",
+        "quantstats==0.0.62",
+        "python-dotenv",  # Secret Storage
         "ccxt==3.0.61",
         "termcolor",
         "jsonpickle",
