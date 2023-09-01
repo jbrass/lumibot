@@ -10,12 +10,11 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import quantstats as qs
-from plotly.subplots import make_subplots
-
 # import lumibot.data_sources.alpha_vantage as av
 from lumibot import LUMIBOT_DEFAULT_PYTZ
 from lumibot.entities.asset import Asset
 from lumibot.tools import to_datetime_aware
+from plotly.subplots import make_subplots
 
 from .yahoo_helper import YahooHelper as yh
 
@@ -466,7 +465,7 @@ def plot_returns(
     buys = buys.loc[df_final["side"] == "buy"]
 
     def generate_buysell_plotly_text(row):
-        if row["status"] != "canceled":
+        if row["status"] != "canceled" and row["status"] != "new":
             if row["asset.asset_type"] == "option":
                 return (
                     row["status"]
@@ -494,9 +493,9 @@ def plot_returns(
                     + str(
                         # Round to 2 decimal places and add commas for thousands
                         (
-                            Decimal(row["price"])
-                            * Decimal(row["filled_quantity"])
-                            * Decimal(row["asset.multiplier"])
+                            Decimal(row["price"]) if row["price"] else 0
+                            * Decimal(row["filled_quantity"]) if row["filled_quantity"] else 0
+                            * Decimal(row["asset.multiplier"]) if row["asset.multiplier"] else 1
                         )
                         .quantize(Decimal("0.01"))
                         .__format__(",f")
@@ -524,9 +523,9 @@ def plot_returns(
                     + str(
                         # Round to 2 decimal places and add commas for thousands
                         (
-                            Decimal(row["price"])
-                            * Decimal(row["filled_quantity"])
-                            * Decimal(row["asset.multiplier"])
+                            Decimal(row["price"]) if row["price"] else 0
+                            * Decimal(row["filled_quantity"]) if row["filled_quantity"] else 0
+                            * Decimal(row["asset.multiplier"]) if row["asset.multiplier"] else 1
                         )
                         .quantize(Decimal("0.01"))
                         .__format__(",f")
@@ -713,11 +712,6 @@ def create_tearsheet(
     if df_final["strategy"].sum() == 0:
         logging.error("Not enough data to create a tearsheet, at least 2 days of data are required. Skipping")
         return
-
-    # # If the dataframe is 1 day or shorter, then we can't calculate the stats
-    # if len(df_final) <= 2:
-    #     logging.error("Not enough data to create a tearsheet, at least 2 days of data are required. Skipping")
-    #     return
 
     # TODO: Add the risk free rate, it's currently 0% which is wrong
     qs.reports.html(
