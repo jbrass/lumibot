@@ -19,7 +19,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setuptools.setup(
     name="lumibot",
-    version="2.7.14",
+    version="2.7.15",
     author="Robert Grzesik",
     author_email="rob@lumiwealth.com",
     description="Backtesting and Trading Library, Made by Lumiwealth",
@@ -36,7 +36,7 @@ setuptools.setup(
         "yfinance>=0.2.18",
         "matplotlib>=3.3.3",
         "quandl",
-        "pandas>=2.0.0",
+        "pandas>=2.0.0,<2.1.0",  # 2.1.0 broke pandas_market_calendars, waiting for fix
         "pandas_datareader",
         "pandas_market_calendars>=4.1.2",
         "plotly",
