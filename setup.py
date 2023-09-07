@@ -1,17 +1,11 @@
 import json
+import os
 
 import requests
 import setuptools
 
-
-def increment_version():
-    resp = requests.get("https://pypi.python.org/pypi/lumibot/json")
-    j = json.loads(resp.content)
-    last_version = j["info"]["version"]
-    version_numbers = last_version.split(".")
-    version_numbers[-1] = str(int(version_numbers[-1]) + 1)
-    new_version = ".".join(version_numbers)
-    return new_version
+# Disable aiohttp extensions, used to fix error on Windows with Python 3.11
+os.environ['AIOHTTP_NO_EXTENSIONS'] = '1'
 
 
 with open("README.md", "r", encoding="utf-8") as fh:
@@ -19,7 +13,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setuptools.setup(
     name="lumibot",
-    version="2.7.15",
+    version="2.7.17",
     author="Robert Grzesik",
     author_email="rob@lumiwealth.com",
     description="Backtesting and Trading Library, Made by Lumiwealth",
@@ -38,7 +32,7 @@ setuptools.setup(
         "quandl",
         "pandas>=2.0.0,<2.1.0",  # 2.1.0 broke pandas_market_calendars, waiting for fix
         "pandas_datareader",
-        "pandas_market_calendars>=4.1.2",
+        "pandas_market_calendars<=4.1.4",
         "plotly",
         "flask>=2.2.2",
         "flask-socketio",
