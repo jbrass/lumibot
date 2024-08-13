@@ -4066,12 +4066,12 @@ class Strategy(_Strategy):
 
     def send_account_summary_to_discord(self):
         # Log that we are sending the account summary to Discord
-        self.logger.info("Considering to send account summary to Discord")
+        self.logger.debug("Considering to send account summary to Discord")
 
         # Check if we are in backtesting mode, if so, don't send the message
         if self.is_backtesting:
             # Log that we are not sending the account summary to Discord
-            self.logger.info("Not sending account summary to Discord because we are in backtesting mode")
+            self.logger.debug("Not sending account summary to Discord because we are in backtesting mode")
             return
 
         # Check if last_account_summary_dt has been set, if not, set it to None
@@ -4495,7 +4495,7 @@ class Strategy(_Strategy):
 
         else:
             # Log that we are not sending the account summary to Discord
-            self.logger.info(f"Not sending account summary to Discord because it has not been at least 24 hours since the last account summary. It is currently {now} and the last account summary was at: {self.last_account_summary_dt}, which was {time_since_last_account_summary} ago.")
+            self.logger.debug(f"Not sending account summary to Discord because it has not been at least 24 hours since the last account summary. It is currently {now} and the last account summary was at: {self.last_account_summary_dt}, which was {time_since_last_account_summary} ago.")
 
             # Return False because we should not send the account summary to Discord
             return False
