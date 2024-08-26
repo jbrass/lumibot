@@ -3993,6 +3993,9 @@ class Strategy(_Strategy):
         # Get the current positions
         positions = self.get_positions()
 
+        # Log the positions
+        self.logger.info(f"Positions for send_result_text_to_discord: {positions}")
+
         # Create the positions text
         positions_details_list = []
         for position in positions:
@@ -4009,15 +4012,18 @@ class Strategy(_Strategy):
                 self.logger.info(f"Last price for {position.asset} is not a number: {last_price}")
                 continue
 
-            # Calculate teh value of the position
+            # Calculate the value of the position
             position_value = position.quantity * last_price
 
             # If option, multiply % of portfolio by 100
             if position.asset.asset_type == "option":
                 position_value = position_value * 100
 
-            # Calculate the percent of the portfolio that this position represents
-            percent_of_portfolio = position_value / portfolio_value
+            if position_value > 0 and portfolio_value > 0:
+                # Calculate the percent of the portfolio that this position represents
+                percent_of_portfolio = position_value / portfolio_value
+            else:
+                percent_of_portfolio = 0
 
             # Add the position details to the list
             positions_details_list.append(
@@ -4035,9 +4041,9 @@ class Strategy(_Strategy):
         # Create the positions text
         positions_text = ""
         for position in positions_details_list:
-            # positions_text += f"{position.quantity:,.2f} {position.asset} ({percent_of_portfolio:,.0%})\n"
+            # positions_text += f"{position.quantity:,.2f} {position.asset} (${position.value:,.0f} or {position.percent_of_portfolio:,.0%})\n"
             positions_text += (
-                f"{position['quantity']:,.2f} {position['asset']} ({position['percent_of_portfolio']:,.0%})\n"
+                f"{position['quantity']:,.2f} {position['asset']} (${position['value']:,.0f} or {position['percent_of_portfolio']:,.0%})\n"
             )
 
         # Create a message to send to Discord (round the values to 2 decimal places)
@@ -4449,7 +4455,7 @@ class Strategy(_Strategy):
             # Calculate the return since inception
             return_since_inception = ((portfolio_value / portfolio_value_inception) - 1) * 100
             # Add the return to the results
-            results_text += f"**Since Inception ({inception_date_text}):** {return_since_inception:,.2f}% (${(portfolio_value - portfolio_value_inception):,.2f} change)\n"
+            results_text += f"**Since Inception ({inception_date_text}):** {return_since_inception:,.2f}% (started at ${portfolio_value_inception:,.2f}, now ${portfolio_value - portfolio_value_inception:,.2f} change)\n"
 
             return results_text, stats_df
 

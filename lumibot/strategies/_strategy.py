@@ -29,7 +29,8 @@ from ..credentials import (
     BROKER, 
     POLYGON_API_KEY, 
     DISCORD_WEBHOOK_URL, 
-    DB_CONNECTION_STR
+    DB_CONNECTION_STR,
+    MARKET,
 )
     
 class CustomLoggerAdapter(logging.LoggerAdapter):
@@ -93,7 +94,7 @@ class _Strategy:
         db_connection_str=None,
         strategy_id=None,
         discord_account_summary_footer=None,
-        should_backup_variables_to_database=False,
+        should_backup_variables_to_database=True,
         should_send_summary_to_discord=True,
         save_logfile=False,
         **kwargs,
@@ -231,6 +232,13 @@ class _Strategy:
 
         if self._name is None:
             self._name = self.__class__.__name__
+
+        # If the MARKET env variable is set, use it as the market
+        if MARKET:
+            # Log the market being used
+            colored_message = colored(f"Using market from environment variables: {MARKET}", "green")
+            logger.info(colored_message)
+            self.set_market(MARKET)
 
         # Create an adapter with 'strategy_name' set to the instance's name
         self.logger = CustomLoggerAdapter(logger, {'strategy_name': self._name})
@@ -1027,7 +1035,11 @@ class _Strategy:
         if isinstance(datasource_class, dict):
             optionsource_class = datasource_class["OPTION"]
             datasource_class = datasource_class["STOCK"]
-            use_other_option_source = True
+            # check if optionsource_class and datasource_class are the same type of class
+            if optionsource_class == datasource_class:
+                use_other_option_source = False
+            else:
+                use_other_option_source = True
         else:
             optionsource_class = None
             use_other_option_source = False

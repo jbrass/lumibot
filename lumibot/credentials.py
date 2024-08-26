@@ -55,6 +55,12 @@ else:
 # Name for the strategy to be used in the database
 STRATEGY_NAME = os.environ.get("STRATEGY_NAME")
 
+# Market to be traded
+MARKET = os.environ.get("MARKET")
+
+# Live trading configuration (if applicable)
+LIVE_CONFIG = os.environ.get("LIVE_CONFIG")
+
 # Discord credentials
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 
@@ -90,6 +96,7 @@ THETADATA_CONFIG = {
     "THETADATA_USERNAME": os.environ.get("THETADATA_USERNAME"),
     "THETADATA_PASSWORD": os.environ.get("THETADATA_PASSWORD")
 }
+
 
 ALPACA_CONFIG = {  # Paper trading!
     # Add ALPACA_API_KEY, ALPACA_API_SECRET, and ALPACA_IS_PAPER to your .env file or set them as secrets
@@ -131,8 +138,9 @@ INTERACTIVE_BROKERS_CONFIG = {
     "SOCKET_PORT": int(os.environ.get("INTERACTIVE_BROKERS_PORT")) if os.environ.get("INTERACTIVE_BROKERS_PORT") else None,
     "CLIENT_ID": int(os.environ.get("INTERACTIVE_BROKERS_CLIENT_ID")) if os.environ.get("INTERACTIVE_BROKERS_CLIENT_ID") else None,
     "IP": os.environ.get("INTERACTIVE_BROKERS_IP", "127.0.0.1"),
+    "IB_SUBACCOUNT": os.environ.get("IB_SUBACCOUNT", None)
 }
-
+ 
 if IS_BACKTESTING:
     broker = None
 else:
