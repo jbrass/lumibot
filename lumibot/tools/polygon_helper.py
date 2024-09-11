@@ -116,7 +116,6 @@ def get_price_data_from_polygon(
 
     # Check if we already have data for this asset in the feather file
     cache_file = build_cache_filename(asset, timespan)
-    logging.info(f"Caching data to {cache_file}")
     # Check whether it might be stale because of splits.
     force_cache_update = validate_cache(force_cache_update, asset, cache_file, api_key)
 
