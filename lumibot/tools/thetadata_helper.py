@@ -65,7 +65,7 @@ def get_price_data(
     df_feather = None
     cache_file = build_cache_filename(asset, timespan, datastyle)
     if cache_file.exists():
-        logging.info(f"\nLoading '{datastyle}' pricing data for {asset} / {quote_asset} with '{timespan}' timespan from cache file...")
+        logging.debug(f"\nLoading '{datastyle}' pricing data for {asset} / {quote_asset} with '{timespan}' timespan from cache file...")
         df_feather = load_cache(cache_file)
         if df_feather is not None and not df_feather.empty:
             df_all = df_feather.copy() # Make a copy so we can check the original later for differences
