@@ -45,7 +45,7 @@ class InteractiveBrokersRESTData(DataSource):
 
         # Check if we are running on a server
         running_on_server = config["RUNNING_ON_SERVER"] if config["RUNNING_ON_SERVER"] is not None else ""
-        if running_on_server.lower() == "true":
+        if running_on_server.lower() == "true" or hasattr(self, "api_url") :
             self.running_on_server = True
         else:
             self.running_on_server = False
@@ -53,7 +53,7 @@ class InteractiveBrokersRESTData(DataSource):
         self.start()
 
     def start(self):
-        if not hasattr(self, "api_url") and not self.running_on_server:
+        if not self.running_on_server:
             # Run the Docker image with the specified environment variables and port mapping
             if not subprocess.run(['docker', '--version'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
                 logging.error(colored("Docker is not installed.", "red"))
@@ -83,18 +83,9 @@ class InteractiveBrokersRESTData(DataSource):
             time.sleep(10)
 
         while not self.is_authenticated():
-            logging.info(colored("Not connected to API server yet. Waiting for Interactive Brokers API Portal to start in Docker...", "yellow"))
+            logging.info(colored("Not connected to API server yet. Waiting for Interactive Brokers API Portal to start...", "yellow"))
             logging.info(colored("Waiting for another 10 seconds before checking again...", "yellow"))
             time.sleep(10)
-        
-        # Ensure the Docker process is running
-        docker_ps = subprocess.run(['docker', 'ps', '--filter', 'name=lumibot-client-portal', '--format', '{{.Names}}'], capture_output=True, text=True)
-        if 'lumibot-client-portal' not in docker_ps.stdout:
-            logging.error(colored("Docker container 'lumibot-client-portal' is not running.", "red"))
-            logging.error(colored("Waiting for 5 seconds and retrying...", "red"))
-            time.sleep(5)
-            self.start()
-            return
         
         # Set self.account_id
         if self.account_id is None:
@@ -302,7 +293,7 @@ class InteractiveBrokersRESTData(DataSource):
     
     def stop(self):        
         # Check if the Docker image is already running
-        if hasattr(self, "api_url"):
+        if self.running_on_server:
             return
 
         subprocess.run(['docker', 'rm', '-f', 'lumibot-client-portal'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -404,24 +395,30 @@ class InteractiveBrokersRESTData(DataSource):
         conid = self.get_conid_from_asset(asset=asset)
 
         # Determine the period based on the timestep and length
+        # TODO fix wtvr this is
+        try:
+            timestep_value = int(timestep.split()[0])
+        except ValueError:
+            timestep_value = 1
+
         if "minute" in timestep:
-            period = f"{length * int(timestep.split()[0])}mins"
-            timestep = f"{int(timestep.split()[0])}mins"
+            period = f"{length * timestep_value}mins"
+            timestep = f"{timestep_value}mins"
         elif "hour" in timestep:
-            period = f"{length * int(timestep.split()[0])}h"
-            timestep = f"{int(timestep.split()[0])}h"
+            period = f"{length * timestep_value}h"
+            timestep = f"{timestep_value}h"
         elif "day" in timestep:
-            period = f"{length * int(timestep.split()[0])}d"
-            timestep = f"{int(timestep.split()[0])}d"
+            period = f"{length * timestep_value}d"
+            timestep = f"{timestep_value}d"
         elif "week" in timestep:
-            period = f"{length * int(timestep.split()[0])}w"
-            timestep = f"{int(timestep.split()[0])}w"
+            period = f"{length * timestep_value}w"
+            timestep = f"{timestep_value}w"
         elif "month" in timestep:
-            period = f"{length * int(timestep.split()[0])}m"
-            timestep = f"{int(timestep.split()[0])}m"
+            period = f"{length * timestep_value}m"
+            timestep = f"{timestep_value}m"
         elif "year" in timestep:
-            period = f"{length * int(timestep.split()[0])}y"
-            timestep = f"{int(timestep.split()[0])}y"
+            period = f"{length * timestep_value}y"
+            timestep = f"{timestep_value}y"
         else:
             raise ValueError(f"Unsupported timestep: {timestep}")
 
@@ -442,6 +439,10 @@ class InteractiveBrokersRESTData(DataSource):
         if result and 'error' in result:
             logging.error(colored(f"Error getting historical prices: {result['error']}", "red"))
             raise Exception("Error getting historical prices")
+        
+        if not result or not result['data']:
+            logging.error(colored(f"Failed to get historical prices for {asset.symbol}, result was: {result}", "red"))
+            return None
 
         # Create a DataFrame from the data
         df = pd.DataFrame(result['data'], columns=['t', 'o', 'h', 'l', 'c', 'v'])
@@ -467,7 +468,13 @@ class InteractiveBrokersRESTData(DataSource):
     def get_last_price(self, asset, quote=None, exchange=None) -> float:
         field = "last_price"
         response = self.get_market_snapshot(asset, [field])
-        return response[field]
+        price = response[field]
+
+        # Remove the 'C' prefix if it exists
+        if isinstance(price, str) and price.startswith("C"):
+            price = float(price[1:])
+
+        return price
     
     def get_spread_conid(self, conid):
         url = f'{self.base_url}/iserver/secdef/info?conid={conid}'
