@@ -4596,29 +4596,29 @@ class Strategy(_Strategy):
 
         # Get the current orders
         orders = self.get_orders()
-
-        # Get the current time in New York
-        ny_tz = pytz.timezone("America/New_York")
-        now = datetime.datetime.now(ny_tz)
-
-        LUMIWEALTH_URL = "https://tntc3iftia.execute-api.us-east-1.amazonaws.com/prod/portfolio_events"
+        
+        LUMIWEALTH_URL = "https://listener.lumiwealth.com/portfolio_events"
 
         headers = {
-            "Authorization": f"Bearer {self.lumiwealth_api_key}",
+            "x-api-key": f"{self.lumiwealth_api_key}",
             "Content-Type": "application/json",
         }
 
         # Create the data to send to the cloud
         data = {
+            "data_type": "portfolio_event",
             "portfolio_value": portfolio_value,
             "cash": cash,
             "positions": [position.to_dict() for position in positions],
             "orders": [order.to_dict() for order in orders],
-            "datetime": now.isoformat(),
         }
 
-        # Send the data to the cloud
-        response = requests.post(LUMIWEALTH_URL, headers=headers, json=data)
+        try:
+            # Send the data to the cloud
+             response = requests.post(LUMIWEALTH_URL, headers=headers, json=data)
+        except Exception as e:
+            self.logger.error(f"Failed to send update to the cloud. Error: {e}")
+            return False
 
         # Check if the message was sent successfully
         if response.status_code == 200:
