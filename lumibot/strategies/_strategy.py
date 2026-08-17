@@ -4080,7 +4080,7 @@ class _Strategy:
 
         else:
             # Log that we are not sending the account summary to Discord
-            self.logger.info(f"Not sending account summary to Discord because it has not been at least 24 hours since the last account summary. It is currently {now} and the last account summary was at: {self.last_account_summary_dt}, which was {time_since_last_account_summary} ago.")
+            self.logger.debug(f"Not sending account summary to Discord because it has not been at least 24 hours since the last account summary. It is currently {now} and the last account summary was at: {self.last_account_summary_dt}, which was {time_since_last_account_summary} ago.")
 
             # Return False because we should not send the account summary to Discord
             return False
@@ -4647,7 +4647,7 @@ class _Strategy:
                 self._last_backup_state = current_state
                 self.logger.info("Variables backed up successfully")
             else:
-                self.logger.info("No variables to back up")
+                self.logger.debug("No variables to back up")
 
         except Exception as e:
             self.logger.error(f"Error backing up variables to DB: {e}", exc_info=True)
