@@ -360,6 +360,14 @@ _AGENT_DETAIL_COLUMNS = [
     "memory_state_text",
     "memory_retrieval_ids",
     "warning_messages",
+    "outcome_operation",
+    "outcome_requiredness",
+    "outcome_retryability",
+    "outcome_fallback_used",
+    "outcome_decision_completed",
+    "outcome_broker_state_certainty",
+    "outcome_impact",
+    "outcome_error_category",
     "event_input_tokens",
     "event_output_tokens",
     "event_total_tokens",
@@ -437,6 +445,53 @@ def _unwrap_tool_payload(payload: Any) -> Any:
     if isinstance(payload, dict) and set(payload.keys()) == {"payload"} and isinstance(payload.get("payload"), dict):
         return payload["payload"]
     return payload
+
+
+def _structured_operation_outcomes(result: AgentRunResult) -> list[dict[str, Any]]:
+    """Return runtime-authored operation outcomes without interpreting log text."""
+
+    outcomes: list[dict[str, Any]] = []
+    primary: dict[str, Any] = {}
+    if isinstance(result.payload, dict):
+        primary_candidate = result.payload.get("execution_outcome")
+        primary = primary_candidate if isinstance(primary_candidate, dict) else {}
+        if isinstance(primary, dict) and primary.get("operation"):
+            outcomes.append(primary)
+    for event in result.tool_results:
+        payload = _unwrap_tool_payload(event.payload)
+        if not isinstance(payload, dict):
+            continue
+        outcome = payload.get("execution_outcome")
+        if isinstance(outcome, dict) and outcome.get("operation"):
+            outcomes.append(outcome)
+        elif payload.get("tool_error") is True:
+            error = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+            outcomes.append(
+                {
+                    "operation": f"tool:{event.tool_name or 'unknown'}",
+                    "requiredness": "optional",
+                    "retryability": "unknown",
+                    "fallback_used": True,
+                    "decision_completed": primary.get("decision_completed") is True,
+                    "broker_state_certainty": "not_observed",
+                    "impact": "optional_component_failed",
+                    "error_category": error.get("type") or "ToolError",
+                }
+            )
+        else:
+            outcomes.append(
+                {
+                    "operation": f"tool:{event.tool_name or 'unknown'}",
+                    "requiredness": "optional",
+                    "retryability": "not_applicable",
+                    "fallback_used": False,
+                    "decision_completed": primary.get("decision_completed") is True,
+                    "broker_state_certainty": "not_observed",
+                    "impact": "completed",
+                    "error_category": None,
+                }
+            )
+    return outcomes
 
 
 def _sanitize_csv_text(value: Any) -> str:
@@ -576,6 +631,37 @@ def _runtime_timing_payload(result: AgentRunResult) -> dict[str, Any]:
     }
 
 
+def _managed_ai_execution_outcome(
+    *,
+    required_for_decision: bool,
+    decision_completed: bool,
+    error_category: str | None = None,
+    fallback_used: bool = False,
+) -> dict[str, Any]:
+    return {
+        "operation": "managed_ai_inference",
+        "requiredness": "decision_critical" if required_for_decision else "optional",
+        "retryability": (
+            "retryable"
+            if error_category in {"transient", "unknown"}
+            else "non_retryable"
+            if error_category
+            else "not_applicable"
+        ),
+        "fallback_used": bool(fallback_used),
+        "decision_completed": bool(decision_completed),
+        "broker_state_certainty": "not_observed",
+        "impact": (
+            "completed"
+            if decision_completed
+            else "decision_blocked"
+            if required_for_decision
+            else "optional_component_failed"
+        ),
+        "error_category": error_category,
+    }
+
+
 def _iter_timestamp_candidates(value: Any, *, path: str = "payload", hinted: bool = False):
     if isinstance(value, dict):
         for key, item in value.items():
@@ -624,11 +710,13 @@ def _provider_prompt_cache_key(
     model: str,
     effective_system_prompt: str,
     bound_tools: list[BoundTool],
+    builtin_skill_fingerprint: str | None,
 ) -> str:
     payload = {
         "agent": agent_name,
         "model": model,
         "effective_system_prompt": effective_system_prompt,
+        "builtin_skill_fingerprint": builtin_skill_fingerprint,
         "tool_surface": [
             {
                 "name": tool.name,
@@ -656,6 +744,8 @@ class AgentHandle:
         runtime: Any | None = None,
         allow_trading: bool = True,
         include_builtin_tools: bool = True,
+        include_builtin_skills: bool = True,
+        rules_path: str | Path | None = None,
         model_request_timeout_seconds: float | None = None,
         run_timeout_seconds: float | None = None,
     ) -> None:
@@ -666,6 +756,8 @@ class AgentHandle:
         self.allow_trading = bool(allow_trading)
         self.model_request_timeout_seconds = model_request_timeout_seconds
         self.run_timeout_seconds = run_timeout_seconds
+        self.include_builtin_skills = bool(include_builtin_skills)
+        self.rules_path = rules_path
         from .builtins import BuiltinTools
         builtin_tools = self._filter_tools_for_trading_permission(BuiltinTools.all())
         if tools is None:
@@ -769,6 +861,9 @@ class AgentHandle:
     def _runtime_context(self) -> dict[str, Any]:
         strategy = self.manager.strategy
         current_dt = _current_strategy_datetime(strategy)
+        from .rules import load_strategy_rules
+
+        strategy_rules = load_strategy_rules(strategy, self.rules_path)
         return {
             "agent_name": self.name,
             "mode": self._runtime_mode(),
@@ -780,6 +875,7 @@ class AgentHandle:
             "account": self._serialize_account_state(),
             "recent_orders": self._serialize_orders(),
             "recent_trades": _serialize_recent_trade_events(strategy),
+            "strategy_rules": strategy_rules.runtime_context(),
         }
 
     def _base_system_prompt(self, runtime_context: dict[str, Any]) -> str:
@@ -840,6 +936,11 @@ class AgentHandle:
             "When you have access to external MCP tools, explore what they offer and use them. You do not need to be told which specific tool to call.",
             "Finish every run with a short summary sentence starting with RESULT: that explains what you did and why.",
         ]
+        if self.include_builtin_skills:
+            lines.insert(
+                -1,
+                "Asset-class skills are available through list_skills, load_skill, and load_skill_resource. Before researching, selecting, opening, modifying, closing, or managing any stock, ETF, or option position or related pending order, you MUST load the matching skill and follow it. If a broad mandate leads you to consider an asset class later, load its skill at that point before acting on the asset. Skill loading supplies knowledge; it does not choose a trade or override active strategy rules.",
+            )
         if mode == "backtesting":
             lines.extend(
                 [
@@ -875,12 +976,21 @@ class AgentHandle:
         return "\n".join(lines).strip()
 
     def _compose_system_prompt(self, runtime_context: dict[str, Any]) -> str:
+        strategy_rules = runtime_context.get("strategy_rules") or {
+            "document": {"version": 1, "rules": []},
+            "content_hash": None,
+            "source": "missing",
+            "file_name": None,
+        }
         return "\n\n".join(
             [
                 self._base_system_prompt(runtime_context),
                 "USER SYSTEM PROMPT:",
-                "Treat this as the strategy-specific trading objective. It may override the default investor style, but not hard safety, broker, or look-ahead-bias rules.",
+                "Treat this as the strategy-specific trading objective. It may override the default investor style, but not hard safety, broker, look-ahead-bias, or active strategy rules.",
                 self.system_prompt.strip(),
+                "ACTIVE STRATEGY RULES JSON:",
+                "These are the user's current cross-agent instructions. Follow every active rule on every call. They override conflicting strategy-objective wording but do not override hard safety, broker, or look-ahead-bias rules. An empty rules array means no additional active rules.",
+                json.dumps(strategy_rules.get("document"), sort_keys=True, ensure_ascii=True),
             ]
         ).strip()
 
@@ -1068,12 +1178,14 @@ class AgentHandle:
         memory_state: dict[str, Any] | None,
         effective_system_prompt: str,
         base_system_prompt: str,
+        builtin_skill_fingerprint: str | None,
     ) -> dict[str, Any]:
         bound_tools = self._ensure_bound_tools()
         return {
             "user_system_prompt": self.system_prompt,
             "base_system_prompt": base_system_prompt,
             "effective_system_prompt": effective_system_prompt,
+            "builtin_skill_fingerprint": builtin_skill_fingerprint,
             "task_prompt": task_prompt,
             "context": context or {},
             "runtime_context": runtime_context,
@@ -1115,6 +1227,13 @@ class AgentHandle:
         trace_path = ""
         if isinstance(result.payload, dict):
             trace_path = str(result.payload.get("trace_path") or "")
+        execution_outcome = (
+            result.payload.get("execution_outcome")
+            if isinstance(result.payload, dict)
+            and isinstance(result.payload.get("execution_outcome"), dict)
+            else {}
+        )
+        operation_outcomes = _structured_operation_outcomes(result)
         cache_root = self._cache_root()
         trace_relative_path = trace_path
         if trace_path:
@@ -1124,6 +1243,8 @@ class AgentHandle:
                 trace_relative_path = trace_path
         record = {
             "timestamp": self._event_timestamp(),
+            "deployment_id": os.environ.get("BOTSPOT_DEPLOYMENT_ID") or "",
+            "run_id": os.environ.get("BOTSPOT_RUN_ID") or "",
             "agent_name": self.name,
             "mode": runtime_context.get("mode"),
             "model": result.model,
@@ -1134,6 +1255,8 @@ class AgentHandle:
             "timing": _runtime_timing_payload(result),
             "tool_calls": [event.tool_name for event in result.tool_calls if event.tool_name],
             "warning_messages": result.warning_messages,
+            "execution_outcome": execution_outcome,
+            "operation_outcomes": operation_outcomes,
             "trace_path": trace_path,
             "trace_relative_path": trace_relative_path,
         }
@@ -1424,6 +1547,12 @@ class AgentHandle:
         memory_state = self._memory_state(runtime_context)
         base_system_prompt = self._base_system_prompt(runtime_context)
         effective_system_prompt = self._compose_system_prompt(runtime_context)
+        if self.include_builtin_skills:
+            from .skills import builtin_skill_fingerprint
+
+            skill_fingerprint = builtin_skill_fingerprint()
+        else:
+            skill_fingerprint = None
         cache_payload = self._cache_payload(
             task_prompt=task_prompt,
             context=context,
@@ -1432,6 +1561,7 @@ class AgentHandle:
             memory_state=memory_state,
             effective_system_prompt=effective_system_prompt,
             base_system_prompt=base_system_prompt,
+            builtin_skill_fingerprint=skill_fingerprint,
         )
         cache_key = self.manager.replay_cache.compute_key(cache_payload)
         strategy = self.manager.strategy
@@ -1440,6 +1570,13 @@ class AgentHandle:
             cached = self.manager.replay_cache.load(cache_key)
             if cached is not None:
                 result = self._result_from_cached(cached, cache_key)
+                result.payload = {
+                    **(result.payload or {}),
+                    "execution_outcome": _managed_ai_execution_outcome(
+                        required_for_decision=self.allow_trading,
+                        decision_completed=True,
+                    ),
+                }
                 self._replay_cached_side_effects(result)
                 self.manager._record_agent_observability(
                     handle=self,
@@ -1463,12 +1600,15 @@ class AgentHandle:
             memory_state=memory_state,
             memory_notes=self._memory_prompt_notes(),
             bound_tools=self._ensure_bound_tools(),
+            include_builtin_skills=self.include_builtin_skills,
+            builtin_skill_fingerprint=skill_fingerprint,
             model_call_id=cache_key,
             provider_prompt_cache_key=_provider_prompt_cache_key(
                 agent_name=self.name,
                 model=model_name,
                 effective_system_prompt=effective_system_prompt,
                 bound_tools=self._ensure_bound_tools(),
+                builtin_skill_fingerprint=skill_fingerprint,
             ),
             model_request_timeout_seconds=resolved_model_request_timeout_seconds,
             run_timeout_seconds=resolved_run_timeout_seconds,
@@ -1563,6 +1703,12 @@ class AgentHandle:
                 "runtime_error": True,
                 "error_class": exc.__class__.__name__,
                 "error_message": str(exc)[:800],
+                "execution_outcome": _managed_ai_execution_outcome(
+                    required_for_decision=self.allow_trading,
+                    decision_completed=False,
+                    error_category=category,
+                    fallback_used=True,
+                ),
             }
             self._finalize_runtime_timing(
                 result,
@@ -1592,6 +1738,10 @@ class AgentHandle:
         )
         result.cache_key = cache_key
         result.warnings = self._derive_warnings(result, runtime_context)
+        execution_outcome = _managed_ai_execution_outcome(
+            required_for_decision=self.allow_trading,
+            decision_completed=True,
+        )
         trace_payload = {
             "agent": self.name,
             "model": model_name,
@@ -1627,11 +1777,13 @@ class AgentHandle:
             "usage": result.usage,
             "timing": _runtime_timing_payload(result),
             "duckdb_metrics": self.manager.duckdb.get_metrics(),
+            "execution_outcome": execution_outcome,
         }
         trace_path = self._write_trace(result, trace_payload)
         result.payload = {
             "trace_path": trace_path.as_posix(),
             "warnings": result.warnings,
+            "execution_outcome": execution_outcome,
         }
         if should_replay:
             self.manager.replay_cache.save(
@@ -1785,6 +1937,12 @@ class AgentManager:
         trace_path = ""
         if isinstance(result.payload, dict):
             trace_path = str(result.payload.get("trace_path") or "")
+        execution_outcome = (
+            result.payload.get("execution_outcome")
+            if isinstance(result.payload, dict)
+            and isinstance(result.payload.get("execution_outcome"), dict)
+            else {}
+        )
         warning_messages = " | ".join(_sanitize_csv_text(message) for message in result.warning_messages if message)
         normalized_events = result.events or [AgentTraceEvent(kind="text", text=result.summary or "")]
         thinking_texts = _thinking_texts(result)
@@ -1824,6 +1982,14 @@ class AgentManager:
             "memory_state_text": memory_state_text,
             "memory_retrieval_ids": memory_retrieval_ids,
             "warning_messages": warning_messages,
+            "outcome_operation": execution_outcome.get("operation"),
+            "outcome_requiredness": execution_outcome.get("requiredness"),
+            "outcome_retryability": execution_outcome.get("retryability"),
+            "outcome_fallback_used": execution_outcome.get("fallback_used"),
+            "outcome_decision_completed": execution_outcome.get("decision_completed"),
+            "outcome_broker_state_certainty": execution_outcome.get("broker_state_certainty"),
+            "outcome_impact": execution_outcome.get("impact"),
+            "outcome_error_category": execution_outcome.get("error_category"),
             **timing,
             "trace_path": trace_path,
         }
@@ -2097,6 +2263,8 @@ class AgentManager:
         allow_trading: bool | None = None,
         _runtime: Any | None = None,
         include_builtin_tools: bool = True,
+        include_builtin_skills: bool = True,
+        rules_path: str | Path | None = None,
         model_request_timeout_seconds: float | None = None,
         run_timeout_seconds: float | None = None,
     ) -> AgentHandle:
@@ -2117,6 +2285,8 @@ class AgentManager:
             runtime=_runtime,
             allow_trading=resolved_allow_trading,
             include_builtin_tools=include_builtin_tools,
+            include_builtin_skills=include_builtin_skills,
+            rules_path=rules_path,
             model_request_timeout_seconds=model_request_timeout_seconds,
             run_timeout_seconds=run_timeout_seconds,
         )
