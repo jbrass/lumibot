@@ -215,6 +215,7 @@ class Order:
         OrderStatus.SUBMITTED,
         OrderStatus.OPEN,
         OrderStatus.NEW,
+        OrderStatus.CANCELLING,
         OrderStatus.PARTIALLY_FILLED,
     )
 
@@ -513,7 +514,11 @@ class Order:
 
         # Cryptocurrency market.
         if self.asset and "crypto" == self.asset.asset_type:
-            self.pair = f"{self.asset.symbol}/{self.quote.symbol}"
+            from lumibot.tools.symbol_normalization import build_ccxt_crypto_symbol
+
+            self.pair = build_ccxt_crypto_symbol(self.asset.symbol, self.quote.symbol) or (
+                f"{self.asset.symbol}/{self.quote.symbol}"
+            )
         else:
             self.pair = pair
 
@@ -1268,7 +1273,10 @@ class Order:
         bool
             True if the order has been cancelled, False otherwise.
         """
-        return self.status.lower() in ["cancelled", "canceled", "cancel", "cancelling", "error", "expired"]
+        # ``cancelling`` means the broker has accepted or is processing a cancel
+        # request.  It is deliberately active/non-terminal because a fill can
+        # still win the race before the broker confirms cancellation.
+        return self.status.lower() in ["cancelled", "canceled", "cancel", "error", "expired"]
 
     def is_filled(self):
         """

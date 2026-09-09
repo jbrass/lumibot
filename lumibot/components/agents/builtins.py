@@ -1,3 +1,4 @@
+import hashlib
 import json
 import math
 import os
@@ -157,8 +158,7 @@ def _require_single_symbol_text(name: str, value: Any) -> str:
     text = _require_non_empty_text(name, value)
     if "," in text:
         raise ValueError(
-            f"{name} must be one tradable symbol, not a comma-separated list. "
-            "Call this tool once per symbol."
+            f"{name} must be one tradable symbol, not a comma-separated list. Call this tool once per symbol."
         )
     return text
 
@@ -183,6 +183,16 @@ def _require_positive_number(name: str, value: Any) -> float:
     return parsed
 
 
+def _require_nonnegative_number(name: str, value: Any) -> float:
+    try:
+        parsed = float(value)
+    except Exception as exc:
+        raise ValueError(f"{name} must be a nonnegative number.") from exc
+    if not math.isfinite(parsed) or parsed < 0:
+        raise ValueError(f"{name} must be a finite number greater than or equal to 0.")
+    return parsed
+
+
 def _agent_tool_calls_for_current_run() -> list[dict[str, Any]]:
     context = current_agent_tool_context()
     calls = context.get("tool_calls")
@@ -200,6 +210,80 @@ def _has_successful_tool_call(tool_name: str) -> bool:
         call.get("tool_name") == tool_name and _tool_call_was_successful(call)
         for call in _agent_tool_calls_for_current_run()
     )
+
+
+_ACCOUNT_MUTATING_ORDER_TOOLS = {
+    "orders_submit_order",
+    "orders_submit_multileg",
+    "orders_cancel_order",
+    "orders_modify_order",
+}
+
+
+def _last_successful_account_mutation_index() -> int:
+    return max(
+        (
+            index
+            for index, call in enumerate(_agent_tool_calls_for_current_run())
+            if call.get("tool_name") in _ACCOUNT_MUTATING_ORDER_TOOLS and _tool_call_was_successful(call)
+        ),
+        default=-1,
+    )
+
+
+def _has_successful_tool_call_after(tool_name: str, after_index: int) -> bool:
+    return any(
+        index > after_index and call.get("tool_name") == tool_name and _tool_call_was_successful(call)
+        for index, call in enumerate(_agent_tool_calls_for_current_run())
+    )
+
+
+def _injected_account_snapshot_is_complete() -> bool:
+    snapshot = current_agent_tool_context().get("account_snapshot")
+    return bool(
+        isinstance(snapshot, dict)
+        and snapshot.get("as_of")
+        and snapshot.get("account_complete") is True
+        and snapshot.get("positions_complete") is True
+        and snapshot.get("open_orders_complete") is True
+    )
+
+
+def _has_complete_unfiltered_pagination_after(tool_name: str, after_index: int) -> bool:
+    contiguous_end = 0
+    expected_total: int | None = None
+    expected_snapshot_id: str | None = None
+    for index, call in enumerate(_agent_tool_calls_for_current_run()):
+        if index <= after_index or call.get("tool_name") != tool_name or not _tool_call_was_successful(call):
+            continue
+        coverage = call.get("coverage") if isinstance(call.get("coverage"), dict) else None
+        if not coverage or coverage.get("filters") not in ({}, None):
+            continue
+        try:
+            offset = int(coverage.get("offset") or 0)
+            returned = int(coverage.get("returned") or 0)
+            total = int(coverage.get("matched") if coverage.get("matched") is not None else coverage.get("total"))
+        except (TypeError, ValueError):
+            continue
+        snapshot_id = coverage.get("snapshot_id")
+        if not isinstance(snapshot_id, str) or not snapshot_id:
+            contiguous_end = 0
+            expected_total = None
+            expected_snapshot_id = None
+            continue
+        if expected_total is None or expected_snapshot_id is None:
+            expected_total = total
+            expected_snapshot_id = snapshot_id
+        elif total != expected_total or snapshot_id != expected_snapshot_id:
+            contiguous_end = 0
+            expected_total = total
+            expected_snapshot_id = snapshot_id
+        if offset > contiguous_end:
+            continue
+        contiguous_end = max(contiguous_end, offset + returned)
+        if bool(coverage.get("complete")) and contiguous_end >= total:
+            return True
+    return False
 
 
 def _symbols_from_tool_argument(value: Any) -> set[str]:
@@ -259,19 +343,28 @@ def _require_agent_order_readiness(symbol: str) -> None:
     if not bool(context.get("enforce_order_readiness")):
         return
     missing: list[str] = []
-    if not _has_successful_tool_call("account_portfolio"):
+    last_mutation_index = _last_successful_account_mutation_index()
+    initial_snapshot_is_current = last_mutation_index < 0 and _injected_account_snapshot_is_complete()
+    if not initial_snapshot_is_current and not _has_successful_tool_call_after(
+        "account_portfolio", last_mutation_index
+    ):
         missing.append("account_portfolio")
-    if not _has_successful_tool_call("account_positions"):
-        missing.append("account_positions")
+    if not initial_snapshot_is_current and not _has_complete_unfiltered_pagination_after(
+        "account_positions", last_mutation_index
+    ):
+        missing.append("complete account_positions pagination")
+    if not initial_snapshot_is_current and not _has_complete_unfiltered_pagination_after(
+        "orders_open_orders", last_mutation_index
+    ):
+        missing.append("complete orders_open_orders pagination")
     if not _has_successful_market_last_price_for_symbol(symbol):
-        missing.append(
-            f"market_last_price(symbol={symbol!r}) or market_last_prices including {symbol!r}"
-        )
+        missing.append(f"market_last_price(symbol={symbol!r}) or market_last_prices including {symbol!r}")
     if missing:
         raise ValueError(
             "ORDER_READINESS_REQUIRED: Before submitting an order, call "
             f"{', '.join(missing)} in this same agent run. "
-            "Agents must inspect cash, portfolio value, positions, and the latest price for the ordered asset before trading."
+            "Agents must inspect cash, portfolio value, positions, and the latest price for the ordered asset before trading. "
+            "A complete injected account snapshot satisfies only the first account and open-order checks; any order mutation requires fresh, complete account and open-order pagination."
         )
 
 
@@ -407,20 +500,60 @@ def _symbol_from_bars_key(key: Any, fallback: str | None = None) -> str:
 
 def _asset_to_dict(asset: Any) -> dict[str, Any] | str:
     if asset is None:
-        return "None"
+        return {"symbol": "None", "type": "unknown"}
+    to_minimal_dict = getattr(asset, "to_minimal_dict", None)
+    if callable(to_minimal_dict):
+        try:
+            payload = to_minimal_dict()
+            if isinstance(payload, dict):
+                return _jsonable(payload)
+        except Exception:
+            pass
     expiration = getattr(asset, "expiration", None)
     if isinstance(expiration, (datetime, date)):
         expiration_value = expiration.strftime("%Y-%m-%d")
     else:
         expiration_value = expiration
-    return {
-        "symbol": getattr(asset, "symbol", None),
-        "asset_type": getattr(asset, "asset_type", None),
-        "expiration": expiration_value,
-        "strike": getattr(asset, "strike", None),
-        "right": getattr(asset, "right", None),
-        "multiplier": getattr(asset, "multiplier", None),
+    asset_type = getattr(asset, "asset_type", None)
+    asset_type = str(getattr(asset_type, "value", asset_type) or "unknown").lower()
+    payload: dict[str, Any] = {
+        "symbol": str(getattr(asset, "symbol", None) or asset),
+        "type": asset_type,
     }
+    if expiration_value:
+        payload["exp"] = expiration_value
+    strike = getattr(asset, "strike", None)
+    if strike is not None:
+        try:
+            payload["strike"] = float(strike)
+        except (TypeError, ValueError):
+            payload["strike"] = _jsonable(strike)
+    right = getattr(asset, "right", None)
+    if right:
+        payload["right"] = str(getattr(right, "value", right)).upper()
+    multiplier = getattr(asset, "multiplier", None)
+    if multiplier not in {None, 1, 1.0}:
+        payload["mult"] = _jsonable(multiplier)
+    return payload
+
+
+def _optional_finite_number(value: Any) -> float | int | None:
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return number
+
+
+def _put_if_present(payload: dict[str, Any], key: str, value: Any) -> None:
+    if value is not None:
+        payload[key] = value
 
 
 def _position_to_dict(position: Any) -> dict[str, Any]:
@@ -449,25 +582,27 @@ def _position_to_dict(position: Any) -> dict[str, Any]:
                 closing_side = "sell_to_close"
             elif quantity < 0:
                 closing_side = "buy_to_close"
-    return {
+    payload: dict[str, Any] = {
         "asset": asset_payload,
         "quantity": quantity,
-        "position_side": position_side,
-        "closing_side": closing_side,
-        "closing_quantity": closing_quantity,
-        "avg_fill_price": _jsonable(getattr(position, "avg_fill_price", None)),
-        "current_price": _jsonable(getattr(position, "current_price", None)),
-        "market_value": _jsonable(getattr(position, "market_value", None)),
-        "pnl": _jsonable(
-            getattr(position, "pnl", None)
-            if hasattr(position, "pnl")
-            else getattr(position, "unrealized_pnl", None)
-        ),
-        "pnl_percent": _jsonable(getattr(position, "pnl_percent", None)),
     }
+    _put_if_present(payload, "position_side", position_side)
+    _put_if_present(payload, "closing_side", closing_side)
+    _put_if_present(payload, "closing_quantity", closing_quantity)
+    _put_if_present(
+        payload,
+        "avg_fill_price",
+        _optional_finite_number(getattr(position, "avg_fill_price", None)),
+    )
+    _put_if_present(payload, "current_price", _optional_finite_number(getattr(position, "current_price", None)))
+    _put_if_present(payload, "market_value", _optional_finite_number(getattr(position, "market_value", None)))
+    pnl = getattr(position, "pnl", None) if hasattr(position, "pnl") else getattr(position, "unrealized_pnl", None)
+    _put_if_present(payload, "pnl", _optional_finite_number(pnl))
+    _put_if_present(payload, "pnl_percent", _optional_finite_number(getattr(position, "pnl_percent", None)))
+    return payload
 
 
-def _order_to_dict(order: Any) -> dict[str, Any]:
+def _order_to_dict(order: Any, *, include_legs: bool = True) -> dict[str, Any]:
     asset = getattr(order, "asset", None)
     asset_payload = _asset_to_dict(asset)
     quantity = getattr(order, "quantity", None)
@@ -475,21 +610,165 @@ def _order_to_dict(order: Any) -> dict[str, Any]:
         quantity = float(quantity)
     except Exception:
         quantity = quantity
-    payload = {
+    payload: dict[str, Any] = {
         "identifier": _jsonable(getattr(order, "identifier", None)),
-        "status": _jsonable(getattr(order, "status", None)),
-        "side": _jsonable(getattr(order, "side", None)),
         "asset": asset_payload,
+        "side": _jsonable(getattr(order, "side", None)),
         "quantity": quantity,
         "order_type": _jsonable(getattr(order, "order_type", None)),
+        "status": _jsonable(getattr(order, "status", None)),
         "time_in_force": _jsonable(getattr(order, "time_in_force", None)),
-        "limit_price": _jsonable(getattr(order, "limit_price", None)),
-        "stop_price": _jsonable(getattr(order, "stop_price", None)),
     }
+    quote = getattr(order, "quote", None)
+    if quote is not None:
+        payload["quote"] = _asset_to_dict(quote)
+    _put_if_present(payload, "limit_price", _optional_finite_number(getattr(order, "limit_price", None)))
+    _put_if_present(payload, "stop_price", _optional_finite_number(getattr(order, "stop_price", None)))
+    if include_legs:
+        child_orders = getattr(order, "child_orders", None)
+        if isinstance(child_orders, list) and child_orders:
+            payload["legs"] = [_order_to_dict(child, include_legs=False) for child in child_orders]
     decision_provenance = getattr(order, "decision_provenance", None)
     if isinstance(decision_provenance, dict):
-        payload["decision_provenance"] = _jsonable(decision_provenance)
+        allowed_provenance = {
+            key: _jsonable(decision_provenance.get(key))
+            for key in ("deployment_id", "run_id", "decision_id", "model_call_id")
+            if decision_provenance.get(key) is not None
+        }
+        if allowed_provenance:
+            payload["decision_provenance"] = allowed_provenance
     return payload
+
+
+def _compact_sort_key(payload: dict[str, Any]) -> str:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _sorted_position_payloads(positions: list[Any]) -> list[dict[str, Any]]:
+    payloads = [_position_to_dict(position) for position in positions]
+    return sorted(payloads, key=lambda payload: _compact_sort_key(payload.get("asset", {})))
+
+
+def _sorted_order_payloads(orders: list[Any]) -> list[dict[str, Any]]:
+    payloads = [_order_to_dict(order) for order in orders]
+    return sorted(
+        payloads,
+        key=lambda payload: (
+            _compact_sort_key(payload.get("asset", {})),
+            str(payload.get("identifier") or ""),
+        ),
+    )
+
+
+def _normalize_page(*, offset: int = 0, limit: int = 50) -> tuple[int, int]:
+    try:
+        offset_value = int(offset)
+        limit_value = int(limit)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("offset and limit must be integers.") from exc
+    if offset_value < 0:
+        raise ValueError("offset must be zero or greater.")
+    if limit_value < 1 or limit_value > 100:
+        raise ValueError("limit must be between 1 and 100.")
+    return offset_value, limit_value
+
+
+def _normalized_asset_filters(
+    *,
+    symbol: str | None = None,
+    asset_type: str | None = None,
+    expiration: str | None = None,
+    strike: float | None = None,
+    right: str | None = None,
+) -> dict[str, Any]:
+    filters: dict[str, Any] = {}
+    if symbol is not None:
+        filters["symbol"] = _require_non_empty_text("symbol", symbol).upper()
+    if asset_type is not None:
+        filters["asset_type"] = _require_non_empty_text("asset_type", asset_type).lower()
+    if expiration is not None:
+        value = _require_non_empty_text("expiration", expiration)
+        try:
+            filters["expiration"] = datetime.fromisoformat(value).date().isoformat()
+        except ValueError as exc:
+            raise ValueError("expiration must use YYYY-MM-DD format.") from exc
+    if strike is not None:
+        value = _optional_finite_number(strike)
+        if value is None:
+            raise ValueError("strike must be a finite number.")
+        filters["strike"] = float(value)
+    if right is not None:
+        value = _require_non_empty_text("right", right).upper()
+        if value not in {"CALL", "PUT"}:
+            raise ValueError("right must be CALL or PUT.")
+        filters["right"] = value
+    return filters
+
+
+def _asset_matches_filters(asset: dict[str, Any], filters: dict[str, Any]) -> bool:
+    expected_to_actual = {
+        "symbol": "symbol",
+        "asset_type": "type",
+        "expiration": "exp",
+        "strike": "strike",
+        "right": "right",
+    }
+    return all(asset.get(expected_to_actual[key]) == value for key, value in filters.items())
+
+
+def _payload_matches_asset_filters(payload: dict[str, Any], filters: dict[str, Any]) -> bool:
+    if _asset_matches_filters(payload.get("asset", {}), filters):
+        return True
+    return any(
+        _asset_matches_filters(leg.get("asset", {}), filters)
+        for leg in payload.get("legs", [])
+        if isinstance(leg, dict)
+    )
+
+
+def _paged_payload(
+    payloads: list[dict[str, Any]],
+    *,
+    item_key: str,
+    offset: int,
+    limit: int,
+    total: int,
+    filters: dict[str, Any],
+    snapshot_id: str,
+) -> dict[str, Any]:
+    page = payloads[offset : offset + limit]
+    next_offset = offset + len(page)
+    complete = next_offset >= len(payloads)
+    return {
+        item_key: page,
+        "total": total,
+        "matched": len(payloads),
+        "returned": len(page),
+        "offset": offset,
+        "limit": limit,
+        "omitted": max(len(payloads) - next_offset, 0),
+        "complete": complete,
+        "next_offset": None if complete else next_offset,
+        "filters": filters,
+        "snapshot_id": snapshot_id,
+    }
+
+
+def _collection_snapshot_id(payloads: list[dict[str, Any]], *, item_key: str) -> str:
+    """Hash the account facts that must stay stable across readiness pages."""
+
+    if item_key == "positions":
+        stable_payloads = [
+            {
+                "asset": payload.get("asset"),
+                "quantity": payload.get("quantity"),
+            }
+            for payload in payloads
+        ]
+    else:
+        stable_payloads = payloads
+    encoded = json.dumps(stable_payloads, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _options_helper_for_strategy(strategy: Any) -> Any:
@@ -583,22 +862,110 @@ def _parse_option_legs(strategy: Any, legs_json: str, *, time_in_force: TimeInFo
     return orders
 
 
+def _option_contract_key(asset: Any) -> tuple[str, str, float, str]:
+    expiration = getattr(asset, "expiration", None)
+    if isinstance(expiration, (date, datetime)):
+        expiration_text = expiration.strftime("%Y-%m-%d")
+    else:
+        expiration_text = str(expiration or "")
+    right = getattr(asset, "right", None)
+    return (
+        str(getattr(asset, "symbol", "") or "").upper(),
+        expiration_text,
+        float(getattr(asset, "strike", 0) or 0),
+        str(getattr(right, "value", right) or "").lower(),
+    )
+
+
+def _validate_option_closing_orders(strategy: Any, orders: list[Any]) -> None:
+    closing_orders = [
+        order
+        for order in orders
+        if str(getattr(order, "side", "") or "").lower() in {"buy_to_close", "sell_to_close"}
+    ]
+    if not closing_orders:
+        return
+
+    quantities_by_contract: dict[tuple[str, str, float, str], float] = {}
+    for position in strategy.get_positions(include_cash_positions=True) or []:
+        asset = getattr(position, "asset", None)
+        asset_type = getattr(asset, "asset_type", None)
+        if str(getattr(asset_type, "value", asset_type) or "").lower() != "option":
+            continue
+        key = _option_contract_key(asset)
+        quantities_by_contract[key] = quantities_by_contract.get(key, 0.0) + float(
+            getattr(position, "quantity", 0) or 0
+        )
+
+    for order in closing_orders:
+        side = str(getattr(order, "side", "") or "").lower()
+        key = _option_contract_key(getattr(order, "asset", None))
+        current_quantity = quantities_by_contract.get(key, 0.0)
+        expected_side = (
+            "sell_to_close" if current_quantity > 0 else "buy_to_close" if current_quantity < 0 else None
+        )
+        if side != expected_side:
+            raise ValueError(
+                "Option closing side does not reduce the current signed position: "
+                f"contract={key}, current_quantity={current_quantity}, side={side!r}, "
+                f"required_side={expected_side!r}. Reread account_positions and correct the leg."
+            )
+        order_quantity = float(getattr(order, "quantity", 0) or 0)
+        if order_quantity > abs(current_quantity):
+            raise ValueError(
+                "Option closing quantity exceeds the current signed position: "
+                f"contract={key}, current_quantity={current_quantity}, requested_quantity={order_quantity}."
+            )
+        quantities_by_contract[key] = (
+            current_quantity - order_quantity if side == "sell_to_close" else current_quantity + order_quantity
+        )
+
+
 def _bind_positions(strategy: Any, manager: Any) -> BoundTool:
-    def positions() -> dict[str, Any]:
-        return {
-            "positions": [_position_to_dict(position) for position in strategy.get_positions(include_cash_positions=True)],
-            "as_of": strategy.get_datetime().isoformat(),
-        }
+    def positions(
+        *,
+        offset: int = 0,
+        limit: int = 50,
+        symbol: str | None = None,
+        asset_type: str | None = None,
+        expiration: str | None = None,
+        strike: float | None = None,
+        right: str | None = None,
+    ) -> dict[str, Any]:
+        offset_value, limit_value = _normalize_page(offset=offset, limit=limit)
+        filters = _normalized_asset_filters(
+            symbol=symbol,
+            asset_type=asset_type,
+            expiration=expiration,
+            strike=strike,
+            right=right,
+        )
+        current = strategy.get_positions(include_cash_positions=True) or []
+        payloads = _sorted_position_payloads(list(current))
+        filtered = [
+            payload for payload in payloads if _asset_matches_filters(payload.get("asset", {}), filters)
+        ]
+        result = _paged_payload(
+            filtered,
+            item_key="positions",
+            offset=offset_value,
+            limit=limit_value,
+            total=len(payloads),
+            filters=filters,
+            snapshot_id=_collection_snapshot_id(payloads, item_key="positions"),
+        )
+        result["as_of"] = strategy.get_datetime().isoformat()
+        return result
 
     return BoundTool(
         name="account_positions",
         description=(
-            "Return current positions as structured data. "
-            "Each entry includes exact asset fields, signed quantity, position_side, closing_side and closing_quantity for options, average fill price, current price, market value, and P&L fields when the broker or backtest provides them. "
-            "For options, signed quantity is authoritative: quantity > 0 is a long contract and must use sell_to_close to reduce it; quantity < 0 is a short contract and must use buy_to_close to reduce it. "
-            "Use expiration, strike, right, signed quantity, and average fill price to reconstruct and manage an existing multi-leg position. Never report the option portfolio as flat while any option entry has nonzero quantity. "
-            "Use this before trading to understand current exposure, whether a symbol is already held, and whether the current portfolio is concentrated. "
-            "Example: call this before rotating into a new symbol so you can compare it against what is already owned."
+            "Return current positions in a compact, deterministic, paginated representation. "
+            "Arguments: offset defaults to 0; limit defaults to 50 and is capped at 100. Optional exact filters are symbol, asset_type, expiration, strike, and right. "
+            "The response reports total account positions, matched positions, returned positions, omitted positions, complete, and next_offset. If complete is false, omitted positions still exist; continue from next_offset before treating the account as fully inspected. "
+            "Each entry includes a compact exact asset identity, signed quantity, position_side, option closing_side, and available average fill, current price, value, and P&L. Missing optional values are omitted rather than represented as zero. "
+            "For options, signed quantity is authoritative: quantity > 0 is long and uses sell_to_close; quantity < 0 is short and uses buy_to_close. "
+            "Use exact filters to verify a particular option contract, but use complete unfiltered pagination when full-portfolio readiness is required."
         ),
         function=positions,
         metadata={"kind": "builtin"},
@@ -622,6 +989,51 @@ def _bind_portfolio(strategy: Any, manager: Any) -> BoundTool:
         ),
         function=portfolio,
         metadata={"kind": "builtin"},
+    )
+
+
+def _bind_calculate_stock_quantity(strategy: Any, manager: Any) -> BoundTool:
+    def calculate_stock_quantity(
+        *,
+        maximum_notional: float,
+        price: float,
+        available_cash: float | None = None,
+    ) -> dict[str, Any]:
+        maximum_notional_value = _require_positive_number("maximum_notional", maximum_notional)
+        price_value = _require_positive_number("price", price)
+        available_cash_value = (
+            _require_nonnegative_number("available_cash", available_cash)
+            if available_cash is not None
+            else None
+        )
+        spendable_notional = min(
+            maximum_notional_value,
+            available_cash_value if available_cash_value is not None else maximum_notional_value,
+        )
+        quantity = math.floor(spendable_notional / price_value)
+        notional = quantity * price_value
+        return {
+            "quantity": quantity,
+            "price": price_value,
+            "maximum_notional": maximum_notional_value,
+            "available_cash": available_cash_value,
+            "spendable_notional": spendable_notional,
+            "notional": notional,
+            "remaining_notional": spendable_notional - notional,
+            "within_maximum_notional": notional <= maximum_notional_value,
+            "within_available_cash": available_cash_value is None or notional <= available_cash_value,
+        }
+
+    return BoundTool(
+        name="risk_calculate_stock_quantity",
+        description=(
+            "Calculate a whole-share stock quantity without model arithmetic. "
+            "Arguments: maximum_notional, current or intended limit price, and optional available_cash. "
+            "Returns floor(min(maximum_notional, available_cash) / price), the resulting notional, and explicit cap checks. "
+            "Use the returned quantity unchanged for a capped stock order after verifying it is positive."
+        ),
+        function=calculate_stock_quantity,
+        metadata={"kind": "builtin", "replay_on_cache": True},
     )
 
 
@@ -762,7 +1174,7 @@ def _bind_last_prices(strategy: Any, manager: Any) -> BoundTool:
             "Use this to scan a provided equity/ETF universe before fetching detailed history with "
             "market_historical_prices for finalists or a full multi-symbol history request. "
             "Never invent prices for missing symbols. "
-            "Example: market_last_prices(symbols_json='[\"SPY\",\"QQQ\",\"AAPL\",\"MSFT\"]')."
+            'Example: market_last_prices(symbols_json=\'["SPY","QQQ","AAPL","MSFT"]\').'
         ),
         function=last_prices,
         metadata={"kind": "builtin", "replay_on_cache": True},
@@ -871,14 +1283,14 @@ def _bind_historical_prices(strategy: Any, manager: Any) -> BoundTool:
             "Get historical OHLCV bars for many symbols in one call via "
             "Strategy.get_historical_prices_for_assets. "
             "Arguments: symbols as a list or comma-separated string, and/or symbols_json as a JSON array; "
-            "required length; timestep (default day); optional asset_type (default stock), quote_symbol, "
+            "required length; timestep (default day; multi-minute aliases such as '5minute', '5min', and '5 minutes' are supported); optional asset_type (default stock), quote_symbol, "
             "exchange, include_after_hours, chunk_size, max_workers. "
             "Cap is 150 symbols per call. Returns bars_by_symbol keyed by symbol with datetime/open/high/low/close/volume rows, "
             "plus symbols_available and symbols_missing. "
             "Never loop market_load_history_table or market_last_price once per symbol when you need multi-symbol history. "
             "Use market_last_prices for a cheap latest-price universe scan, then this tool for history on finalists or the full list. "
             "For SQL analysis of one already-loaded table, use market_load_history_table plus duckdb_query. "
-            "Example: market_historical_prices(symbols_json='[\"SPY\",\"QQQ\",\"AAPL\"]', length=20, timestep='minute')."
+            'Examples: market_historical_prices(symbols_json=\'["SPY","QQQ","AAPL"]\', length=20, timestep=\'minute\'); market_historical_prices(symbols="AAPL", length=20, timestep="5minute").'
         ),
         function=historical_prices,
         metadata={"kind": "builtin", "replay_on_cache": True},
@@ -972,11 +1384,7 @@ def _bind_options_get_strikes(strategy: Any, manager: Any) -> BoundTool:
         elif hasattr(chains, "strikes"):
             strikes = chains.strikes(expiration_value, right.upper()) or []
         else:
-            strikes = (
-                chains.get("Chains", {})
-                .get(right.upper(), {})
-                .get(expiration_value.isoformat(), [])
-            )
+            strikes = chains.get("Chains", {}).get(right.upper(), {}).get(expiration_value.isoformat(), [])
         normalized = sorted({float(value) for value in strikes})
         return {
             "symbol": symbol.upper(),
@@ -1177,7 +1585,7 @@ def _bind_options_calculate_multileg_price(strategy: Any, manager: Any) -> Bound
             "Never price a close with buy_to_close for a positive quantity or sell_to_close for a negative quantity because those sides do not close the observed position. "
             "When comparing a per-unit multi-leg opening credit with a per-unit closing debit, price one contract per leg here. Use the full absolute position quantities only in the later orders_submit_multileg call. "
             "Independently reconcile the returned net price from the four option midpoint values you just observed. For a defined-risk structure, reject a result that conflicts materially with those leg mids or violates the structure's economic bounds. "
-            "Example legs_json: [{\"symbol\":\"SPY\",\"expiration\":\"2026-09-18\",\"strike\":620,\"right\":\"put\",\"quantity\":1,\"side\":\"buy_to_open\"},{\"symbol\":\"SPY\",\"expiration\":\"2026-09-18\",\"strike\":625,\"right\":\"put\",\"quantity\":1,\"side\":\"sell_to_open\"}]."
+            'Example legs_json: [{"symbol":"SPY","expiration":"2026-09-18","strike":620,"right":"put","quantity":1,"side":"buy_to_open"},{"symbol":"SPY","expiration":"2026-09-18","strike":625,"right":"put","quantity":1,"side":"sell_to_open"}].'
         ),
         function=calculate_multileg_price,
         metadata={"kind": "builtin", "replay_on_cache": True},
@@ -1854,16 +2262,60 @@ def _bind_alpaca_news(strategy: Any, manager: Any) -> BoundTool:
 
 
 def _bind_open_orders(strategy: Any, manager: Any) -> BoundTool:
-    def open_orders() -> dict[str, Any]:
-        orders = strategy.get_orders()
-        return {
-            "orders": [_order_to_dict(order) for order in orders],
-            "datetime": strategy.get_datetime().isoformat(),
-        }
+    def open_orders(
+        *,
+        offset: int = 0,
+        limit: int = 50,
+        symbol: str | None = None,
+        asset_type: str | None = None,
+        expiration: str | None = None,
+        strike: float | None = None,
+        right: str | None = None,
+    ) -> dict[str, Any]:
+        offset_value, limit_value = _normalize_page(offset=offset, limit=limit)
+        filters = _normalized_asset_filters(
+            symbol=symbol,
+            asset_type=asset_type,
+            expiration=expiration,
+            strike=strike,
+            right=right,
+        )
+        tracked = strategy.get_orders() or []
+        open_only = []
+        active_statuses = {"unprocessed", "submitted", "open", "new", "cancelling", "partial_fill"}
+        for order in tracked:
+            is_active = getattr(order, "is_active", None)
+            if callable(is_active):
+                try:
+                    if not is_active():
+                        continue
+                except Exception:
+                    pass
+            elif str(getattr(order, "status", "") or "").lower() not in active_statuses:
+                continue
+            open_only.append(order)
+        payloads = _sorted_order_payloads(open_only)
+        filtered = [payload for payload in payloads if _payload_matches_asset_filters(payload, filters)]
+        result = _paged_payload(
+            filtered,
+            item_key="orders",
+            offset=offset_value,
+            limit=limit_value,
+            total=len(payloads),
+            filters=filters,
+            snapshot_id=_collection_snapshot_id(payloads, item_key="orders"),
+        )
+        result["as_of"] = strategy.get_datetime().isoformat()
+        return result
 
     return BoundTool(
         name="orders_open_orders",
-        description="List the strategy's currently tracked orders, including identifiers, status, side, quantity, and prices.",
+        description=(
+            "List active tracked orders in a compact, deterministic, paginated representation. "
+            "Arguments: offset defaults to 0; limit defaults to 50 and is capped at 100. Optional exact filters are symbol, asset_type, expiration, strike, and right. "
+            "The response reports total, matched, returned, omitted, complete, and next_offset. If complete is false, continue from next_offset before concluding no other open orders exist. "
+            "Each order includes its identifier, compact asset identity, side, signed quantity, type, status, time in force, available prices, quote asset, and compact multileg children when present."
+        ),
         function=open_orders,
         metadata={"kind": "builtin"},
     )
@@ -1891,7 +2343,9 @@ def _bind_cancel_order(strategy: Any, manager: Any) -> BoundTool:
 
 
 def _bind_modify_order(strategy: Any, manager: Any) -> BoundTool:
-    def modify_order(*, identifier: str, limit_price: float | None = None, stop_price: float | None = None) -> dict[str, Any]:
+    def modify_order(
+        *, identifier: str, limit_price: float | None = None, stop_price: float | None = None
+    ) -> dict[str, Any]:
         identifier = _require_non_empty_text("identifier", identifier)
         order = strategy.get_order(identifier)
         if order is None:
@@ -2002,7 +2456,9 @@ def _bind_get_indicator(strategy: Any, manager: Any) -> BoundTool:
             "asset_type": asset_type,
             "indicator": indicator_name,
             "timestep": timestep,
-            "datetime": strategy.get_datetime().isoformat() if hasattr(strategy.get_datetime(), "isoformat") else str(strategy.get_datetime()),
+            "datetime": strategy.get_datetime().isoformat()
+            if hasattr(strategy.get_datetime(), "isoformat")
+            else str(strategy.get_datetime()),
             "value": _jsonable(value),
             "no_lookahead": True,
         }
@@ -2385,7 +2841,10 @@ def _bind_get_fred_snapshot(strategy: Any, manager: Any) -> BoundTool:
 def _bind_notify_user(strategy: Any, manager: Any) -> BoundTool:
     def notify_user(title: str, message: str, severity: str = "info", enabled: bool | None = None) -> dict[str, Any]:
         results = strategy.notify(title, message, severity=severity, enabled=enabled)
-        return {"ok": all(result.ok for result in results), "results": [_jsonable(result.__dict__) for result in results]}
+        return {
+            "ok": all(result.ok for result in results),
+            "results": [_jsonable(result.__dict__) for result in results],
+        }
 
     return BoundTool(
         name="notify_user",
@@ -2403,7 +2862,13 @@ def _bind_memory_remember(strategy: Any, manager: Any) -> BoundTool:
     def remember(text: str, kind: str = "memory", tags: list[str] | None = None) -> dict[str, Any]:
         return strategy.memory.remember(text, kind=kind, tags=tags, **_agent_memory_context_kwargs())
 
-    return BoundTool(name="remember", description="Store a local Lumibot agent memory or note.", function=remember, source="builtin", metadata={"kind": "memory"})
+    return BoundTool(
+        name="remember",
+        description="Store a local Lumibot agent memory or note.",
+        function=remember,
+        source="builtin",
+        metadata={"kind": "memory"},
+    )
 
 
 def _bind_memory_search(strategy: Any, manager: Any) -> BoundTool:
@@ -2501,28 +2966,52 @@ def _bind_remember_lesson(strategy: Any, manager: Any) -> BoundTool:
     def remember_lesson(text: str, symbol: str | None = None) -> dict[str, Any]:
         return strategy.memory.remember_lesson(text, symbol=symbol, **_agent_memory_context_kwargs())
 
-    return BoundTool(name="remember_lesson", description="Record a compact trading lesson for future agent runs.", function=remember_lesson, source="builtin", metadata={"kind": "memory"})
+    return BoundTool(
+        name="remember_lesson",
+        description="Record a compact trading lesson for future agent runs.",
+        function=remember_lesson,
+        source="builtin",
+        metadata={"kind": "memory"},
+    )
 
 
 def _bind_open_thesis(strategy: Any, manager: Any) -> BoundTool:
     def open_thesis(text: str, symbol: str | None = None, tags: list[str] | None = None) -> dict[str, Any]:
         return strategy.memory.open_thesis(text, symbol=symbol, tags=tags, **_agent_memory_context_kwargs())
 
-    return BoundTool(name="open_thesis", description="Open a hedge-fund-style investment thesis in local Lumibot memory.", function=open_thesis, source="builtin", metadata={"kind": "memory"})
+    return BoundTool(
+        name="open_thesis",
+        description="Open a hedge-fund-style investment thesis in local Lumibot memory.",
+        function=open_thesis,
+        source="builtin",
+        metadata={"kind": "memory"},
+    )
 
 
 def _bind_update_thesis(strategy: Any, manager: Any) -> BoundTool:
     def update_thesis(thesis_id: str, text: str) -> dict[str, Any]:
         return strategy.memory.update_thesis(thesis_id, text, **_agent_memory_context_kwargs())
 
-    return BoundTool(name="update_thesis", description="Append an update to an open investment thesis.", function=update_thesis, source="builtin", metadata={"kind": "memory"})
+    return BoundTool(
+        name="update_thesis",
+        description="Append an update to an open investment thesis.",
+        function=update_thesis,
+        source="builtin",
+        metadata={"kind": "memory"},
+    )
 
 
 def _bind_close_thesis(strategy: Any, manager: Any) -> BoundTool:
     def close_thesis(thesis_id: str, text: str) -> dict[str, Any]:
         return strategy.memory.close_thesis(thesis_id, text, **_agent_memory_context_kwargs())
 
-    return BoundTool(name="close_thesis", description="Close an investment thesis and record its outcome/reflection.", function=close_thesis, source="builtin", metadata={"kind": "memory"})
+    return BoundTool(
+        name="close_thesis",
+        description="Close an investment thesis and record its outcome/reflection.",
+        function=close_thesis,
+        source="builtin",
+        metadata={"kind": "memory"},
+    )
 
 
 def _bind_submit_order(strategy: Any, manager: Any) -> BoundTool:
@@ -2553,9 +3042,13 @@ def _bind_submit_order(strategy: Any, manager: Any) -> BoundTool:
         if order_type in {"stop", "stop_limit"} and stop_price is None:
             raise ValueError(f"orders_submit_order with order_type={order_type!r} requires stop_price.")
         if order_type == "stop_limit" and stop_limit_price is None and limit_price is None:
-            raise ValueError("orders_submit_order with order_type='stop_limit' requires stop_limit_price or limit_price.")
+            raise ValueError(
+                "orders_submit_order with order_type='stop_limit' requires stop_limit_price or limit_price."
+            )
         if order_type == "trailing_stop" and trail_price is None and trail_percent is None:
-            raise ValueError("orders_submit_order with order_type='trailing_stop' requires trail_price or trail_percent.")
+            raise ValueError(
+                "orders_submit_order with order_type='trailing_stop' requires trail_price or trail_percent."
+            )
         asset, quote = resolve_asset_and_quote(
             strategy,
             symbol=symbol,
@@ -2579,6 +3072,7 @@ def _bind_submit_order(strategy: Any, manager: Any) -> BoundTool:
             quote=quote,
             time_in_force=time_in_force,
         )
+        _validate_option_closing_orders(strategy, [created])
         memory = getattr(strategy, "memory", None)
         memory_context = _agent_memory_context_kwargs()
         decision_provenance = None
@@ -2636,7 +3130,7 @@ def _bind_submit_order(strategy: Any, manager: Any) -> BoundTool:
             "Arguments: symbol, quantity, side, optional asset_type, expiration, strike, right, order_type, limit_price, stop_price, stop_limit_price, trail_price, trail_percent, quote_symbol, exchange, time_in_force. "
             "Valid asset_type values: stock, option, future, cont_future, forex, crypto, index, multileg, us_equity. "
             "Use stock for normal equities. "
-            "Before using this tool, call account_portfolio, account_positions, and market_last_price (or market_last_prices including the symbol) for the same symbol in the current agent run; otherwise the order is rejected with ORDER_READINESS_REQUIRED. "
+            "Before using this tool, inspect the injected account_snapshot plus market_last_price (or market_last_prices including the symbol). A complete injected account_snapshot satisfies the initial account_portfolio, account_positions, and open-order readiness checks; after any order mutation, refresh account_portfolio and complete unfiltered pagination for both account_positions and orders_open_orders before another order. The current-price check is always required in the same agent run; otherwise the order is rejected with ORDER_READINESS_REQUIRED. "
             "Valid side values: buy, sell, buy_to_open, buy_to_close, sell_to_open, sell_to_close, sell_short, buy_to_cover. "
             "For an option close, reconcile the exact contract with the latest account_positions result: positive long quantity requires sell_to_close and negative short quantity requires buy_to_close, always using the absolute current quantity. Never use the inverse mapping. "
             "Valid order_type values: market, limit, stop, stop_limit, trailing_stop, smart_limit. "
@@ -2661,6 +3155,7 @@ def _bind_submit_multileg_order(strategy: Any, manager: Any) -> BoundTool:
         symbols = sorted({str(getattr(order.asset, "symbol", "")).upper() for order in orders})
         for symbol in symbols:
             _require_agent_order_readiness(symbol)
+        _validate_option_closing_orders(strategy, orders)
 
         submit_kwargs: dict[str, Any] = {
             "is_multileg": True,
@@ -2705,7 +3200,7 @@ def _bind_submit_multileg_order(strategy: Any, manager: Any) -> BoundTool:
         description=(
             "Create and submit one atomic multi-leg option order from exact contracts selected by the agent. This is generic and does not choose a strategy or its legs. "
             "Arguments: legs_json, optional price_style='market', 'best', 'mid', or 'fastest', optional signed net_limit_price, optional time_in_force. legs_json must be a JSON array with at least two legs; each leg requires symbol, expiration, strike, right, quantity, and side. "
-            "Before submitting in the same agent run, call account_portfolio, account_positions, orders_open_orders, market_last_price or market_last_prices for each underlying symbol, options_get_chain, and options_calculate_multileg_price after evaluating every exact leg. "
+            "Before submitting in the same agent run, inspect the injected account_snapshot, market_last_price or market_last_prices for each underlying symbol, options_get_chain, and options_calculate_multileg_price after evaluating every exact leg. A complete injected account_snapshot satisfies the initial account_portfolio, account_positions, and open-order inspection; after any order mutation, refresh account_portfolio, account_positions, and orders_open_orders before another order. Market and option evidence are always required. "
             "Opening sides are buy_to_open and sell_to_open. Closing sides are buy_to_close and sell_to_close. Use matching quantities when the intended position requires matched contracts. "
             "When closing existing positions, map signed account quantities exactly: positive long quantity -> sell_to_close; negative short quantity -> buy_to_close. Reversing that mapping increases exposure instead of closing it. "
             "Immediately before submission, reconcile every closing leg against the latest account_positions result. Reject the package yourself if any positive quantity is paired with buy_to_close or any negative quantity is paired with sell_to_close. "
@@ -2768,30 +3263,71 @@ class _MarketTools:
         )
 
 
+class _RiskTools:
+    def calculate_stock_quantity(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="risk_calculate_stock_quantity",
+            description="Calculate a whole-share stock quantity within notional and cash caps.",
+            binder=_bind_calculate_stock_quantity,
+        )
+
+
 class _OptionsTools:
     def get_chain(self) -> ToolDefinition:
-        return ToolDefinition(name="options_get_chain", description="Retrieve an underlying's available option chain.", binder=_bind_options_get_chain)
+        return ToolDefinition(
+            name="options_get_chain",
+            description="Retrieve an underlying's available option chain.",
+            binder=_bind_options_get_chain,
+        )
 
     def get_strikes(self) -> ToolDefinition:
-        return ToolDefinition(name="options_get_strikes", description="List strikes for one expiration and option right.", binder=_bind_options_get_strikes)
+        return ToolDefinition(
+            name="options_get_strikes",
+            description="List strikes for one expiration and option right.",
+            binder=_bind_options_get_strikes,
+        )
 
     def get_greeks(self) -> ToolDefinition:
-        return ToolDefinition(name="options_get_greeks", description="Get Greeks for one exact option contract.", binder=_bind_options_get_greeks)
+        return ToolDefinition(
+            name="options_get_greeks",
+            description="Get Greeks for one exact option contract.",
+            binder=_bind_options_get_greeks,
+        )
 
     def find_strike_for_delta(self) -> ToolDefinition:
-        return ToolDefinition(name="options_find_strike_for_delta", description="Find a listed option strike closest to a target delta.", binder=_bind_options_find_strike_for_delta)
+        return ToolDefinition(
+            name="options_find_strike_for_delta",
+            description="Find a listed option strike closest to a target delta.",
+            binder=_bind_options_find_strike_for_delta,
+        )
 
     def evaluate_market(self) -> ToolDefinition:
-        return ToolDefinition(name="options_evaluate_market", description="Evaluate quote quality for one exact option contract.", binder=_bind_options_evaluate_market)
+        return ToolDefinition(
+            name="options_evaluate_market",
+            description="Evaluate quote quality for one exact option contract.",
+            binder=_bind_options_evaluate_market,
+        )
 
     def calculate_multileg_price(self) -> ToolDefinition:
-        return ToolDefinition(name="options_calculate_multileg_price", description="Calculate a signed net price for exact option legs.", binder=_bind_options_calculate_multileg_price)
+        return ToolDefinition(
+            name="options_calculate_multileg_price",
+            description="Calculate a signed net price for exact option legs.",
+            binder=_bind_options_calculate_multileg_price,
+        )
 
     def find_expiration(self) -> ToolDefinition:
-        return ToolDefinition(name="options_find_expiration", description="Find a listed expiration on or after a target date.", binder=_bind_options_find_expiration)
+        return ToolDefinition(
+            name="options_find_expiration",
+            description="Find a listed expiration on or after a target date.",
+            binder=_bind_options_find_expiration,
+        )
 
     def check_spread_profit(self) -> ToolDefinition:
-        return ToolDefinition(name="options_check_spread_profit", description="Estimate multi-leg spread P&L percentage from exact legs.", binder=_bind_options_check_spread_profit)
+        return ToolDefinition(
+            name="options_check_spread_profit",
+            description="Estimate multi-leg spread P&L percentage from exact legs.",
+            binder=_bind_options_check_spread_profit,
+        )
 
 
 class _DuckDBTools:
@@ -2823,27 +3359,43 @@ class _NewsTools:
 
 class _IndicatorTools:
     def list_indicators(self) -> ToolDefinition:
-        return ToolDefinition(name="list_indicators", description="List common technical indicators.", binder=_bind_list_indicators)
+        return ToolDefinition(
+            name="list_indicators", description="List common technical indicators.", binder=_bind_list_indicators
+        )
 
     def get_indicator(self) -> ToolDefinition:
-        return ToolDefinition(name="get_indicator", description="Get one current-bar technical indicator.", binder=_bind_get_indicator)
+        return ToolDefinition(
+            name="get_indicator", description="Get one current-bar technical indicator.", binder=_bind_get_indicator
+        )
 
     def get_indicators(self) -> ToolDefinition:
-        return ToolDefinition(name="get_indicators", description="Get multiple current-bar technical indicators.", binder=_bind_get_indicators)
+        return ToolDefinition(
+            name="get_indicators",
+            description="Get multiple current-bar technical indicators.",
+            binder=_bind_get_indicators,
+        )
 
 
 class _FundamentalTools:
     def income_statement(self) -> ToolDefinition:
-        return ToolDefinition(name="get_income_statement", description="Get SEC income statement facts.", binder=_bind_get_income_statement)
+        return ToolDefinition(
+            name="get_income_statement",
+            description="Get SEC income statement facts.",
+            binder=_bind_get_income_statement,
+        )
 
     def balance_sheet(self) -> ToolDefinition:
-        return ToolDefinition(name="get_balance_sheet", description="Get SEC balance sheet facts.", binder=_bind_get_balance_sheet)
+        return ToolDefinition(
+            name="get_balance_sheet", description="Get SEC balance sheet facts.", binder=_bind_get_balance_sheet
+        )
 
     def cash_flow(self) -> ToolDefinition:
         return ToolDefinition(name="get_cash_flow", description="Get SEC cash flow facts.", binder=_bind_get_cash_flow)
 
     def company_facts(self) -> ToolDefinition:
-        return ToolDefinition(name="get_company_facts", description="Get SEC companyfacts.", binder=_bind_get_company_facts)
+        return ToolDefinition(
+            name="get_company_facts", description="Get SEC companyfacts.", binder=_bind_get_company_facts
+        )
 
     def filings(self) -> ToolDefinition:
         return ToolDefinition(name="get_filings", description="List SEC filings.", binder=_bind_get_filings)
@@ -2852,27 +3404,43 @@ class _FundamentalTools:
         return ToolDefinition(name="search_filing", description="Search a SEC filing.", binder=_bind_search_filing)
 
     def filing_document(self) -> ToolDefinition:
-        return ToolDefinition(name="get_filing_document", description="Read a SEC filing document.", binder=_bind_get_filing_document)
+        return ToolDefinition(
+            name="get_filing_document", description="Read a SEC filing document.", binder=_bind_get_filing_document
+        )
 
     def list_filing_sections(self) -> ToolDefinition:
-        return ToolDefinition(name="list_filing_sections", description="List SEC filing sections.", binder=_bind_list_filing_sections)
+        return ToolDefinition(
+            name="list_filing_sections", description="List SEC filing sections.", binder=_bind_list_filing_sections
+        )
 
     def filing_section(self) -> ToolDefinition:
-        return ToolDefinition(name="get_filing_section", description="Read one SEC filing section.", binder=_bind_get_filing_section)
+        return ToolDefinition(
+            name="get_filing_section", description="Read one SEC filing section.", binder=_bind_get_filing_section
+        )
 
 
 class _MacroTools:
     def list_fred_series(self) -> ToolDefinition:
-        return ToolDefinition(name="list_fred_series", description="List curated FRED macro series.", binder=_bind_list_fred_series)
+        return ToolDefinition(
+            name="list_fred_series", description="List curated FRED macro series.", binder=_bind_list_fred_series
+        )
 
     def get_fred_series(self) -> ToolDefinition:
-        return ToolDefinition(name="get_fred_series", description="Get a FRED macro time series.", binder=_bind_get_fred_series)
+        return ToolDefinition(
+            name="get_fred_series", description="Get a FRED macro time series.", binder=_bind_get_fred_series
+        )
 
     def get_fred_latest(self) -> ToolDefinition:
-        return ToolDefinition(name="get_fred_latest", description="Get the latest FRED macro observation.", binder=_bind_get_fred_latest)
+        return ToolDefinition(
+            name="get_fred_latest", description="Get the latest FRED macro observation.", binder=_bind_get_fred_latest
+        )
 
     def get_fred_snapshot(self) -> ToolDefinition:
-        return ToolDefinition(name="get_fred_snapshot", description="Get a multi-series FRED macro snapshot.", binder=_bind_get_fred_snapshot)
+        return ToolDefinition(
+            name="get_fred_snapshot",
+            description="Get a multi-series FRED macro snapshot.",
+            binder=_bind_get_fred_snapshot,
+        )
 
 
 class _NotificationTools:
@@ -2896,19 +3464,27 @@ class _MemoryTools:
         )
 
     def remember_proposal(self) -> ToolDefinition:
-        return ToolDefinition(name="remember_proposal", description="Record a non-final trade proposal.", binder=_bind_remember_proposal)
+        return ToolDefinition(
+            name="remember_proposal", description="Record a non-final trade proposal.", binder=_bind_remember_proposal
+        )
 
     def remember_risk_note(self) -> ToolDefinition:
-        return ToolDefinition(name="remember_risk_note", description="Record a compact risk note.", binder=_bind_remember_risk_note)
+        return ToolDefinition(
+            name="remember_risk_note", description="Record a compact risk note.", binder=_bind_remember_risk_note
+        )
 
     def remember_lesson(self) -> ToolDefinition:
-        return ToolDefinition(name="remember_lesson", description="Record a compact lesson.", binder=_bind_remember_lesson)
+        return ToolDefinition(
+            name="remember_lesson", description="Record a compact lesson.", binder=_bind_remember_lesson
+        )
 
     def open_thesis(self) -> ToolDefinition:
         return ToolDefinition(name="open_thesis", description="Open an investment thesis.", binder=_bind_open_thesis)
 
     def update_thesis(self) -> ToolDefinition:
-        return ToolDefinition(name="update_thesis", description="Update an investment thesis.", binder=_bind_update_thesis)
+        return ToolDefinition(
+            name="update_thesis", description="Update an investment thesis.", binder=_bind_update_thesis
+        )
 
     def close_thesis(self) -> ToolDefinition:
         return ToolDefinition(name="close_thesis", description="Close an investment thesis.", binder=_bind_close_thesis)
@@ -2940,10 +3516,18 @@ class _OrderTools:
         )
 
     def open_orders(self) -> ToolDefinition:
-        return ToolDefinition(name="orders_open_orders", description="List tracked orders and their identifiers.", binder=_bind_open_orders)
+        return ToolDefinition(
+            name="orders_open_orders",
+            description="List tracked orders and their identifiers.",
+            binder=_bind_open_orders,
+        )
 
     def get_status(self) -> ToolDefinition:
-        return ToolDefinition(name="orders_get_status", description="Get status for one or more tracked order identifiers.", binder=_bind_orders_get_status)
+        return ToolDefinition(
+            name="orders_get_status",
+            description="Get status for one or more tracked order identifiers.",
+            binder=_bind_orders_get_status,
+        )
 
     def wait_for_terminal(self) -> ToolDefinition:
         return ToolDefinition(
@@ -2964,6 +3548,7 @@ class _OrderTools:
 class _BuiltinTools:
     account = _AccountTools()
     market = _MarketTools()
+    risk = _RiskTools()
     options = _OptionsTools()
     duckdb = _DuckDBTools()
     docs = _DocsTools()
@@ -2984,6 +3569,7 @@ class _BuiltinTools:
             self.market.last_prices(),
             self.market.historical_prices(),
             self.market.load_history_table(),
+            self.risk.calculate_stock_quantity(),
             self.options.get_chain(),
             self.options.get_strikes(),
             self.options.get_greeks(),

@@ -1,5 +1,5 @@
-import hashlib
 import functools
+import hashlib
 import inspect
 import json
 import os
@@ -13,15 +13,21 @@ from typing import Any
 from lumibot import LUMIBOT_CACHE_FOLDER
 
 from .schemas import AgentRunResult, AgentTraceEvent, BoundTool, MCPServer, ToolDefinition
+from .skills import BUILTIN_SKILL_LOADING_INSTRUCTION
 from .tool_context import agent_tool_context
 from .tools import bind_callable_tool
-
 
 _TIMESTAMP_HINT_RE = re.compile(
     r"(time|date|datetime|published|updated|created|accepted|released|release|as_of|realtime)",
     re.IGNORECASE,
 )
 _DEFAULT_MEMORY_NOTE_MAX_CHARS = 2000
+_BOTSPOT_RESEARCH_TOOLS = [
+    "search_data_catalog",
+    "query_data",
+    "search_documents",
+    "get_document",
+]
 
 
 class AgentModelCallLimitExceeded(RuntimeError):
@@ -48,7 +54,8 @@ def _get_pandas():
 def _get_replay_imports():
     global _REPLAY_IMPORTS
     if _REPLAY_IMPORTS is None:
-        from .replay_cache import AgentReplayCache, _normalize_json as normalize_json
+        from .replay_cache import AgentReplayCache
+        from .replay_cache import _normalize_json as normalize_json
 
         _REPLAY_IMPORTS = (AgentReplayCache, normalize_json)
     return _REPLAY_IMPORTS
@@ -113,6 +120,40 @@ def _current_strategy_datetime(strategy: Any) -> Any:
     if hasattr(strategy, "get_datetime"):
         return _safe_call(strategy.get_datetime)
     return None
+
+
+def _botspot_research_server_from_environment() -> tuple[MCPServer | None, str | None]:
+    url = str(os.environ.get("BOTSPOT_RESEARCH_MCP_URL") or "").strip()
+    token = str(os.environ.get("BOTSPOT_RESEARCH_MCP_TOKEN") or "").strip()
+    renew_url = str(os.environ.get("BOTSPOT_RESEARCH_MCP_RENEW_URL") or "").strip()
+    configured = [bool(url), bool(token), bool(renew_url)]
+    if not any(configured):
+        return (
+            None,
+            "BotSpot managed public macro and SEC research are not linked. This optional capability "
+            "is attached automatically on BotSpot; external LumiBot users can link a BotSpot account. "
+            "Ordinary LumiBot tools and strategy execution remain available.",
+        )
+    if not all(configured):
+        return (
+            None,
+            "BotSpot research is only partially configured. Link a BotSpot account or run on BotSpot "
+            "to use the managed public macro and SEC research catalog.",
+        )
+    try:
+        return (
+            MCPServer(
+                name="botspot_research",
+                transport="streamable_http",
+                url=url,
+                exposed_tools=_BOTSPOT_RESEARCH_TOOLS,
+                auth_token_env="BOTSPOT_RESEARCH_MCP_TOKEN",
+                auth_token_refresh_url=renew_url,
+            ),
+            None,
+        )
+    except ValueError as exc:
+        return None, f"BotSpot research configuration is invalid: {exc}"
 
 
 def _iso_or_none(value: Any) -> str | None:
@@ -337,10 +378,15 @@ _AGENT_DETAIL_COLUMNS = [
     "agent_name",
     "model",
     "mode",
+    "runtime_version",
+    "ai_access_mode",
+    "gateway_protocol_version",
+    "gateway_component_sha256",
     "cache_hit",
     "event_kind",
     "is_call_summary",
     "tool_name",
+    "tool_call_id",
     "event_detail",
     "event_payload_json",
     "event_text",
@@ -364,6 +410,7 @@ _AGENT_DETAIL_COLUMNS = [
     "outcome_requiredness",
     "outcome_retryability",
     "outcome_fallback_used",
+    "outcome_status",
     "outcome_decision_completed",
     "outcome_broker_state_certainty",
     "outcome_impact",
@@ -547,25 +594,29 @@ def _summarize_tool_payload(tool_name: str | None, payload: Any) -> str:
             headline = article.get("headline") or "untitled"
             prefix = f"{symbols} " if symbols else ""
             headline_parts.append(f"{prefix}@ {published_at}: {headline}")
-        return _sanitize_csv_text(_truncate_text(
-            f"count={payload.get('count', len(articles))} "
-            f"window=({payload.get('window_start')} -> {payload.get('window_end')}) "
-            f"headlines={headline_parts}"
-        ))
+        return _sanitize_csv_text(
+            _truncate_text(
+                f"count={payload.get('count', len(articles))} "
+                f"window=({payload.get('window_start')} -> {payload.get('window_end')}) "
+                f"headlines={headline_parts}"
+            )
+        )
 
     if "row_count" in payload and "table_name" in payload:
-        return _sanitize_csv_text(_truncate_text(
-            f"table={payload.get('table_name')} symbol={payload.get('symbol')} "
-            f"rows={payload.get('row_count')} timestep={payload.get('timestep')} "
-            f"loaded_at={payload.get('loaded_at')}"
-        ))
+        return _sanitize_csv_text(
+            _truncate_text(
+                f"table={payload.get('table_name')} symbol={payload.get('symbol')} "
+                f"rows={payload.get('row_count')} timestep={payload.get('timestep')} "
+                f"loaded_at={payload.get('loaded_at')}"
+            )
+        )
 
     if "rows" in payload and "row_count" in payload:
         rows = payload.get("rows") or []
         sample = rows[0] if rows else {}
-        return _sanitize_csv_text(_truncate_text(
-            f"rows={payload.get('row_count')} sample={_compact_json(sample, limit=140)}"
-        ))
+        return _sanitize_csv_text(
+            _truncate_text(f"rows={payload.get('row_count')} sample={_compact_json(sample, limit=140)}")
+        )
 
     if "positions" in payload and isinstance(payload["positions"], list):
         labels: list[str] = []
@@ -578,16 +629,20 @@ def _summarize_tool_payload(tool_name: str | None, payload: Any) -> str:
         return _sanitize_csv_text(_truncate_text(f"positions={labels}"))
 
     if "cash" in payload and "portfolio_value" in payload:
-        return _sanitize_csv_text(_truncate_text(
-            f"cash={payload.get('cash')} portfolio_value={payload.get('portfolio_value')} "
-            f"datetime={payload.get('datetime')}"
-        ))
+        return _sanitize_csv_text(
+            _truncate_text(
+                f"cash={payload.get('cash')} portfolio_value={payload.get('portfolio_value')} "
+                f"datetime={payload.get('datetime')}"
+            )
+        )
 
     if "identifier" in payload or "status" in payload:
-        return _sanitize_csv_text(_truncate_text(
-            f"identifier={payload.get('identifier')} status={payload.get('status')} "
-            f"symbol={payload.get('symbol')} side={payload.get('side')} quantity={payload.get('quantity')}"
-        ))
+        return _sanitize_csv_text(
+            _truncate_text(
+                f"identifier={payload.get('identifier')} status={payload.get('status')} "
+                f"symbol={payload.get('symbol')} side={payload.get('side')} quantity={payload.get('quantity')}"
+            )
+        )
 
     return _flatten_csv_value(payload) or _sanitize_csv_text(_compact_json(payload))
 
@@ -603,6 +658,32 @@ def _visible_model_texts(result: AgentRunResult) -> list[str]:
         and event.text.strip()
         and event.text.strip() != summary
     ]
+
+
+def _coalesce_trace_events(events: list[AgentTraceEvent]) -> list[AgentTraceEvent]:
+    """Coalesce adjacent streamed text/thinking deltas for bounded artifacts."""
+
+    coalesced: list[AgentTraceEvent] = []
+    for event in events:
+        previous = coalesced[-1] if coalesced else None
+        if (
+            previous is not None
+            and event.kind in {"text", "thinking"}
+            and previous.kind == event.kind
+            and previous.tool_name == event.tool_name
+            and previous.call_id == event.call_id
+            and isinstance(previous.text, str)
+            and isinstance(event.text, str)
+        ):
+            left = previous.text
+            right = event.text
+            separator = ""
+            if len(left) > 2 and len(right) > 2 and left[-1:].isalnum() and right[:1].isalnum():
+                separator = " "
+            previous.text = f"{left}{separator}{right}"
+            continue
+        coalesced.append(event)
+    return coalesced
 
 
 def _thinking_texts(result: AgentRunResult) -> list[str]:
@@ -631,10 +712,32 @@ def _runtime_timing_payload(result: AgentRunResult) -> dict[str, Any]:
     }
 
 
+@functools.lru_cache(maxsize=1)
+def _managed_gateway_component_sha256() -> str:
+    from . import managed_gateway
+
+    return hashlib.sha256(Path(managed_gateway.__file__).read_bytes()).hexdigest()
+
+
+def _managed_ai_provenance(model: str) -> dict[str, Any]:
+    from lumibot import __version__
+
+    from .managed_gateway import managed_gateway_available_for
+
+    managed = managed_gateway_available_for(model)
+    return {
+        "runtime_version": str(__version__),
+        "ai_access_mode": "botspot_managed" if managed else "byok",
+        "gateway_protocol_version": 2 if managed else None,
+        "gateway_component_sha256": _managed_gateway_component_sha256() if managed else None,
+    }
+
+
 def _managed_ai_execution_outcome(
     *,
     required_for_decision: bool,
     decision_completed: bool,
+    decision_status: str,
     error_category: str | None = None,
     fallback_used: bool = False,
 ) -> dict[str, Any]:
@@ -649,6 +752,7 @@ def _managed_ai_execution_outcome(
             else "not_applicable"
         ),
         "fallback_used": bool(fallback_used),
+        "status": decision_status,
         "decision_completed": bool(decision_completed),
         "broker_state_certainty": "not_observed",
         "impact": (
@@ -660,6 +764,48 @@ def _managed_ai_execution_outcome(
         ),
         "error_category": error_category,
     }
+
+
+def _managed_ai_terminal_status(result: AgentRunResult, *, allow_trading: bool) -> str:
+    """Classify a successful ADK run from structural tool events only."""
+
+    mutating_order_tools = {
+        "orders_submit_order",
+        "orders_submit_multileg",
+        "orders_cancel_order",
+        "orders_modify_order",
+    }
+    tool_results = result.tool_results
+    successful_order = any(
+        str(event.tool_name or "") in mutating_order_tools
+        and not (
+            isinstance(_unwrap_tool_payload(event.payload), dict)
+            and _unwrap_tool_payload(event.payload).get("tool_error") is True
+        )
+        for event in tool_results
+    )
+    if successful_order:
+        return "completed_decision"
+    if any(
+        isinstance(_unwrap_tool_payload(event.payload), dict)
+        and _unwrap_tool_payload(event.payload).get("tool_error") is True
+        for event in tool_results
+    ):
+        return "tool_error"
+    return "completed_no_action" if allow_trading else "completed_decision"
+
+
+def _managed_ai_error_status(exc: BaseException) -> str:
+    """Classify a failed run from typed exception metadata, never response text."""
+
+    code = str(getattr(exc, "code", "") or "").strip().lower()
+    if code == "protocol_integrity_error":
+        return "protocol_integrity_error"
+    if code == "tool_error" or code.startswith("tool_"):
+        return "tool_error"
+    if code.startswith("provider_") or code in {"gateway_error", "renewal_failed"}:
+        return "provider_error"
+    return "runtime_error"
 
 
 def _iter_timestamp_candidates(value: Any, *, path: str = "payload", hinted: bool = False):
@@ -759,6 +905,7 @@ class AgentHandle:
         self.include_builtin_skills = bool(include_builtin_skills)
         self.rules_path = rules_path
         from .builtins import BuiltinTools
+
         builtin_tools = self._filter_tools_for_trading_permission(BuiltinTools.all())
         if tools is None:
             self._tool_inputs = builtin_tools
@@ -766,7 +913,12 @@ class AgentHandle:
             self._tool_inputs = builtin_tools + self._filter_tools_for_trading_permission(list(tools))
         else:
             self._tool_inputs = self._filter_tools_for_trading_permission(list(tools))
-        self._mcp_servers = mcp_servers or []
+        self._mcp_servers = list(mcp_servers or [])
+        hosted_research, research_warning = _botspot_research_server_from_environment()
+        if hosted_research and all(server.name != hosted_research.name for server in self._mcp_servers):
+            self._mcp_servers.append(hosted_research)
+        if research_warning:
+            self.manager._warn_once("botspot_research_configuration", research_warning)
         google_runtime, _RuntimeRequest, _StubAgentRuntime, _call_mcp_tool = _get_runtime_imports()
         self._runtime = runtime or google_runtime(mcp_servers=self._mcp_servers)
         self._bound_tools: list[BoundTool] | None = None
@@ -833,20 +985,31 @@ class AgentHandle:
             return current_dt.isoformat()
         return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
-    def _serialize_positions(self) -> list[dict[str, Any]]:
+    def _serialize_positions(self, limit: int = 50) -> tuple[list[dict[str, Any]], int, bool]:
         if not hasattr(self.manager.strategy, "get_positions"):
-            return []
-        positions = _safe_call(lambda: self.manager.strategy.get_positions(include_cash_positions=True), default=[]) or []
+            return [], 0, False
+        try:
+            positions = self.manager.strategy.get_positions(include_cash_positions=True) or []
+        except Exception:
+            return [], 0, False
         _order_to_dict, _position_to_dict = _get_builtin_serializers()
-        return [_position_to_dict(position) for position in positions]
+        serialized = sorted(
+            (_position_to_dict(position) for position in positions),
+            key=lambda payload: json.dumps(payload.get("asset", {}), sort_keys=True, default=str),
+        )
+        return serialized[:limit], len(serialized), len(serialized) <= limit
 
-    def _serialize_account_state(self) -> dict[str, Any]:
-        return {
-            "cash": _safe_call(self.manager.strategy.get_cash) if hasattr(self.manager.strategy, "get_cash") else None,
-            "portfolio_value": _safe_call(self.manager.strategy.get_portfolio_value)
+    def _serialize_account_state(self) -> tuple[dict[str, Any], bool]:
+        cash = _safe_call(self.manager.strategy.get_cash) if hasattr(self.manager.strategy, "get_cash") else None
+        portfolio_value = (
+            _safe_call(self.manager.strategy.get_portfolio_value)
             if hasattr(self.manager.strategy, "get_portfolio_value")
-            else None,
-        }
+            else None
+        )
+        return {
+            "cash": cash,
+            "portfolio_value": portfolio_value,
+        }, cash is not None and portfolio_value is not None
 
     def _serialize_orders(self, limit: int = 10) -> list[dict[str, Any]]:
         if not hasattr(self.manager.strategy, "get_orders"):
@@ -854,6 +1017,36 @@ class AgentHandle:
         orders = _safe_call(self.manager.strategy.get_orders, default=[]) or []
         _order_to_dict, _position_to_dict = _get_builtin_serializers()
         return [_order_to_dict(order) for order in orders[-limit:]]
+
+    def _serialize_open_orders(self, limit: int = 50) -> tuple[list[dict[str, Any]], int, bool]:
+        if not hasattr(self.manager.strategy, "get_orders"):
+            return [], 0, False
+        try:
+            orders = self.manager.strategy.get_orders() or []
+        except Exception:
+            return [], 0, False
+        _order_to_dict, _position_to_dict = _get_builtin_serializers()
+        active_statuses = {"unprocessed", "submitted", "open", "new", "cancelling", "partial_fill"}
+        active_orders = []
+        for order in orders:
+            is_active = getattr(order, "is_active", None)
+            if callable(is_active):
+                try:
+                    if not is_active():
+                        continue
+                except Exception:
+                    pass
+            elif str(getattr(order, "status", "") or "").strip().lower() not in active_statuses:
+                continue
+            active_orders.append(order)
+        serialized = sorted(
+            (_order_to_dict(order) for order in active_orders),
+            key=lambda payload: (
+                json.dumps(payload.get("asset", {}), sort_keys=True, default=str),
+                str(payload.get("identifier") or ""),
+            ),
+        )
+        return serialized[:limit], len(serialized), len(serialized) <= limit
 
     def _runtime_mode(self) -> str:
         return "backtesting" if bool(getattr(self.manager.strategy, "is_backtesting", False)) else "live"
@@ -864,15 +1057,32 @@ class AgentHandle:
         from .rules import load_strategy_rules
 
         strategy_rules = load_strategy_rules(strategy, self.rules_path)
+        positions, positions_count, positions_complete = self._serialize_positions()
+        account, account_complete = self._serialize_account_state()
+        open_orders, open_orders_count, open_orders_complete = self._serialize_open_orders()
+        as_of = _iso_or_none(current_dt)
         return {
             "agent_name": self.name,
             "mode": self._runtime_mode(),
-            "current_datetime": _iso_or_none(current_dt),
+            "current_datetime": as_of,
             "timezone": _strategy_timezone_name(strategy, current_dt),
             "strategy_name": getattr(strategy, "name", None) or strategy.__class__.__name__,
             "market": getattr(strategy, "market", None),
-            "positions": self._serialize_positions(),
-            "account": self._serialize_account_state(),
+            "positions": positions,
+            "account": account,
+            "open_orders": open_orders,
+            "account_snapshot": {
+                "as_of": as_of,
+                "account_complete": account_complete,
+                "positions_total": positions_count,
+                "positions_included": len(positions),
+                "positions_omitted": max(positions_count - len(positions), 0),
+                "positions_complete": positions_complete,
+                "open_orders_total": open_orders_count,
+                "open_orders_included": len(open_orders),
+                "open_orders_omitted": max(open_orders_count - len(open_orders), 0),
+                "open_orders_complete": open_orders_complete,
+            },
             "recent_orders": self._serialize_orders(),
             "recent_trades": _serialize_recent_trade_events(strategy),
             "strategy_rules": strategy_rules.runtime_context(),
@@ -880,12 +1090,41 @@ class AgentHandle:
 
     def _base_system_prompt(self, runtime_context: dict[str, Any]) -> str:
         mode = runtime_context.get("mode") or "live"
+        account_snapshot = runtime_context.get("account_snapshot") or {}
+        omitted_warnings: list[str] = []
+        positions_omitted = int(account_snapshot.get("positions_omitted") or 0)
+        open_orders_omitted = int(account_snapshot.get("open_orders_omitted") or 0)
+        if positions_omitted:
+            omitted_warnings.append(
+                f"{positions_omitted} positions are omitted from the injected snapshot; they still exist. "
+                "Use complete unfiltered account_positions pagination before treating the portfolio as fully inspected."
+            )
+        if open_orders_omitted:
+            omitted_warnings.append(
+                f"{open_orders_omitted} open orders are omitted from the injected snapshot; they still exist. "
+                "Use complete unfiltered orders_open_orders pagination before concluding no other open orders exist."
+            )
+        available_tool_names = {tool.name for tool in self._ensure_bound_tools()}
+        if "risk_calculate_stock_quantity" in available_tool_names:
+            stock_sizing_instruction = (
+                "For a stock order constrained by a notional or portfolio-percentage cap, use "
+                "risk_calculate_stock_quantity and submit its returned whole-share quantity unchanged only when "
+                "quantity is greater than zero; otherwise make a no-trade decision."
+            )
+        else:
+            stock_sizing_instruction = (
+                "risk_calculate_stock_quantity is unavailable. Do not submit a stock order constrained by a "
+                "notional or portfolio-percentage cap unless another available tool produces a verified positive "
+                "whole-share quantity within both the cap and available cash; otherwise make a no-trade decision."
+            )
         lines = [
             "You are operating as a trading agent inside LumiBot.",
             "Use the provided runtime context and tool outputs as the ground truth for the current state of the strategy.",
             "Ground claims in tool results or runtime context instead of unsupported prior knowledge or vague market memory.",
             "If evidence is weak, conflicting, stale, or incomplete, prefer doing nothing and explain why.",
             "Execution mode, current datetime, current timezone, current positions, cash, equity/portfolio value, recent orders, and recent trades are provided in Runtime Context JSON.",
+            "Runtime Context JSON includes account_snapshot freshness, counts, and completeness flags. Treat truncated or incomplete snapshots as insufficient and call the relevant account tool before acting.",
+            *omitted_warnings,
             "Review current exposure, available cash, and recent activity before proposing any new trade.",
             "",
             "DEFAULT INVESTOR POLICY - FOLLOW THIS UNLESS THE USER'S SYSTEM PROMPT CLEARLY ASKS FOR A DIFFERENT STYLE:",
@@ -916,7 +1155,7 @@ class AgentHandle:
             "POSITION SIZING AND ORDER EXECUTION:",
             "Do not buy token one-share positions. Use account cash, portfolio value, current position size, and last price to calculate a sensible whole-share quantity.",
             "Round down to whole shares when sizing positions.",
-            "Before every order, check current cash, portfolio value, current positions, and the latest price of the asset you are ordering. Lumibot rejects agent order submissions that skip those checks in the current agent run.",
+            "Before every order, check current cash, portfolio value, current positions, open orders, and the latest price of the asset you are ordering. A complete current injected snapshot satisfies the initial account and open-order checks. After any order mutation, Lumibot requires fresh complete account_positions and orders_open_orders pagination plus account_portfolio before another order.",
             "Estimate the order's cash impact before submitting it. Ask whether the order is likely to create negative cash or additional leverage, and only do that when it is intentional for the strategy and suitable for the asset class.",
             "Margin and leverage behave differently across stocks, ETFs, options, futures, forex, crypto, brokers, and jurisdictions. Use judgment instead of assuming the same sizing rule works for every asset class.",
             "When switching from one asset to another, close or reduce the current position first to free up capital before buying the replacement.",
@@ -925,6 +1164,7 @@ class AgentHandle:
             "TOOL USAGE:",
             "Use your available tools to gather evidence before making any trading decision. Do not guess when a tool can give you the answer.",
             "Before placing any trade, use tools to check current positions, available cash, and portfolio value.",
+            stock_sizing_instruction,
             "Load recent price history for any asset you are considering and inspect it before deciding.",
             "If you already hold a position and are considering adding, reducing, or selling it, call search_memory for the open thesis first and compare the current evidence against that thesis.",
             "When available, use the built-in evidence stack before making a material equity decision: account/portfolio tools, current market prices, recent price history, DuckDB analysis, technical indicators, relevant news, macro/FRED data, SEC financial statements, SEC company facts, and SEC filings.",
@@ -934,12 +1174,13 @@ class AgentHandle:
             "If the user asks for an aggressive or concentrated strategy, let that user strategy prompt override the default investor style, but still ground the decision in tool evidence, position sizing, broker constraints, and backtesting look-ahead safety.",
             "When querying DuckDB tables, use datetime for timestamp columns and close for price columns unless the loaded sample rows clearly show different column names.",
             "When you have access to external MCP tools, explore what they offer and use them. You do not need to be told which specific tool to call.",
+            "Before your final response, reconcile every state-changing tool result with the latest account and order reads. Never claim that no order was submitted after an order tool returned a submitted identifier; report the exact observed order status, even if your later analysis changes.",
             "Finish every run with a short summary sentence starting with RESULT: that explains what you did and why.",
         ]
         if self.include_builtin_skills:
             lines.insert(
                 -1,
-                "Asset-class skills are available through list_skills, load_skill, and load_skill_resource. Before researching, selecting, opening, modifying, closing, or managing any stock, ETF, or option position or related pending order, you MUST load the matching skill and follow it. If a broad mandate leads you to consider an asset class later, load its skill at that point before acting on the asset. Skill loading supplies knowledge; it does not choose a trade or override active strategy rules.",
+                BUILTIN_SKILL_LOADING_INSTRUCTION,
             )
         if mode == "backtesting":
             lines.extend(
@@ -1023,9 +1264,7 @@ class AgentHandle:
             try:
                 self._append_legacy_run_artifact_summary(run)
             except Exception as exc:
-                self.manager._log_warning(
-                    f"Could not archive legacy agent run summary for {self.name}: {exc}"
-                )
+                self.manager._log_warning(f"Could not archive legacy agent run summary for {self.name}: {exc}")
                 compacted_runs.append(run)
                 continue
             compacted_runs.append({key: value for key, value in run.items() if key != "summary"})
@@ -1050,8 +1289,12 @@ class AgentHandle:
 
                 def make_remote_tool(_server: MCPServer, _tool_name: str):
                     def remote_tool(payload: dict[str, Any]) -> dict[str, Any]:
+                        payload = self._bound_remote_tool_payload(_server, _tool_name, payload)
                         warning_key = (_server.name, _tool_name)
-                        if bool(getattr(self.manager.strategy, "is_backtesting", False)) and warning_key not in self.manager._warned_backtest_mcp_tools:
+                        if (
+                            bool(getattr(self.manager.strategy, "is_backtesting", False))
+                            and warning_key not in self.manager._warned_backtest_mcp_tools
+                        ):
                             log_message = getattr(self.manager.strategy, "log_message", None)
                             if callable(log_message):
                                 log_message(
@@ -1082,6 +1325,28 @@ class AgentHandle:
                     )
                 )
         return remote_tools
+
+    def _bound_remote_tool_payload(
+        self, server: MCPServer, tool_name: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        arguments = dict(payload or {})
+        if server.name != "botspot_research" or not bool(
+            getattr(self.manager.strategy, "is_backtesting", False)
+        ):
+            return arguments
+        current_dt = _current_strategy_datetime(self.manager.strategy)
+        if current_dt is None:
+            raise RuntimeError("BotSpot research requires a current simulated datetime during backtests.")
+        as_of = current_dt.date().isoformat() if hasattr(current_dt, "date") else str(current_dt)[:10]
+        if tool_name in {"query_data", "search_documents"}:
+            time_range = dict(arguments.get("timeRange") or {})
+            requested_end = str(time_range.get("endDate") or "").strip()
+            if not requested_end or requested_end[:10] > as_of:
+                time_range["endDate"] = as_of
+            arguments["timeRange"] = time_range
+        elif tool_name == "get_document":
+            arguments["asOf"] = as_of
+        return arguments
 
     def _ensure_bound_tools(self) -> list[BoundTool]:
         if self._bound_tools is not None:
@@ -1114,14 +1379,38 @@ class AgentHandle:
         without decoding a raw provider stack trace."""
         # Map provider prefix -> (env var, billing url).
         provider_hints = {
-            "openai/": ("OPENAI_API_KEY", "https://platform.openai.com/api-keys", "https://platform.openai.com/account/billing"),
+            "openai/": (
+                "OPENAI_API_KEY",
+                "https://platform.openai.com/api-keys",
+                "https://platform.openai.com/account/billing",
+            ),
             "xai/": ("XAI_API_KEY or GROK_API_KEY", "https://console.x.ai/", "https://console.x.ai/team"),
-            "anthropic/": ("ANTHROPIC_API_KEY", "https://console.anthropic.com/", "https://console.anthropic.com/settings/billing"),
-            "deepseek/": ("DEEPSEEK_API_KEY", "https://platform.deepseek.com/api_keys", "https://platform.deepseek.com/usage"),
-            "together_ai/": ("TOGETHER_API_KEY or TOGETHERAI_API_KEY", "https://api.together.ai/settings/api-keys", "https://api.together.ai/settings/billing"),
-            "cerebras/": ("CEREBRAS_API_KEY", "https://cloud.cerebras.ai/platform/", "https://cloud.cerebras.ai/platform/billing"),
+            "anthropic/": (
+                "ANTHROPIC_API_KEY",
+                "https://console.anthropic.com/",
+                "https://console.anthropic.com/settings/billing",
+            ),
+            "deepseek/": (
+                "DEEPSEEK_API_KEY",
+                "https://platform.deepseek.com/api_keys",
+                "https://platform.deepseek.com/usage",
+            ),
+            "together_ai/": (
+                "TOGETHER_API_KEY or TOGETHERAI_API_KEY",
+                "https://api.together.ai/settings/api-keys",
+                "https://api.together.ai/settings/billing",
+            ),
+            "cerebras/": (
+                "CEREBRAS_API_KEY",
+                "https://cloud.cerebras.ai/platform/",
+                "https://cloud.cerebras.ai/platform/billing",
+            ),
         }
-        env_var, key_url, billing_url = ("GEMINI_API_KEY", "https://aistudio.google.com/apikey", "https://aistudio.google.com/")
+        env_var, key_url, billing_url = (
+            "GEMINI_API_KEY",
+            "https://aistudio.google.com/apikey",
+            "https://aistudio.google.com/",
+        )
         for prefix, (ev, ku, bu) in provider_hints.items():
             if isinstance(model, str) and model.startswith(prefix):
                 env_var, key_url, billing_url = ev, ku, bu
@@ -1137,31 +1426,39 @@ class AgentHandle:
             "",
         ]
         if category == "auth":
-            lines.extend([
-                f"Likely cause: {env_var} is missing or invalid.",
-                f"  Get a key at: {key_url}",
-                f"  Then:         export {env_var}='your-key-here'",
-            ])
+            lines.extend(
+                [
+                    f"Likely cause: {env_var} is missing or invalid.",
+                    f"  Get a key at: {key_url}",
+                    f"  Then:         export {env_var}='your-key-here'",
+                ]
+            )
         elif category == "billing":
-            lines.extend([
-                f"Likely cause: provider billing issue (out of credits, quota exceeded).",
-                f"  Check billing at: {billing_url}",
-            ])
+            lines.extend(
+                [
+                    "Likely cause: provider billing issue (out of credits, quota exceeded).",
+                    f"  Check billing at: {billing_url}",
+                ]
+            )
         elif category == "config":
-            lines.extend([
-                "Likely cause: bad model id, malformed request, or context-window exceeded.",
-                f"  Current model:      {model}",
-                "  Verify the model id is on your provider's /models list.",
-                "  If context-window: reduce runtime context / memory / tool count.",
-            ])
-        lines.extend([
-            "",
-            "Backtest stopped intentionally so you can fix this and re-run.",
-            "Note: live trading does NOT stop on this error category — it logs and",
-            "skips the iteration so the bot stays alive for operator intervention.",
-            "=" * 78,
-            "",
-        ])
+            lines.extend(
+                [
+                    "Likely cause: bad model id, malformed request, or context-window exceeded.",
+                    f"  Current model:      {model}",
+                    "  Verify the model id is on your provider's /models list.",
+                    "  If context-window: reduce runtime context / memory / tool count.",
+                ]
+            )
+        lines.extend(
+            [
+                "",
+                "Backtest stopped intentionally so you can fix this and re-run.",
+                "Note: live trading does NOT stop on this error category — it logs and",
+                "skips the iteration so the bot stays alive for operator intervention.",
+                "=" * 78,
+                "",
+            ]
+        )
         try:
             sys.stderr.write("\n".join(lines))
             sys.stderr.flush()
@@ -1218,7 +1515,10 @@ class AgentHandle:
         return trace_dir
 
     def _write_trace(self, result: AgentRunResult, trace_payload: dict[str, Any]) -> Path:
-        trace_path = self._trace_dir() / f"{result.cache_key or 'live'}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}.json"
+        trace_path = (
+            self._trace_dir()
+            / f"{result.cache_key or 'live'}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}.json"
+        )
         trace_path.write_text(json.dumps(_normalize_json(trace_payload), indent=2, sort_keys=True), encoding="utf-8")
         return trace_path
 
@@ -1229,8 +1529,7 @@ class AgentHandle:
             trace_path = str(result.payload.get("trace_path") or "")
         execution_outcome = (
             result.payload.get("execution_outcome")
-            if isinstance(result.payload, dict)
-            and isinstance(result.payload.get("execution_outcome"), dict)
+            if isinstance(result.payload, dict) and isinstance(result.payload.get("execution_outcome"), dict)
             else {}
         )
         operation_outcomes = _structured_operation_outcomes(result)
@@ -1289,6 +1588,7 @@ class AgentHandle:
                 kind=str(event.get("kind")),
                 text=event.get("text"),
                 tool_name=event.get("tool_name"),
+                call_id=event.get("call_id"),
                 payload=event.get("payload"),
                 timestamp=event.get("timestamp"),
             )
@@ -1345,7 +1645,8 @@ class AgentHandle:
             name.startswith("market_")
             or name.startswith("duckdb_")
             or name.startswith("account_")
-            or name in {
+            or name
+            in {
                 "get_news",
                 "alpaca_news",
                 "list_fred_series",
@@ -1459,9 +1760,7 @@ class AgentHandle:
         )
         log_message(message, color="yellow")
         if result.tool_calls:
-            tool_sequence = " -> ".join(
-                event.tool_name or "unknown_tool" for event in result.tool_calls
-            )
+            tool_sequence = " -> ".join(event.tool_name or "unknown_tool" for event in result.tool_calls)
             log_message(f"[agents][tools] {tool_sequence}", color="yellow")
         for idx, event in enumerate(result.tool_calls, start=1):
             preview = _summarize_tool_payload(event.tool_name, event.payload)
@@ -1574,7 +1873,11 @@ class AgentHandle:
                     **(result.payload or {}),
                     "execution_outcome": _managed_ai_execution_outcome(
                         required_for_decision=self.allow_trading,
-                        decision_completed=True,
+                        decision_completed=(
+                            _managed_ai_terminal_status(result, allow_trading=self.allow_trading)
+                            in {"completed_decision", "completed_no_action"}
+                        ),
+                        decision_status=_managed_ai_terminal_status(result, allow_trading=self.allow_trading),
                     ),
                 }
                 self._replay_cached_side_effects(result)
@@ -1641,6 +1944,7 @@ class AgentHandle:
             raise
         except BaseException as exc:  # noqa: BLE001 - intentional broad catch
             import traceback as _tb
+
             from .runtime import _classify_agent_error
             from .schemas import AgentRunResult, AgentTraceEvent
 
@@ -1706,6 +2010,7 @@ class AgentHandle:
                 "execution_outcome": _managed_ai_execution_outcome(
                     required_for_decision=self.allow_trading,
                     decision_completed=False,
+                    decision_status=_managed_ai_error_status(exc),
                     error_category=category,
                     fallback_used=True,
                 ),
@@ -1738,9 +2043,11 @@ class AgentHandle:
         )
         result.cache_key = cache_key
         result.warnings = self._derive_warnings(result, runtime_context)
+        decision_status = _managed_ai_terminal_status(result, allow_trading=self.allow_trading)
         execution_outcome = _managed_ai_execution_outcome(
             required_for_decision=self.allow_trading,
-            decision_completed=True,
+            decision_completed=decision_status in {"completed_decision", "completed_no_action"},
+            decision_status=decision_status,
         )
         trace_payload = {
             "agent": self.name,
@@ -1749,6 +2056,7 @@ class AgentHandle:
             "tool_calls": [
                 {
                     "tool_name": event.tool_name,
+                    "call_id": event.call_id,
                     "payload": event.payload,
                     "timestamp": event.timestamp,
                 }
@@ -1757,6 +2065,7 @@ class AgentHandle:
             "tool_results": [
                 {
                     "tool_name": event.tool_name,
+                    "call_id": event.call_id,
                     "payload": event.payload,
                     "timestamp": event.timestamp,
                 }
@@ -1767,6 +2076,7 @@ class AgentHandle:
                     "kind": event.kind,
                     "text": event.text,
                     "tool_name": event.tool_name,
+                    "call_id": event.call_id,
                     "payload": event.payload,
                     "timestamp": event.timestamp,
                 }
@@ -1815,6 +2125,7 @@ class AgentManager:
         self.strategy = strategy
         self._agents: dict[str, AgentHandle] = {}
         self._warned_backtest_mcp_tools: set[tuple[str, str]] = set()
+        self._warning_keys: set[str] = set()
         self._model_call_count = 0
         agent_replay_cache_class, _ = _get_replay_imports()
         self.replay_cache = agent_replay_cache_class()
@@ -1827,6 +2138,18 @@ class AgentManager:
 
     def __getitem__(self, item: str) -> AgentHandle:
         return self._agents[item]
+
+    def _warn_once(self, key: str, message: str) -> None:
+        if key in self._warning_keys:
+            return
+        self._warning_keys.add(key)
+        logger = getattr(self.strategy, "logger", None)
+        if logger is not None and hasattr(logger, "warning"):
+            self._log_warning(message)
+            return
+        log_message = getattr(self.strategy, "log_message", None)
+        if callable(log_message):
+            log_message(f"[agents] {message}", color="yellow")
 
     def _reserve_model_call(self, *, agent_name: str, model: str) -> None:
         limit = _agent_model_call_limit(self.strategy)
@@ -1939,15 +2262,18 @@ class AgentManager:
             trace_path = str(result.payload.get("trace_path") or "")
         execution_outcome = (
             result.payload.get("execution_outcome")
-            if isinstance(result.payload, dict)
-            and isinstance(result.payload.get("execution_outcome"), dict)
+            if isinstance(result.payload, dict) and isinstance(result.payload.get("execution_outcome"), dict)
             else {}
         )
         warning_messages = " | ".join(_sanitize_csv_text(message) for message in result.warning_messages if message)
-        normalized_events = result.events or [AgentTraceEvent(kind="text", text=result.summary or "")]
+        normalized_events = _coalesce_trace_events(
+            result.events or [AgentTraceEvent(kind="text", text=result.summary or "")]
+        )
         thinking_texts = _thinking_texts(result)
         final_texts = _visible_model_texts(result)
-        final_text = " || ".join(final_texts) if final_texts else _sanitize_csv_text(result.summary or result.text or "")
+        final_text = (
+            " || ".join(final_texts) if final_texts else _sanitize_csv_text(result.summary or result.text or "")
+        )
         thinking_text = " || ".join(thinking_texts)
         tool_sequence = " -> ".join(event.tool_name or "unknown_tool" for event in result.tool_calls)
         task_prompt = _sanitize_csv_text(cache_payload.get("task_prompt") or "")
@@ -1959,12 +2285,14 @@ class AgentManager:
         memory_state_text = _flatten_csv_value(cache_payload.get("memory_state") or {})
         memory_retrieval_ids = ", ".join(_memory_retrieval_ids(result))
         timing = _runtime_timing_payload(result)
+        provenance = _managed_ai_provenance(str(result.model or handle.default_model))
         common: dict[str, Any] = {
             "timestamp": result.ended_at or handle._event_timestamp(),
             "call_index": call_index,
             "agent_name": handle.name,
             "model": result.model,
             "mode": runtime_context.get("mode"),
+            **provenance,
             "cache_hit": bool(result.cache_hit),
             "summary": _sanitize_csv_text(result.summary or result.text or ""),
             "final_text": final_text,
@@ -1986,6 +2314,7 @@ class AgentManager:
             "outcome_requiredness": execution_outcome.get("requiredness"),
             "outcome_retryability": execution_outcome.get("retryability"),
             "outcome_fallback_used": execution_outcome.get("fallback_used"),
+            "outcome_status": execution_outcome.get("status"),
             "outcome_decision_completed": execution_outcome.get("decision_completed"),
             "outcome_broker_state_certainty": execution_outcome.get("broker_state_certainty"),
             "outcome_impact": execution_outcome.get("impact"),
@@ -2002,6 +2331,7 @@ class AgentManager:
                 "event_kind": "call_summary",
                 "is_call_summary": True,
                 "tool_name": "",
+                "tool_call_id": "",
                 "event_detail": (
                     f"events={len(normalized_events)} tool_calls={len(result.tool_calls)} "
                     f"cache_hit={bool(result.cache_hit)}"
@@ -2042,6 +2372,7 @@ class AgentManager:
                     "event_kind": event.kind,
                     "is_call_summary": False,
                     "tool_name": event.tool_name or "",
+                    "tool_call_id": event.call_id or "",
                     "event_detail": _summarize_tool_payload(event.tool_name, event.payload),
                     "event_payload_json": _payload_json_text(event.payload),
                     "event_text": _sanitize_csv_text(event.text or ""),
@@ -2066,7 +2397,9 @@ class AgentManager:
         agent_rows = self._observability_rows.setdefault(handle.name, [])
         agent_rows.extend(rows)
         self._observability_all_rows.extend(rows)
-        configured_stats_file = getattr(self.strategy, "stats_file", None) or getattr(self.strategy, "_stats_file", None)
+        configured_stats_file = getattr(self.strategy, "stats_file", None) or getattr(
+            self.strategy, "_stats_file", None
+        )
         if isinstance(configured_stats_file, str) and configured_stats_file:
             detail_rows = self._observability_all_rows
         else:

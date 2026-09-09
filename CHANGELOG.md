@@ -1,5 +1,222 @@
 # Changelog
 
+## 4.5.91 - 2026-09-06
+
+Deploy marker: `d007efed231d`
+
+### Fixed
+- **Bitunix futures orders obey exchange quantity and price rules.** Decimal
+  quantities and prices round down using cached trading-pair precision and
+  serialize as strings; below-minimum quantities fail locally. Crypto-futures
+  assets retain requested constructor leverage. Hedge-mode initialization
+  failures block submission, and reduce-only closes use `CLOSE`, the matching
+  position ID, and the correct hedge side. Fractional Bitunix closes use
+  Decimal arithmetic, with close responses mapped back to execution sides and
+  exchange `SHORT` positions retaining their negative quantity.
+- **Live order reconciliation no longer loses a submitted broker identifier.**
+  When submit and callback copies of the same order race with a broker refresh,
+  reconciliation now collapses them atomically into one strategy-owned order
+  while preserving authoritative open, partial, filled, canceled, expired, and
+  error lifecycle state. New-order callbacks now perform lookup and transition
+  under the same lock, broker-driven closes retain the strategy quote asset,
+  and a later scheduled process can recover a terminal order from the broker
+  snapshot after the submitting process exits.
+- **Hosted agents can use deployment-bound BotSpot public research safely.**
+  BotSpot runtimes auto-attach a short-lived, read-only macro and SEC research
+  MCP capability; external users receive one optional linking notice. Historical
+  runs enforce their simulated date as a hard ceiling, SEC text is explicitly
+  untrusted, expired capabilities renew once on the same origin, and a built-in
+  research skill defines provenance, fallback, and researcher-to-trader handoff
+  requirements.
+- **Real-model release evals choose the intended Gemini credential
+  deterministically.** When both supported environment-variable names exist,
+  the release-scoped Gemini key wins instead of allowing an older Google key to
+  silently shadow it.
+- **Release tags can reuse compatible real-model eval evidence from a prior
+  version-branch qualification.** The release gate restores the newest
+  repository-scoped standalone eval artifact after the branch-scoped cache,
+  while the existing case/runtime/model fingerprints and freshness policy
+  remain authoritative. Cross-workflow evidence is accepted only when its
+  source commit is the exact release commit or an ancestor, targeted case IDs
+  are normalized, recorded research fixtures are fingerprinted, and unsupported
+  research datasets fail closed instead of silently substituting a different
+  data source. Stale or incompatible cases still run normally.
+- **Live Bitunix and Coinbase/CCXT history requests return complete bar
+  windows.** Bitunix requests native mapped intervals, respects the exchange's
+  200-candle page limit, and walks bounded timestamp windows. The live CCXT
+  cursor now advances by one full timeframe after the last returned candle.
+  Both paths raise a clear short-history error instead of silently returning an
+  undersized frame.
+- **Crypto-futures positions can be closed safely in backtests.** The shared
+  broker close path now builds a side-correct reduce-only order when
+  ``Position.get_selling_order()`` intentionally returns ``None``. ``sell_all``
+  filters null orders, submission rejects null orders explicitly, and ordinary
+  stock/option close behavior is unchanged.
+
+## 4.5.90 - 2026-09-02
+
+Deploy marker: `d5a2d1629580`
+
+### Fixed
+- **Live fill handling now enforces strategy ownership before hedge callbacks.**
+  Shared-account broker activity with a foreign order tag (for example MOS
+  option fills while an STM strategy is the sole local subscriber) is no longer
+  ingested or delivered to ``on_filled_order``. Tag matching is ground truth over
+  a wrongly attributed ``order.strategy``, sole-subscriber fallback no longer
+  claims foreign tags, Tradier polling skips foreign-tagged rows, Schwab no
+  longer seeds untracked foreign NEW snapshots into the local strategy, and
+  executor/broker fill paths skip foreign fills so an unrelated option fill
+  cannot trigger a 100-share stock hedge. Helper APIs:
+  ``Broker.normalize_broker_strategy_tag``, ``strategy_tag_matches``,
+  ``order_belongs_to_local_strategy``, ``order_is_foreign_to_local_strategy``,
+  and ``fills_match_underlying``.
+- **Managed agents now preserve correctness across compound safety boundaries.**
+  Duplicate option-closing legs are validated against the remaining signed
+  position, stale broker snapshots cannot prune positions created while the
+  snapshot was in flight, fixture snapshot identifiers change when position
+  content changes, and stock sizing guidance requires a verified positive
+  whole-share quantity even when the built-in sizing tool is unavailable.
+- **Priority trade events are now isolated from normal executor backlog.** Fill,
+  partial-fill, cancel, and error events use a dedicated nonblocking queue that
+  is drained before ordinary order events, eliminating the prior
+  ``Queue.empty()``/blocking-``get()`` race and preserving hedge responsiveness.
+- **Crypto symbol normalization preserves the requested quote asset.** Compact
+  symbols prefer the longest recognized suffix (for example ``BTCBUSD`` parses
+  as ``BTC/BUSD``), and Coinbase lookup no longer silently substitutes a USD
+  market for an explicitly requested USDT market.
+- **Release tests no longer inherit developer credentials into lazy-import
+  subprocesses or classify live Alpaca shorting checks as deterministic unit
+  coverage.** The isolated import checks strip broker/data-provider runtime
+  variables, the no-broker test now explicitly suppresses the dynamic default
+  broker factory, and network-backed shorting tests are correctly marked as API
+  tests. This keeps local and GitHub release gates equivalent without exposing
+  credential-bearing state in failure traces.
+- **Built distributions exclude generated Python bytecode.** The resource
+  manifest still includes the optional ThetaData runtime files while pruning
+  ``__pycache__`` directories and ``*.pyc``/``*.pyo`` artifacts from public
+  wheels.
+- **Option close tools now reject exposure-increasing closing legs before broker
+  submission.** Single-leg and atomic multi-leg closes validate every contract
+  against the latest signed position, reject reversed closing sides and oversized
+  quantities with a visible error, and allow the agent to correct the package
+  without creating a duplicate order.
+- **Agent release fixtures now exercise the same compact account-pagination
+  contract as production.** Positions and open orders expose totals, returned and
+  omitted counts, completeness, next offsets, snapshot identifiers, and as-of
+  timestamps, preventing agents from repeatedly polling legacy count-only fixture
+  results that could never prove account readiness.
+- **Stock agents now keep opening-range boundaries and reported order state
+  consistent.** The stock skill defines bar timestamps as interval starts,
+  excludes the first post-window bar from the opening range, requires exact
+  interval aggregation when necessary, verifies share quantity against notional
+  and cash caps through the deterministic ``risk_calculate_stock_quantity`` tool,
+  and requires final narratives to match submitted order
+  identifiers and final account reads. This fixes real-model release-gate
+  failures where an order filled but the final response claimed no trade occurred
+  and where a tenfold sizing error exceeded the strategy's allocation cap.
+  Historical-price tool guidance now advertises supported multi-minute aliases,
+  and agents may not treat a one-minute constituent as a completed five-minute
+  confirmation bar.
+- **Live fill/hedge callbacks are no longer gated behind a long
+  ``on_trading_iteration``.** During live scans the executor drains priority
+  fill/cancel events on the OTIM thread while user strategy code runs on a
+  helper thread, ``check_queue`` wakes immediately on fill/cancel/error events
+  instead of sleeping up to 0.5s, and ``sync_broker`` no longer holds fill or
+  partial-fill trade events. Target: hedge submission must not wait for a
+  100s+ scan (2026-09-02 regression: option fill while a 122s iteration was
+  running). Covered by ``tests/test_priority_fill_during_iteration.py``.
+- **Coinbase/CCXT crypto backtests no longer silently complete with zero trades
+  when strategies use pair-string base symbols.** Hyphen and concatenated forms
+  such as `BTC-USD`, `BTCUSD`, and redundant `BTC-USD/USD` now normalize to the
+  CCXT unified USD form `BTC/USD` before market lookup. If a market still cannot
+  be resolved after alias attempts, CCXT history raises a clear diagnostic
+  instead of returning empty candles that produce `completed_no_trades`.
+
+
+## 4.5.89 - 2026-09-02
+
+Deploy marker: `04ef8d417189`
+
+### Added
+
+- **BotSpot managed AI requests now use a lossless structured v2 protocol.**
+  Ordered text, native function calls, native function responses, exact call
+  identifiers, thought flags, and base64 thought signatures survive the
+  LumiBot-to-gateway round trip. Unsupported or malformed parts fail visibly
+  with ``protocol_integrity_error`` instead of being silently converted to
+  prose. The released v1 route remains available only for older LumiBot
+  callers.
+- **Managed Agent artifacts now expose typed outcomes and exact runtime
+  provenance.** Decision results distinguish completed decisions, completed
+  no-action decisions, provider errors, tool errors, protocol-integrity errors,
+  and runtime errors. ``agent_detail`` records native tool-call linkage,
+  gateway protocol version, LumiBot version, and a gateway-component
+  fingerprint so the served implementation can be verified from artifacts.
+- **Agent account tools now support bounded pagination and exact contract
+  lookup.** ``account_positions`` and ``orders_open_orders`` return 50 compact,
+  deterministically ordered records by default (maximum 100), report explicit
+  total/included/omitted/completeness metadata, and accept exact symbol, asset
+  type, expiration, strike, and option-right filters. Open-order lookup also
+  matches multi-leg child contracts.
+
+### Fixed
+
+- **Agent account context stays compact and cannot silently hide omitted
+  exposure.** Injected snapshots and account tools share a strict projection
+  built from ``Asset.to_minimal_dict()`` rather than expanding raw broker or
+  Python objects. Missing optional values are omitted instead of becoming fake
+  zeroes, prompts state that truncated positions and orders still exist, and
+  order readiness now requires complete unfiltered position and open-order
+  pagination whenever the initial snapshot is incomplete or an earlier order
+  mutated account state. Pagination pages must also share one content-derived
+  account snapshot identifier, so an order cannot pass readiness by combining
+  pages from changing position or open-order collections.
+- **Managed continuation and decision outcomes are conversation-safe.** Opaque
+  provider continuation identifiers now travel through ADK's request/response
+  interaction fields instead of shared model-instance state, and read-only
+  order inspection no longer records a false completed trading decision.
+
+## 4.5.88 - 2026-09-01
+
+### Fixed
+
+- Schwab account-activity streaming now receives the same refreshable OAuth
+  token metadata as the manually constructed REST client. Stream login and
+  reconnect no longer fail with a missing ``client.token_metadata`` while REST
+  trading continues to work.
+
+## 4.5.87 - 2026-08-30
+
+Deploy marker: `79fdbd23938c`
+
+### Fixed
+
+- Strategy parameter overrides now use the mode-neutral
+  `LUMIBOT_STRATEGY_PARAMETERS` contract in both backtests and live execution,
+  so a validated parameter set can be deployed unchanged. The former
+  `BACKTESTING_PARAMETERS` name remains a deprecated compatibility alias, and
+  logs expose parameter keys without values.
+- Backtests now record a safe `logs/data_provenance.json` artifact with the
+  versioned routing policy and data adapters actually observed, without
+  credentials or signed URLs.
+
+- Schwab order lifecycle observations now converge through one serialized,
+  idempotent reducer shared by account-activity streaming and REST healing.
+  Cancel HTTP acceptance remains non-terminal, partial fills preserve delta
+  quantities, reconnects reconcile active orders, duplicate/out-of-order
+  observations do not repeat callbacks, and HTTP 429 responses honor bounded
+  endpoint-family backoff instead of inventing order state.
+- Define `Strategy.initial_budget` for live strategies as the first broker-verified
+  portfolio equity snapshot, while preserving configured starting cash semantics in
+  backtests.
+
+### Documentation
+- **Lifecycle methods are documented as callbacks with precise live semantics.**
+  The Schwab and lifecycle references now define callback triggers, partial/full
+  fill quantity deltas, cancel acceptance versus terminal observation,
+  streaming-first reconciliation, reconnect behavior, and rate-limit handling.
+- **Fast order lifecycle guidance now separates strategy policy, broker constraints, and reusable state-machine invariants.** The new guide documents configurable monotonic deadlines, callback races, risk-scoped blocking, bounded reconciliation, Schwab request budgeting and measured cancel-response observations, plus a redacted telemetry contract for deadline and hedge diagnosis.
+
 ## 4.5.86 - Unreleased
 
 ### Fixed

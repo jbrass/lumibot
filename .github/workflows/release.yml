@@ -11,6 +11,7 @@ on:
 permissions:
   contents: write
   id-token: write
+  actions: read
 
 jobs:
   validate-build:
@@ -284,6 +285,16 @@ jobs:
           restore-keys: |
             lumibot-agent-evals-v1-
 
+      - name: Restore cross-workflow passing eval freshness
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python scripts/restore_agent_eval_freshness.py \
+            --repository "${GITHUB_REPOSITORY}" \
+            --trusted-commit "${GITHUB_SHA}" \
+            --output .ci/agent-evals/freshness.json
+
       - name: Run stale real-model evals
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -294,7 +305,7 @@ jobs:
             --gate \
             --repeat 3 \
             --max-workers 3 \
-            --max-cost-usd 10 \
+            --max-cost-usd 2 \
             --freshness-state .ci/agent-evals/freshness.json \
             --output-root .ci/agent-evals/artifacts
 
