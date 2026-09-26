@@ -69,6 +69,11 @@ def test_release_eval_uses_production_manager_context_and_builtin_bindings(monke
             )
 
     monkeypatch.setattr(runtime, "GoogleADKRuntime", CaptureRuntime)
+    # AgentManager caches the runtime class on first use. Reset the cache for
+    # this test only, so the stub is not left behind for later tests.
+    import lumibot.components.agents.manager as manager_module
+
+    monkeypatch.setattr(manager_module, "_RUNTIME_IMPORTS", None)
     monkeypatch.setattr(
         evals,
         "run_judge",
@@ -154,7 +159,8 @@ def test_every_eval_case_uses_a_real_model_and_a_production_contract():
     assert len(cases) >= 7
     assert len({case["id"] for case in cases}) == len(cases)
     for case in cases:
-        assert case["model"] == "gemini-3.5-flash-lite"
+        # Rob, 2026-09-23: release evals run the product default, GPT-6 Luna.
+        assert case["model"] == "openai/gpt-6-luna"
         assert case["judgeRubric"].strip()
         assert case["machineContract"]
         assert "simulatedEvents" not in case
@@ -317,7 +323,7 @@ def test_release_runner_prefers_gemini_key_when_both_credential_names_exist(monk
     monkeypatch.setenv("GEMINI_API_KEY", "release-gemini-key")
     monkeypatch.setenv("GOOGLE_API_KEY", "stale-google-key")
 
-    assert evals.select_gemini_credential() == "GEMINI_API_KEY"
+    assert evals.select_eval_credentials({"gemini-3.5-flash-lite"}) == ["GEMINI_API_KEY"]
     assert os.environ["GOOGLE_API_KEY"] == "release-gemini-key"
 
 
@@ -325,8 +331,93 @@ def test_release_runner_supports_google_key_when_it_is_the_only_credential(monke
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     monkeypatch.setenv("GOOGLE_API_KEY", "google-key")
 
-    assert evals.select_gemini_credential() == "GOOGLE_API_KEY"
+    assert evals.select_eval_credentials({"gemini-3.5-flash-lite"}) == ["GOOGLE_API_KEY"]
     assert os.environ["GOOGLE_API_KEY"] == "google-key"
+
+
+def test_luna_evals_need_only_the_openai_key(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-openai")
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+
+    assert evals.select_eval_credentials({"openai/gpt-6-luna"}) == ["OPENAI_API_KEY"]
+    evals.preflight(evals.load_cases(), evals.DEFAULT_JUDGE_MODEL, 2.0)
+
+    monkeypatch.delenv("OPENAI_API_KEY")
+    with pytest.raises(RuntimeError, match="OPENAI_API_KEY"):
+        evals.select_eval_credentials({"openai/gpt-6-luna"})
+    with pytest.raises(RuntimeError, match="OPENAI_API_KEY"):
+        evals.preflight(evals.load_cases(), evals.DEFAULT_JUDGE_MODEL, 2.0)
+
+
+def test_eval_defaults_are_gpt6_luna_on_medium_reasoning_with_registered_prices():
+    from lumibot.components.agents.manager import DEFAULT_AGENT_MODEL
+    from lumibot.components.agents.runtime import _OPENAI_GPT6_MODEL_INFO
+
+    assert evals.DEFAULT_ACTING_MODEL == DEFAULT_AGENT_MODEL == "openai/gpt-6-luna"
+    assert evals.DEFAULT_JUDGE_MODEL == "openai/gpt-6-luna"
+    assert evals.EVAL_REASONING_EFFORT == "medium"
+    info = _OPENAI_GPT6_MODEL_INFO["gpt-6-luna"]
+    prices = evals.MODEL_PRICES_PER_MILLION["openai/gpt-6-luna"]
+    assert prices["input"] == pytest.approx(info["input_cost_per_token"] * 1_000_000)
+    assert prices["cached_input"] == pytest.approx(info["cache_read_input_token_cost"] * 1_000_000)
+    assert prices["output"] == pytest.approx(info["output_cost_per_token"] * 1_000_000)
+    assert "openai" in evals.estimate_cost("openai/gpt-6-luna", {"input_tokens": 10})["price_source_url"]
+
+
+def test_acting_and_judge_requests_use_medium_reasoning(monkeypatch):
+    from lumibot.components.agents import runtime
+    from lumibot.components.agents.schemas import AgentRunResult, AgentTraceEvent
+    from scripts.agent_eval_production_fixture import ProductionFixture
+
+    production = ProductionFixture(evals.build_fixture("flat_stock_account"))
+    try:
+        handle = production.create_agent(evals.load_cases({"stock_price_before_order"})[0], None)
+        assert handle.reasoning_effort == "medium"
+    finally:
+        production.close()
+
+    seen = []
+
+    class CaptureRuntime:
+        def run(self, request):
+            seen.append(request)
+            return AgentRunResult(
+                summary='{"pass": true, "reason": "ok"}',
+                model=request.model,
+                events=[AgentTraceEvent(kind="text", text='{"pass": true, "reason": "ok"}')],
+            )
+
+    monkeypatch.setattr(runtime, "GoogleADKRuntime", CaptureRuntime)
+    case = evals.load_cases({"stock_price_before_order"})[0]
+    evals.run_judge(case, {"tool_calls": []}, evals.DEFAULT_JUDGE_MODEL, None)
+    assert seen[0].model == "openai/gpt-6-luna"
+    assert seen[0].reasoning_effort == "medium"
+
+
+def test_judge_output_cap_leaves_room_for_luna_reasoning(monkeypatch):
+    # GPT-6 Luna counts reasoning tokens against max_output_tokens. A passing
+    # judge call used 985 of the old 1,000 (463 reasoning + 522 text), and run
+    # 36021663457 errored when a longer reasoning pass truncated the JSON verdict.
+    from lumibot.components.agents import runtime
+    from lumibot.components.agents.schemas import AgentRunResult, AgentTraceEvent
+
+    seen = []
+
+    class CaptureRuntime:
+        def run(self, request):
+            seen.append(request)
+            return AgentRunResult(
+                summary='{"pass": true, "reason": "ok"}',
+                model=request.model,
+                events=[AgentTraceEvent(kind="text", text='{"pass": true, "reason": "ok"}')],
+            )
+
+    monkeypatch.setattr(runtime, "GoogleADKRuntime", CaptureRuntime)
+    case = evals.load_cases({"stock_price_before_order"})[0]
+    evals.run_judge(case, {"tool_calls": []}, evals.DEFAULT_JUDGE_MODEL, None)
+    assert seen[0].max_output_tokens == evals.JUDGE_MAX_OUTPUT_TOKENS
+    assert evals.JUDGE_MAX_OUTPUT_TOKENS >= 4_000
 
 
 def test_release_publish_is_blocked_by_real_model_agent_evals():
@@ -334,7 +425,9 @@ def test_release_publish_is_blocked_by_real_model_agent_evals():
     assert "agent-evals:" in workflow
     assert "python scripts/run_agent_evals.py" in workflow
     assert "needs: [validate-build, unit-tests, backtest-tests, agent-evals]" in workflow
-    assert "GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}" in workflow
+    assert "OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}" in workflow
+    standalone = (Path(__file__).resolve().parents[1] / ".github/workflows/agent-evals.yml").read_text(encoding="utf-8")
+    assert "OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}" in standalone
 
 
 def test_paid_eval_workflows_cap_each_run_at_two_dollars():
@@ -547,10 +640,17 @@ def test_runtime_fingerprint_includes_indicators_broker_and_installed_sdks(monke
     assert evals.REPO_ROOT / "lumibot/components/agents/asset_resolution.py" in seen
     assert evals.REPO_ROOT / "lumibot/brokers/broker.py" in seen
     assert evals.REPO_ROOT / "scripts/agent_eval_call_budget.py" in seen
+    # The DuckDB table behind market_historical_prices(table_name=...) is agent
+    # evidence; a change there must invalidate fresh eval receipts.
+    assert evals.REPO_ROOT / "lumibot/components/agents/duckdb_tools.py" in seen
 
 
 def test_fresh_gate_preserves_original_pass_time_without_spending(tmp_path, monkeypatch):
-    monkeypatch.setenv("GEMINI_API_KEY", "unused-synthetic-key")
+    # main() rebuilds the process environment for the fixture. Give it a
+    # private copy and a synthetic key so it neither clears the real test
+    # environment nor imports a key from a developer's .env.local.
+    monkeypatch.setattr(os, "environ", {"PATH": os.environ.get("PATH", "")})
+    monkeypatch.setenv("OPENAI_API_KEY", "unused-synthetic-key")
     case = evals.load_cases({"stock_price_before_order"})[0]
     fingerprint = evals.case_fingerprint(case, judge_model=evals.DEFAULT_JUDGE_MODEL, runtime_hash="runtime")
     passed_at = evals.utc_text(evals.utc_now() - evals.timedelta(days=2))
@@ -835,7 +935,7 @@ def test_preflight_only_never_constructs_a_spending_ledger(
     from scripts import agent_eval_call_budget, agent_eval_isolation
 
     monkeypatch.setattr(agent_eval_isolation, "configure_fixture_environment", lambda root: None)
-    monkeypatch.setattr(evals, "select_gemini_credential", lambda: "GEMINI_API_KEY")
+    monkeypatch.setenv("OPENAI_API_KEY", "unused-synthetic-key")
     monkeypatch.setattr(evals, "preflight", lambda *args: None)
     monkeypatch.setattr(evals, "preflight_production_fixtures", lambda cases: None)
     monkeypatch.setattr(evals, "runtime_fingerprint", lambda: "test-fingerprint")
@@ -874,9 +974,9 @@ def test_resume_rebuilds_missing_freshness_from_completed_matching_ledger(monkey
     from scripts import agent_eval_isolation
     from scripts.agent_eval_call_budget import EvalCallBudget
 
-    case = {"id": "resume-contract", "model": "gemini-3.5-flash-lite"}
+    case = {"id": "resume-contract", "model": "openai/gpt-6-luna"}
     monkeypatch.setattr(agent_eval_isolation, "configure_fixture_environment", lambda root: None)
-    monkeypatch.setattr(evals, "select_gemini_credential", lambda: "GEMINI_API_KEY")
+    monkeypatch.setenv("OPENAI_API_KEY", "unused-synthetic-key")
     monkeypatch.setattr(evals, "load_cases", lambda ids: [case])
     monkeypatch.setattr(evals, "preflight", lambda *args: None)
     monkeypatch.setattr(evals, "preflight_production_fixtures", lambda cases: None)
@@ -900,3 +1000,380 @@ def test_resume_rebuilds_missing_freshness_from_completed_matching_ledger(monkey
     assert summary["fresh_case_count"] == 1
     assert summary["incremental_estimated_cost_usd"] == 0
     assert json.loads(state_path.read_text())["cases"][case["id"]]["passed_at"] == passed_at
+
+
+def _iron_condor_case():
+    return evals.load_cases({"options_iron_condor_atomic_open"})[0]
+
+
+def _good_condor_legs():
+    rows = [
+        (592, "put", "buy_to_open"),
+        (594, "put", "sell_to_open"),
+        (606, "call", "sell_to_open"),
+        (608, "call", "buy_to_open"),
+    ]
+    return [
+        {"symbol": "SPY", "expiration": "2026-08-28", "strike": strike, "right": right, "side": side, "quantity": 1}
+        for strike, right, side in rows
+    ]
+
+
+def test_iron_condor_scoring_reports_a_malformed_leg_instead_of_crashing():
+    """GitHub run 35930118229 recorded options_iron_condor_atomic_open as a bare
+    KeyError: a submission whose legs lacked a strike crashed the scorer."""
+    legs = _good_condor_legs()
+    del legs[1]["strike"]
+    transcript = {
+        "tool_calls": [{"name": "load_skill", "payload": {"skill_name": "options-trading"}}],
+        "fixture_calls": [{"name": "orders_submit_multileg"}],
+        "submissions": [{"tool": "orders_submit_multileg", "legs": legs}],
+        "final_positions": [],
+    }
+
+    score = evals.score_machine_contract(_iron_condor_case(), transcript)
+
+    assert score["pass"] is False
+    assert any("strike" in failure for failure in score["failures"])
+
+
+def test_rejected_order_attempts_are_not_counted_as_broker_submissions():
+    """An order the tool rejected (readiness gate, malformed legs) never reached
+    the broker. exactOrderCount and topology score the accepted order; the
+    rejected attempt is kept separately and still fails a no-order contract."""
+    from types import SimpleNamespace
+
+    from lumibot.components.agents import AgentTraceEvent
+    from scripts.agent_eval_production_fixture import ProductionFixture
+
+    bad = _good_condor_legs()
+    del bad[0]["strike"]
+    def event(kind, call_id, payload):
+        return AgentTraceEvent(kind=kind, tool_name="orders_submit_multileg", call_id=call_id, payload=payload)
+
+    events = [
+        event("tool_call", "a", {"legs_json": json.dumps(bad)}),
+        event("tool_result", "a", {"ok": False, "tool_error": True}),
+        event("tool_call", "b", {"legs_json": json.dumps(_good_condor_legs())}),
+        event("tool_result", "b", {"order_type": "credit"}),
+    ]
+    result = SimpleNamespace(
+        tool_calls=[event for event in events if event.kind == "tool_call"],
+        tool_results=[event for event in events if event.kind == "tool_result"],
+    )
+    production = ProductionFixture(evals.build_fixture("flat_options_account"))
+    try:
+        production.capture(result)
+    finally:
+        production.close()
+    fixture = production.fixture
+
+    assert [submission["legs"] for submission in fixture.submissions] == [_good_condor_legs()]
+    assert [submission["legs"] for submission in fixture.rejected_submissions] == [bad]
+
+    no_order_case = evals.load_cases({"stock_pending_exit_no_duplicate"})[0]
+    transcript = {
+        "tool_calls": [{"name": "load_skill", "payload": {"skill_name": "stock-trading"}}],
+        "fixture_calls": [{"name": "account_positions"}, {"name": "orders_open_orders"}],
+        "submissions": [],
+        "rejected_submissions": [{"tool": "orders_submit_order", "symbol": "AAPL"}],
+        "final_positions": [{"symbol": "AAPL", "quantity": 40}],
+    }
+    score = evals.score_machine_contract(no_order_case, transcript)
+    assert score["pass"] is False
+    assert "submitted an order despite a no-order contract" in score["failures"]
+
+
+def test_close_mode_submission_is_scored_from_the_legs_lumibot_built():
+    """In action='close' mode the agent sends only contracts and LumiBot derives
+    each side and quantity. The harness must score the legs that reached the
+    broker, not the side-less (or ignored) call arguments."""
+    from types import SimpleNamespace
+
+    from lumibot.components.agents import AgentTraceEvent
+    from scripts.agent_eval_production_fixture import ProductionFixture
+
+    contracts = [
+        {"symbol": "SPY", "expiration": "2026-08-28", "strike": 594, "right": "put"},
+        {"symbol": "SPY", "expiration": "2026-08-28", "strike": 592, "right": "put"},
+    ]
+    built = [
+        {"asset": {"symbol": "SPY", "expiration": "2026-08-28", "strike": 594.0, "right": "PUT"}, "side": "buy_to_close", "quantity": 3.0},
+        {"asset": {"symbol": "SPY", "expiration": "2026-08-28", "strike": 592.0, "right": "PUT"}, "side": "sell_to_close", "quantity": 3.0},
+    ]
+
+    def event(kind, payload):
+        return AgentTraceEvent(kind=kind, tool_name="orders_submit_multileg", call_id="a", payload=payload)
+
+    result = SimpleNamespace(
+        tool_calls=[event("tool_call", {"legs_json": json.dumps(contracts), "action": "close"})],
+        tool_results=[event("tool_result", {"legs": built, "order_type": "debit"})],
+    )
+    production = ProductionFixture(evals.build_fixture("open_credit_spread"))
+    try:
+        production.capture(result)
+    finally:
+        production.close()
+
+    legs = production.fixture.submissions[0]["legs"]
+    assert {(float(leg["strike"]), leg["side"], leg["quantity"]) for leg in legs} == {
+        (594.0, "buy_to_close", 3.0),
+        (592.0, "sell_to_close", 3.0),
+    }
+    assert {leg["right"] for leg in legs} == {"put"}
+
+
+def test_harness_error_rows_name_where_the_error_happened_without_its_message():
+    def fail():
+        return {}["secret-looking-key"]
+
+    try:
+        fail()
+    except KeyError as exc:
+        row = evals.harness_error_row("case", 1, "fingerprint", exc)
+
+    assert row["status"] == "error"
+    assert row["error"] == "KeyError"
+    assert row["error_location"].startswith("tests/test_agent_eval_harness.py:")
+    assert "fail" in row["error_location"]
+    assert "secret-looking-key" not in json.dumps(row)
+
+
+def test_stock_fixture_supports_the_above_five_day_average_premise():
+    """stock_price_before_order expects a buy when AAPL is above its five-day
+    average. The fixture's prior sessions all closed at the current 230.00, so a
+    careful model (GPT-6 Luna) correctly found price equal to the average."""
+    from scripts.agent_eval_production_fixture import ProductionFixture
+
+    production = ProductionFixture(evals.build_fixture("flat_stock_account"))
+    try:
+        tools = {tool.name: tool for tool in production.tools()}
+        last = tools["market_last_price"].function(symbol="AAPL", asset_type="stock")["price"]
+        daily = tools["market_historical_prices"].function(symbols="AAPL", length=5, timestep="day")
+    finally:
+        production.close()
+    closes = [bar["close"] for bar in daily["bars_by_symbol"]["AAPL"]]
+    assert len(closes) == 5
+    average = sum(closes) / len(closes)
+    assert last > average
+    # "recent completed daily bars confirm it remains above": the latest
+    # completed close is above the average too, not merely today's price.
+    assert closes[-1] > average
+
+
+def test_limit_between_bid_ask_case_does_not_tell_the_agent_to_use_a_limit():
+    case = evals.load_cases({"options_iron_condor_limit_between_bid_ask"})[0]
+    prompt = f"{case['systemPrompt']} {case['taskPrompt']}".lower()
+    assert "limit" not in prompt
+
+
+def test_explicit_limit_scoring_rejects_a_missing_package_price():
+    case = evals.load_cases({"options_iron_condor_limit_between_bid_ask"})[0]
+    transcript = {
+        "tool_calls": [{"name": "load_skill", "payload": {"skill_name": "options-trading"}}],
+        "fixture_calls": [
+            {"name": "account_portfolio"},
+            {"name": "account_positions"},
+            {"name": "orders_open_orders"},
+            {"name": "market_last_price"},
+            {"name": "options_get_chain"},
+            {"name": "options_get_greeks"},
+            {"name": "options_evaluate_market"},
+            {"name": "options_calculate_multileg_price"},
+            {"name": "load_skill"},
+            {"name": "orders_submit_multileg"},
+        ],
+        "submissions": [{"tool": "orders_submit_multileg", "legs": _good_condor_legs(), "net_limit_price": None}],
+        "final_positions": [],
+    }
+    score = evals.score_machine_contract(case, transcript)
+    assert score["pass"] is False
+    assert any("explicit limit" in failure for failure in score["failures"])
+
+
+def test_explicit_limit_scoring_accepts_a_price_between_bid_and_ask():
+    case = evals.load_cases({"options_iron_condor_limit_between_bid_ask"})[0]
+    transcript = {
+        "tool_calls": [{"name": "load_skill", "payload": {"skill_name": "options-trading"}}],
+        "fixture_calls": [
+            {"name": "account_portfolio"},
+            {"name": "account_positions"},
+            {"name": "orders_open_orders"},
+            {"name": "market_last_price"},
+            {"name": "options_get_chain"},
+            {"name": "options_get_greeks"},
+            {"name": "options_evaluate_market"},
+            {"name": "options_calculate_multileg_price"},
+            {"name": "load_skill"},
+            {"name": "orders_submit_multileg"},
+        ],
+        "submissions": [
+            {
+                "tool": "orders_submit_multileg",
+                "legs": _good_condor_legs(),
+                "net_limit_price": -1.0,
+                "price_style": "mid",
+            }
+        ],
+        "final_positions": [],
+    }
+    score = evals.score_machine_contract(case, transcript)
+    assert score["pass"] is True
+
+
+def test_nearest_expiration_without_data_is_listed_and_unpriced():
+    """The nearer expiration is on the chain. It has no bars, so a quote check
+    cannot price it. The later expiration still has bid and ask."""
+    from scripts.agent_eval_production_fixture import ProductionFixture
+
+    production = ProductionFixture(evals.build_fixture("options_nearest_expiration_without_data"))
+    try:
+        tools = {tool.name: tool for tool in production.tools()}
+        chain = tools["options_get_chain"].function(symbol="SPY")
+        empty = tools["options_evaluate_market"].function(
+            symbol="SPY", expiration="2026-08-14", strike=594, right="put"
+        )
+        priced = tools["options_evaluate_market"].function(
+            symbol="SPY", expiration="2026-08-28", strike=594, right="put"
+        )
+        empty_greeks = tools["options_get_greeks"].function(
+            symbol="SPY", expiration="2026-08-14", strike=594, right="put"
+        )
+    finally:
+        production.close()
+    assert chain["call_expirations"][0] == "2026-08-14"
+    assert "2026-08-28" in chain["call_expirations"]
+    assert empty["market"]["usable_for_limit_pricing"] is False
+    assert empty["market"]["price_basis"] == "none"
+    assert priced["market"]["usable_for_limit_pricing"] is True
+    assert empty_greeks["available"] is False
+
+
+def test_expiration_with_data_case_does_not_name_the_fallback():
+    case = evals.load_cases({"options_expiration_with_data"})[0]
+    prompt = f"{case['systemPrompt']} {case['taskPrompt']}".lower()
+    assert "2026-08-28" not in prompt
+    assert "2026-08-14" not in prompt
+    assert "fall back" not in prompt
+    assert "fallback" not in prompt
+
+
+def test_expiration_scoring_rejects_the_unpriced_expiration():
+    case = evals.load_cases({"options_expiration_with_data"})[0]
+    legs = _good_condor_legs()
+    for leg in legs:
+        leg["expiration"] = "2026-08-14"
+    transcript = {
+        "tool_calls": [{"name": "load_skill", "payload": {"skill_name": "options-trading"}}],
+        "fixture_calls": [
+            {"name": "account_portfolio"},
+            {"name": "account_positions"},
+            {"name": "orders_open_orders"},
+            {"name": "market_last_price"},
+            {"name": "options_get_chain"},
+            {"name": "options_get_greeks"},
+            {"name": "options_evaluate_market"},
+            {"name": "options_calculate_multileg_price"},
+            {"name": "load_skill"},
+            {"name": "orders_submit_multileg"},
+        ],
+        "submissions": [
+            {
+                "tool": "orders_submit_multileg",
+                "legs": legs,
+                "net_limit_price": -1.0,
+                "price_style": "mid",
+            }
+        ],
+        "final_positions": [],
+    }
+    score = evals.score_machine_contract(case, transcript)
+    assert score["pass"] is False
+    assert any("2026-08-28" in failure for failure in score["failures"])
+
+
+def test_public_filings_scoring_rejects_a_future_filing_in_the_tool_result():
+    case = evals.load_cases({"congress_public_filings_only"})[0]
+    transcript = {
+        "tool_calls": [],
+        "fixture_calls": [{"name": "house_public_disclosures"}],
+        "submissions": [],
+        "tool_results": [
+            {
+                "name": "house_public_disclosures",
+                "payload": {
+                    "ok": True,
+                    "as_of": "2026-08-11T14:35:00+00:00",
+                    "filings": [
+                        {"ticker": "AAPL", "published_at": "2026-08-01T00:00:00+00:00", "doc_id": "111"},
+                        {"ticker": "ZZZZ", "published_at": "2026-09-15T00:00:00+00:00", "doc_id": "222"},
+                    ],
+                },
+            }
+        ],
+        "final_positions": [],
+    }
+    score = evals.score_machine_contract(case, transcript)
+    assert score["pass"] is False
+    assert any("222" in failure or "after as_of" in failure for failure in score["failures"])
+
+
+class TestRepeatPolicy:
+    """A new eval proves itself three times. The ongoing gate runs it once.
+
+    Three repeats on every run made the suite too expensive to run often, and
+    coverage stayed thin as a result. Establishing a case still costs three
+    consecutive passes, so a flaky eval cannot sneak in.
+    """
+
+    def test_establishing_a_case_still_requires_three_consecutive_passes(self):
+        assert evals.NEW_CASE_REQUIRED_PASSES == 3
+
+    def test_repeat_one_is_allowed(self):
+        parser = evals.build_parser()
+        args = parser.parse_args(["--max-cost-usd", "5", "--repeat", "1"])
+        assert args.repeat == 1
+        evals.validate_args(args)  # must not raise
+
+    def test_repeat_zero_is_still_rejected(self):
+        parser = evals.build_parser()
+        args = parser.parse_args(["--max-cost-usd", "5", "--repeat", "0"])
+        with pytest.raises(RuntimeError, match="repeat"):
+            evals.validate_args(args)
+
+    def test_default_repeat_is_one_so_the_ordinary_loop_is_cheap(self):
+        parser = evals.build_parser()
+        args = parser.parse_args(["--max-cost-usd", "5"])
+        assert args.repeat == 1
+
+    def test_workers_default_high_enough_for_network_bound_calls(self):
+        parser = evals.build_parser()
+        args = parser.parse_args(["--max-cost-usd", "5"])
+        assert args.max_workers >= 8
+
+    def test_one_pass_does_not_establish_a_brand_new_case(self):
+        """Freshness is still earned with three, never with one."""
+        rows = [{"case_id": "c1", "fingerprint": "f1", "passed": True, "timestamp": "t"}]
+        assert evals.consecutive_pass_count(rows, "c1", "f1") < evals.NEW_CASE_REQUIRED_PASSES
+
+
+class TestTargetPasses:
+    """An unestablished case is driven to three regardless of --repeat.
+
+    Without this, defaulting --repeat to 1 would let a brand new eval be
+    accepted on a single lucky pass, which is exactly what the three-in-a-row
+    rule exists to stop.
+    """
+
+    def test_new_case_is_driven_to_three_even_when_repeat_is_one(self):
+        assert evals.target_passes(already=0, repeat=1) == 3
+
+    def test_partially_established_case_finishes_its_three(self):
+        assert evals.target_passes(already=2, repeat=1) == 3
+
+    def test_established_case_honours_repeat(self):
+        assert evals.target_passes(already=3, repeat=1) == 1
+        assert evals.target_passes(already=5, repeat=2) == 2
+
+    def test_an_explicit_higher_repeat_still_wins(self):
+        assert evals.target_passes(already=0, repeat=5) == 5

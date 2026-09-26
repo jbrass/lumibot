@@ -2,18 +2,38 @@
 
 import fcntl
 import json
+import os
 import threading
 import time
 from pathlib import Path
 
 _LOCK = threading.Lock()
 
+# The old 200_000 default was a Gemini free-tier leftover. Measured against the
+# botspot-dev-ci-evals OpenAI project on 2026-09-24, gpt-6-luna reports
+# x-ratelimit-limit-tokens of 180,000,000 per minute, so pacing at 200k
+# throttled the suite about 900x below what the account allows. This default
+# leaves an order of magnitude of headroom for anything else sharing the key.
+# Override with LUMIBOT_EVAL_INPUT_TPM when an account's real limit differs.
+DEFAULT_INPUT_TOKENS_PER_MINUTE = 20_000_000
+
+
+def _default_tokens_per_minute() -> int:
+    raw = os.environ.get("LUMIBOT_EVAL_INPUT_TPM")
+    if raw is None:
+        return DEFAULT_INPUT_TOKENS_PER_MINUTE
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return DEFAULT_INPUT_TOKENS_PER_MINUTE
+    return value if value > 0 else DEFAULT_INPUT_TOKENS_PER_MINUTE
+
 
 class InputPacer:
-    def __init__(self, path, *, tokens_per_minute=200_000, clock=time.time, sleep=time.sleep):
+    def __init__(self, path, *, tokens_per_minute=None, clock=time.time, sleep=time.sleep):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.limit = tokens_per_minute
+        self.limit = _default_tokens_per_minute() if tokens_per_minute is None else tokens_per_minute
         self.clock = clock
         self.sleep = sleep
 
@@ -43,8 +63,17 @@ class InputPacer:
 
 
 def count_native_request(model, llm_request):
-    """Use the provider's count-only endpoint, with the exact system/tools/history."""
+    """Input tokens for pacing: Gemini's count-only endpoint, or a local estimate.
+
+    Only Gemini has a count endpoint on the eval network boundary. For other
+    providers the pacing window uses a conservative local estimate (about 3
+    characters per token over the exact system, tools and history). Spending is
+    still settled from the provider's reported usage, never from this estimate.
+    """
     import os
+
+    if not str(model or "").startswith("gemini"):
+        return _estimate_request_tokens(llm_request)
     from urllib.parse import quote
 
     import requests
@@ -77,3 +106,18 @@ def count_native_request(model, llm_request):
     if type(count) is not int or count <= 0:
         raise ValueError("The provider returned no authoritative input-token count.")
     return count
+
+
+def _estimate_request_tokens(llm_request):
+    config = getattr(llm_request, "config", None)
+    parts = []
+    system = getattr(config, "system_instruction", None)
+    if system is not None:
+        parts.append(system if isinstance(system, str) else system.model_dump_json(exclude_none=True))
+    for tool in getattr(config, "tools", None) or []:
+        dump = getattr(tool, "model_dump_json", None)
+        parts.append(dump(exclude_none=True) if callable(dump) else json.dumps(str(tool)))
+    for content in getattr(llm_request, "contents", None) or []:
+        parts.append(content.model_dump_json(exclude_none=True))
+    characters = sum(len(part) for part in parts)
+    return max(1, -(-characters // 3))

@@ -1,6 +1,9 @@
 Authenticated Browser Research Showcase
 =======================================
 
+.. meta::
+   :description: This example demonstrates the full handoff: an authenticated browser researcher reads a JavaScript application, a dedicated trading/risk agent decides whether to trade.
+
 .. image:: ../docs/assets/ai-agent-workflows/ai-browser-research-showcase.png
    :alt: Authenticated browser research AI trading team workflow
    :width: 100%
@@ -37,6 +40,10 @@ researcher performs a real login through the built-in browser tools and captures
 a screenshot/trace; the risk agent fills one simulated SHOW share; the separate
 publisher posts an idempotent receipt keyed by the order ID and captures a
 second screenshot. No third-party account is touched.
+
+Only the browser researcher and the publisher are created with
+``allow_network=True``. The risk agent has no browser or HTTP tools; it works
+from the researcher's evidence packet.
 
 The agent currently reasons from rendered visible text, DOM extraction, browser
 state, and action results. Screenshots are durable audit evidence. They are not

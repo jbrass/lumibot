@@ -1,3 +1,4 @@
+import base64
 import json
 from datetime import datetime, timezone
 
@@ -83,6 +84,41 @@ def test_http_request_and_rss_results_carry_stable_availability_provenance():
         "source": "https://example.test/feed",
         "summary": None,
     }
+
+
+def test_http_request_published_at_prefers_last_modified_over_response_date():
+    # A document fetched today that the server says last changed in January was
+    # public in January; stamping it with today's date makes backtests reject it.
+    def handler(request):
+        if request.url.path == "/bad-last-modified":
+                return httpx.Response(
+                    200,
+                    json={"ok": True},
+                    headers={"date": "Wed, 23 Sep 2026 15:53:31 GMT", "last-modified": "not a date"},
+                )
+        if request.url.path == "/future-last-modified":
+            return httpx.Response(
+                200,
+                json={"ok": True},
+                headers={"date": "Wed, 23 Sep 2026 15:53:31 GMT", "last-modified": "Thu, 24 Sep 2026 00:00:00 GMT"},
+            )
+        return httpx.Response(
+            200,
+            json={"ok": True},
+            headers={"date": "Wed, 23 Sep 2026 15:53:31 GMT", "last-modified": "Fri, 23 Jan 2026 15:06:23 GMT"},
+        )
+
+    client = WebClient(transport=httpx.MockTransport(handler), resolver=_resolver)
+
+    assert client.request("GET", "https://example.test/ptr")["published_at"] == "2026-01-23T15:06:23+00:00"
+    assert (
+        client.request("GET", "https://example.test/bad-last-modified")["published_at"]
+        == "2026-09-23T15:53:31+00:00"
+    )
+    assert (
+        client.request("GET", "https://example.test/future-last-modified")["published_at"]
+        == "2026-09-23T15:53:31+00:00"
+    )
 
 
 def test_http_request_supports_form_raw_multipart_and_binary_downloads():
@@ -499,3 +535,105 @@ def test_http_request_pins_ipv6_addresses_and_keeps_cookies_scoped_to_the_hostna
         (ipv6, "a.example.test", "session=abc"),
         (ipv6, "b.example.test", None),
     ]
+
+
+def test_http_request_to_sec_uses_declared_contact_user_agent_even_when_agent_supplies_one(monkeypatch):
+    from lumibot.fundamentals.sec import DEFAULT_SEC_USER_AGENT
+
+    monkeypatch.delenv("LUMIBOT_SEC_USER_AGENT", raising=False)
+    seen = []
+
+    def handler(request):
+        seen.append((request.headers["host"], request.headers["user-agent"]))
+        if request.headers["host"] == "example.test":
+            return httpx.Response(302, headers={"location": "https://www.sec.gov/Archives/x.idx"})
+        return httpx.Response(200, text="ok", headers={"content-type": "text/plain"})
+
+    client = WebClient(transport=httpx.MockTransport(handler), resolver=_resolver)
+
+    direct = client.request(
+        "GET",
+        "https://www.sec.gov/Archives/edgar/daily-index/2026/QTR1/form.20260105.idx",
+        headers={"user-agent": "research contact@example.com"},
+    )
+    redirected = client.request("GET", "https://example.test/start", headers={"User-Agent": "agent-ua"})
+
+    assert direct["ok"] is True and redirected["ok"] is True
+    assert seen == [
+        ("www.sec.gov", DEFAULT_SEC_USER_AGENT),
+        ("example.test", "agent-ua"),
+        ("www.sec.gov", DEFAULT_SEC_USER_AGENT),
+    ]
+
+
+def test_http_request_reports_unreadable_pdf_instead_of_raising():
+    def handler(request):
+        return httpx.Response(200, content=b"%PDF-1.4", headers={"content-type": "application/pdf"})
+
+    client = WebClient(transport=httpx.MockTransport(handler), resolver=_resolver)
+    result = client.request("GET", "https://example.test/broken.pdf")
+
+    assert result["ok"] is True
+    assert "text" not in result
+    assert result["text_error"].startswith("Could not extract PDF text:")
+    assert base64.b64decode(result["body_base64"]) == b"%PDF-1.4"
+
+
+class TestWebSearch:
+    """The agent can fetch a URL and drive a browser, but could not find one.
+
+    Search is the missing discovery primitive. It defaults to a backend that
+    needs no API key, because key fatigue is the real adoption blocker: a model
+    key plus a broker key plus a search key plus a data key is a wall in front
+    of the first run.
+    """
+
+    def test_web_search_is_a_registered_builtin_tool(self):
+        from lumibot.components.agents.builtins import BuiltinTools
+
+        assert "web_search" in {tool.name for tool in BuiltinTools.all()}
+
+    def test_description_says_no_key_is_required(self):
+        from lumibot.components.agents.builtins import BuiltinTools
+
+        tool = next(t for t in BuiltinTools.all() if t.name == "web_search")
+        assert "no api key" in tool.description.lower()
+
+    def test_missing_backend_names_the_install_command(self):
+        """An optional dependency must fail with the fix, not a stack trace."""
+        import builtins as _builtins
+
+        from lumibot.components.agents import builtins as lumibot_builtins
+
+        real_import = _builtins.__import__
+
+        def blocked(name, *args, **kwargs):
+            if name.split(".")[0] == "ddgs":
+                raise ImportError("No module named 'ddgs'")
+            return real_import(name, *args, **kwargs)
+
+        _builtins.__import__ = blocked
+        try:
+            with pytest.raises(RuntimeError, match="pip install ddgs"):
+                lumibot_builtins._web_search_backend()
+        finally:
+            _builtins.__import__ = real_import
+
+    def test_results_are_capped_and_shaped(self, monkeypatch):
+        from lumibot.components.agents import builtins as lumibot_builtins
+
+        rows = [
+            {"title": f"t{i}", "href": f"https://example.test/{i}", "body": f"b{i}"}
+            for i in range(50)
+        ]
+        monkeypatch.setattr(lumibot_builtins, "_web_search_backend", lambda: (lambda **kw: rows))
+        out = lumibot_builtins._run_web_search(query="spy", max_results=5)
+        assert len(out["results"]) == 5
+        assert out["query"] == "spy"
+        assert set(out["results"][0]) == {"title", "url", "snippet"}
+
+    def test_empty_query_is_refused(self):
+        from lumibot.components.agents import builtins as lumibot_builtins
+
+        with pytest.raises(ValueError, match="query"):
+            lumibot_builtins._run_web_search(query="   ", max_results=5)

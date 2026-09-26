@@ -1,6 +1,9 @@
 AI Iron Condor
 ==============
 
+.. meta::
+   :description: ai_iron_condor.py is a two-agent options strategy. A research-only agent finds and documents an exact four-contract candidate.
+
 .. image:: ../docs/assets/ai-agent-workflows/ai-iron-condor.png
    :alt: AI iron-condor workflow using LumiBot runtime skills, rules, tools, and execution
    :width: 100%
@@ -15,7 +18,7 @@ wing width, exits, and risk limits. Reusable options mechanics are supplied by
 LumiBot's built-in ``options-trading`` skill. Active ``rules.json`` entries are
 loaded again before every agent call and appended to the runtime instructions.
 
-The example uses ``openai/gpt-6-luna`` on high reasoning explicitly. Existing saved
+The example uses ``openai/gpt-6-luna`` on medium reasoning, the default. Existing saved
 strategies keep the model identifier already stored in their code.
 
 How it works
@@ -56,9 +59,12 @@ source:
 Set ``BACKTESTING_START`` and ``BACKTESTING_END`` in ``YYYY-MM-DD`` format to
 choose an exact historical window.
 
-The January 2026 Alpaca proof opened one SPY iron condor with
-``orders_submit_multileg`` on January 5 and closed it on January 12. The tear
-sheet is a real QuantStats file and the account was not wrecked.
+The latest run used ``openai/gpt-6-luna`` on high reasoning with Alpaca option
+history from January 5 to 15, 2026. On January 5 it opened 38 SPY February 13
+iron condors (645/650 puts and 715/720 calls) at real Alpaca prices through
+``orders_submit_multileg``, sized to the risk budget. The account ended at
+$99,734 with the package still open. This is one short simulation, not a
+performance claim.
 
 .. literalinclude:: ../lumibot/example_strategies/ai_iron_condor.py
    :language: python

@@ -1,6 +1,9 @@
 Congressional Disclosure Agent
 ===============================
 
+.. meta::
+   :description: This example reads the public House Clerk periodic transaction report. It downloads the yearly index at the House financial-pdfs ZIP, then the member PDF.
+
 .. image:: ../docs/assets/ai-agent-workflows/ai-congress-disclosures.png
    :alt: Congressional disclosure AI trading team workflow
    :width: 100%
@@ -42,6 +45,8 @@ Architecture
 
 ``disclosure_researcher`` cannot trade. ``trading_risk_manager`` is the only
 agent with trading tools and caps a new position at the configured percentage.
+The researcher is the only agent created with ``allow_network=True``, so it is
+the only one that can fetch filings with ``http_request``.
 Already processed disclosure IDs are ignored and old records are rejected by
 the configured age limit. Records stay hidden until ``ReportDate``.
 

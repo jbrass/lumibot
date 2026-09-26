@@ -1,6 +1,9 @@
 AI VWAP Strategy
 ================
 
+.. meta::
+   :description: ai_vwap.py is a two-agent equity strategy. A research-only agent computes and explains the point-in-time VWAP setup.
+
 .. image:: ../docs/assets/ai-agent-workflows/ai-vwap.png
    :alt: AI VWAP workflow using LumiBot runtime skills, rules, market evidence, and execution
    :width: 100%
@@ -33,10 +36,10 @@ $99,978 from a $100,000 start. The tear sheet rounded total return to -0.00%,
 annualized return to -2.02%, and maximum drawdown to -0.02%. This short result
 is mechanical evidence, not a performance claim.
 
-A later Alpaca minute proof, January 5, 2026, bought 1 SPY at 686.54 and sold
-that share at 687.29. The tear sheet for that run is a real QuantStats file.
-That is the source this page now names. The earlier August prices stay as
-history from the prior data source.
+The latest run used ``openai/gpt-6-luna`` on high reasoning with Alpaca minute
+bars on January 5 and 6, 2026. No dip-and-reclaim appeared, so it placed no
+order and stayed in cash. The earlier August prices stay as history from the
+prior data source.
 
 .. code-block:: bash
 
