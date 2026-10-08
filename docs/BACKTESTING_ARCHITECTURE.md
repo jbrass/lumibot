@@ -15,6 +15,28 @@
 
 ## Overview
 
+Backtest quotes retain the stored `last_bid_time` and `last_ask_time` as
+`Quote.bid_time` and `Quote.ask_time`. Pandas and Polars data objects pass those
+columns through; ThetaData cached, snapshot-only, and daily paths use the same
+timestamp normalization. This preserves stale timestamps and their original
+timezone semantics rather than replacing them with the simulation clock.
+Absent, invalid, or numeric timestamps without an explicit unit remain `None`.
+Missing quote sides carry their source times only with their forward-filled
+values. A fresh side without a source time remains unknown, including when
+that fresh value is later carried across missing rows.
+`Quote.quote_time` is not inferred from separate bid/ask events. Parquet-backed
+and adapter regressions live in `tests/test_backtest_quote_source_times.py`.
+
+Intraday bar-completion checks consume nanosecond timestamps. `DataPolars`
+normalizes its native nanosecond, microsecond, or millisecond index before the
+shared state calculation used by history, last-price, and quote reads. A bar
+becomes visible when its full interval has elapsed, including across session
+gaps; a forming bar's close must not become its current price.
+Cadence inference excludes overnight date boundaries; sparse samples with no
+intraday spacing use the nominal minute or hour interval. Regression
+coverage exercises each Polars resolution alongside the pandas path in
+`tests/test_data_get_bars_day_includes_latest_completed_bar.py`.
+
 Technical indicator calculations restrict input to strategy-time history before
 computing, rather than trimming a result calculated over future bars. See
 [indicator temporal safety](indicator-temporal-safety.md) for the regression,
@@ -789,6 +811,15 @@ BACKTESTING_DATA_SOURCE=thetadata  # Options: yahoo, thetadata, ibkr, router, po
 
 IBKR backtesting uses the shared Data Downloader and is cached locally (and optionally mirrored to S3) just like ThetaData.
 
+Minute-session gap detection normalizes the cache index to nanoseconds before
+comparing integer timestamps with session boundaries. `DatetimeIndex.asi8`
+retains the index's resolution, including microseconds after a Parquet round
+trip; it cannot be compared directly with `Timestamp.value` without this
+normalization. The public history regression covers persisted caches at all
+four supported resolutions and verifies that the missing session is fetched.
+Calendar open/close arrays are normalized at their boundary for the same reason;
+otherwise closed-interval checks can skip valid market hours on pandas 3.
+
 - Single-provider: `BACKTESTING_DATA_SOURCE=ibkr`
 - Multi-provider routing (Theta for stock/option/index; IBKR for futures/crypto):
   ```bash
@@ -929,3 +960,29 @@ aws route53 list-resource-record-sets --hosted-zone-id <ZONEID>
 - `docsrc/` = Sphinx source for the public documentation site
 - `generated-docs/` = local build output from `docsrc/` (gitignored)
 - GitHub Pages should be built + deployed by GitHub Actions on pushes to `dev`
+
+### Shared Alpaca historical bars
+
+Live Alpaca reads and AlpacaBacktesting use `tools/alpaca_history.py` before any
+simulation reindexing. Raw UTC OHLCV observations are stored as Parquet through
+`ParquetSeriesCache` and the existing `BacktestCacheManager`, under
+`alpaca/bars/<request-identity>/<symbol-identity>/<YYYY-MM>.parquet`. The manager
+continues to own the S3 bucket, environment prefix, cache version, and credentials.
+Backtest CSV files remain derived local simulation data; charts never read those
+filled rows.
+
+Only complete calendar-month provider requests older than one day are persisted.
+A second overlapping request downloads only missing partitions. Sparse provider
+bars remain sparse. Explicit limits/sort orders and requests without a known
+credential scope use the provider directly. Feed, adjustment, currency, cadence,
+asset class, as-of symbol mapping and credential scope are part of identity. No
+credentials are stored in paths or metadata. Historical partitions expire after
+24 hours so corporate-action changes and provider corrections can be refreshed;
+current months always read the provider. Explicit backtest refresh bypasses reuse.
+
+Partition metadata records the original provider-fetch time and complete request
+coverage. Invalid cache data triggers a real provider read. Invalid provider
+OHLCV raises an error rather than fabricating prices. Local publication is atomic.
+Each concurrent writer publishes a complete month, never a partial window.
+`historyCache` dataframe attributes expose lookup, provider, and write timing
+separately from cache hits and original fetch time.

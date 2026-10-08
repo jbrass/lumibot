@@ -39,6 +39,16 @@ Supported Data
 - **Spot crypto**: IBKR crypto bars (availability depends on region and IBKR product support).
 - **Stocks / Indexes (day bars)**: supported in routed backtests (for example mixed Theta+IBKR routing).
 
+Portfolio Valuation (Stocks/Indexes)
+------------------------------------
+
+Daily-cadence backtests (for example ``sleeptime = "1D"``) value stock and index positions on the daily
+series. Intraday backtests value them on the finest intraday bars loaded for that asset (the bars the
+strategy requested and its fills use): the bar that has just completed marks at its close, a bar still forming
+marks at its open. If the strategy's minute history ends before the current time, a small window of minute bars
+is fetched first, the same request the strategy itself makes. Strategies that only use daily bars never fetch
+minute history for valuation.
+
 Daily Stocks/Indexes: Warmup + Corporate Actions
 ------------------------------------------------
 
@@ -72,6 +82,8 @@ IBKR returns at most about 1,000 bars per request, so LumiBot walks backwards pa
 - **Holes in cached minute bars.** When the cache has bars on both sides of a missing session (for example from two
   earlier backtests, or a download that was stopped), LumiBot downloads each missing session instead of skipping it.
   A session with no trades at all is remembered for a day so it is not requested again by every backtest.
+  Gap checks handle nanosecond, microsecond, millisecond and second cache timestamps consistently;
+  existing Parquet caches do not need to be deleted or rewritten.
 
 Futures Exchange Routing (auto + override)
 ------------------------------------------

@@ -8,6 +8,11 @@ One agent researches the market. A second agent reviews risk, decides whether
 to trade, and checks the result. Both run inside the same standard ``Strategy``
 class used by conventional LumiBot strategies.
 
+This example's file starts a historical backtest when run directly. **The
+strategy class can stay the same; the code that starts it must select a
+backtest or a broker run.** See :doc:`strategy_run_modes` before adapting it
+for a broker.
+
 Before you run
 --------------
 
@@ -19,7 +24,7 @@ use your provider account and incur charges; start with this short date range.
 
 .. code-block:: bash
 
-   python -m pip install "git+https://github.com/Lumiwealth/lumibot.git@version/4.5.92"
+   python -m pip install "git+https://github.com/Lumiwealth/lumibot.git@version/4.6.3"
    export OPENAI_API_KEY="your-openai-api-key"
    export BACKTESTING_DATA_SOURCE=yahoo
 
@@ -266,7 +271,9 @@ Working with the Result
 - ``result.warning_messages`` -- list of observability warnings
 - ``result.tool_calls`` -- list of tool call events
 - ``result.tool_results`` -- list of tool result events
-- ``(result.payload or {}).get("trace_path")`` -- path to one call's JSON trace
+- ``result.parsed`` -- the parsed, validated answer when you pass ``output_schema`` (see below)
+- ``result.parse_error`` -- why the answer did not match ``output_schema`` (``None`` when it did)
+- ``(result.payload or {}).get("trace_path")`` -- path to one call's JSON trace. ``result.payload`` is run bookkeeping, never the answer.
 - ``*_agent_detail.parquet`` -- the table for the whole run, next to the tear sheet in a backtest, or under ``~/Library/Caches/lumibot/1.0/agent_runtime/`` on macOS for live and paper. The ``call_summary`` row includes ``effective_system_prompt``. Raising ``LUMIBOT_LOG_LEVEL`` does not create this file. See :doc:`agents_observability`.
 
 .. code-block:: python
@@ -282,23 +289,51 @@ Working with the Result
         for warning in result.warning_messages:
             self.log_message(f"WARNING: {warning}", color="red")
 
+Structured answers (``output_schema``)
+--------------------------------------
+
+Optional. Most AI strategies do not need this: agents pass plain-language notes to each other and the trading agent places trades itself. Use it only when your Python code must act on the answer; then ask for structured output instead of parsing free text. Pass a JSON Schema ``dict`` or a pydantic model class as ``output_schema`` on ``create()`` (every run) or ``run()`` (one call). LumiBot tells the model the exact format, removes markdown code fences, extracts the JSON, validates it, and puts it on ``result.parsed``:
+
+.. code-block:: python
+
+    VERDICT = {
+        "type": "object",
+        "properties": {
+            "symbol": {"type": "string"},
+            "verdict": {"type": "string", "enum": ["PASS", "VETO"]},
+            "confidence": {"type": "string", "enum": ["LOW", "MEDIUM", "HIGH"]},
+            "reason": {"type": "string"},
+        },
+        "required": ["symbol", "verdict", "confidence", "reason"],
+    }
+
+    self.agents.create(name="analyst", model="openai/gpt-6-luna", output_schema=VERDICT)
+
+    result = self.agents["analyst"].run(task_prompt="Review INTC for a swing entry.")
+    if result.parsed is None:
+        self.log_message(f"No usable verdict: {result.parse_error}", color="red")
+    elif result.parsed["verdict"] == "PASS":
+        ...
+
+With a pydantic model, ``result.parsed`` is an instance of that model. When the answer does not match, ``result.parsed`` is ``None``, ``result.parse_error`` explains why, and ``result.warnings`` contains a ``structured_output_invalid`` entry. No extra model call is made. Tools still work normally; the schema only shapes the final answer.
+
 Running a Backtest
 ------------------
 
-Use the standard LumiBot backtest pattern. The agent runs on every bar just like it would in live trading:
+Use the standard LumiBot backtest pattern. The agent runs on each configured
+backtest iteration. This snippet starts a backtest only; a broker run needs a
+broker instance and ``run_live()`` or ``Trader.run_all()``:
 
 .. code-block:: python
 
     if __name__ == "__main__":
-        IS_BACKTESTING = True
-        if IS_BACKTESTING:
-            from datetime import datetime
-            M2LiquidityStrategy.backtest(
-                datasource_class=None,
-                backtesting_start=datetime(2020, 1, 1),
-                backtesting_end=datetime(2026, 3, 1),
-                benchmark_asset="SPY",
-            )
+        from datetime import datetime
+        M2LiquidityStrategy.backtest(
+            datasource_class=None,
+            backtesting_start=datetime(2020, 1, 1),
+            backtesting_end=datetime(2026, 3, 1),
+            benchmark_asset="SPY",
+        )
 
 Set ``datasource_class=None`` to use the data source configured in your ``.env`` file via ``BACKTESTING_DATA_SOURCE``.
 

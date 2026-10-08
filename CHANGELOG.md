@@ -1,5 +1,82 @@
 # Changelog
 
+## 4.6.6 - 2026-10-07
+
+Deploy marker: `3ad90cf2ef071f9e34e9fb0c140618545624c4b2`
+
+### Fixed
+- IBKR intraday backtests now really value stocks on intraday prices. 4.6.5 only used intraday bars that covered the current time, but the strategy's own minute history ends one bar earlier and is loaded after the portfolio is valued, so the value stayed on the previous daily close all session (a 30-minute strategy showed a flat value while its bars moved). Valuation now uses the just-completed bar's close (or a still-forming bar's open), and tops up a stale minute series with the same small request the strategy makes. Day-only strategies never trigger a minute fetch. Verified on real IBKR data: value equals cash plus shares times the bar close at every 30-minute step.
+- IBKR: CME FX futures (6A, 6B, 6C, 6E, 6J, 6M, 6N, 6S) look up contracts under IBKR's currency root (AUD, GBP, CAD, EUR, JPY, MXN, NZD, CHF). Before, every 6E or 6J backtest failed with "No futures contracts returned for 6E on CME". Strategies keep using the Globex code.
+- IBKR: a stock or index whose IBKR contract id was retired (company reorganization, ETF reverse split) now refreshes its id and retries once when IBKR answers "Contract details are not available". Before, the stale id stayed in the shared registry and every backtest on that symbol failed (XOM and SOXS, October 2026). The new id carries the full price history.
+
+## 4.6.5 - 2026-10-07
+
+Deploy marker: `d72af18aa4b168ec829035de5d04cf5be4b50e6b`
+
+### Added
+- AI agents: no output length is sent by default, so the model answers as long as it needs (before, every call sent 65,535 whatever the model, 4x the 16,384 `openai/gpt-4o` allows). Anthropic models, which require one, get the model's real limit. New optional `max_output_tokens` on `agents.create()` and `run()`, capped at the model's real limit.
+- AI agents (optional): structured output for strategies whose Python code must read the answer. Pass `output_schema=` (a JSON Schema dict or a pydantic model class) to `create()` or `run()` and read the validated answer from `result.parsed`. Code fences are removed before parsing; a mismatch leaves `result.parsed` as `None` with `result.parse_error` and a `structured_output_invalid` warning. `result.payload` stays run bookkeeping.
+- Backtest `settings.json` gains an `agent_health` block, and the tear sheet parameters gain `agent_<name>_skipped_runs` and `agent_skipped_runs_total`, counting bars where an agent call failed and the strategy continued without an AI decision.
+
+### Changed
+- Alpaca live reads and Alpaca backtests share one raw-bar cache (Parquet series under the existing backtest cache namespace and credentials), so a live bot and a backtest of the same bars no longer download them twice. Invalid cached data triggers a real provider read, and cache lookup, provider and write timings are reported separately.
+- Documentation: clearer backtest data source selection; the docs site's analytics drop errors that come only from browser extensions.
+
+### Fixed
+- Alpaca price integrity failures stay visible as explicit errors instead of being treated as missing data.
+- Minute-cache overlap is preserved across daylight-saving transitions (regression test).
+- AI agent rate limits (HTTP 429) wait for the provider's `Retry-After` and retry up to 6 times in every mode, including backtests and trading agents (each wait capped at 120 s). A run that already submitted (including multileg), changed or cancelled an order is never retried. HTTP-date `Retry-After` values are honored. BotSpot's managed AI gateway answer `provider_rate_limited` (the gateway already retried the provider's 429) is treated as a rate limit too. Before, a backtest gave a 429 two quick tries (trading agents one) and then silently skipped the bar.
+- IBKR intraday backtests value stock and index positions on the intraday bars already loaded for that asset (minute, multi-minute or hourly) instead of the daily series, which holds one price per session. A 30-minute-cadence backtest valued two holdings about $250 away from the strategy's own bars. Daily-cadence runs, and runs with no intraday bars loaded, still use the daily series; no extra history is fetched.
+- Remote MCP calls renew expired authentication when the transport wraps HTTP 401 in nested exception groups or chained exceptions. Permission denials and network failures still propagate without token renewal. A bare `401` inside a URL or id no longer counts as an authentication failure.
+
+## 4.6.4 - 2026-10-02
+
+Deploy marker: `8bbc892f818c3760f79303a2be769f69906ecaa6`
+
+### Fixed
+- Stock agents distinguish an exit becoming due from permission to change an already-pending exit. They leave the existing exit in place unless the user's rules explicitly require changing that order, and tie lookback indicators to the requested latest completed-bar window rather than an earlier row.
+- Options agents inspect other listed expirations within the user's constraints when one expiration has unavailable Greeks or quotes, instead of treating one missing expiration as evidence that the whole chain is unusable. Every leg still requires verification for its structure, including user-permitted calendars with distinct expirations.
+- Schwab terminal-order callbacks preserve the broker's raw status and supplied rejection description instead of reporting only the normalized `error` status. Repeated observations still dispatch one error callback.
+- Pandas, Polars, and ThetaData backtest quotes preserve recorded bid/ask source timestamps. Missing or invalid source times remain unavailable instead of being replaced by the simulation clock. Forward-filling a missing side carries its timestamp with its value, while a fresh side with no timestamp stays unavailable.
+- Scheduled/run-once execution advances SmartLimit orders through their configured ladder and waits for fills or confirmed cancellation before disconnecting. In-flight broker submissions, cancellation transitions, order callbacks, and work started by `on_strategy_end` also finish before the final snapshot and state backup. Resting limit/GTC orders do not block shutdown; an interrupted or timed-out drain is reported as a failure, not a completed run.
+- Polars-backed intraday history and quotes normalize timestamp resolution before checking whether a bar has closed. Microsecond and millisecond data now expose completed bars across gaps and keep unfinished bars' future closing prices out of last-price and synthesized quote values. Overnight gaps no longer establish bar duration in sparse intraday history.
+
+## Unreleased
+
+### Fixed
+- IBKR minute history repairs missing cached sessions when Parquet timestamps use microsecond, millisecond, or second resolution. Cache and calendar timestamps now use consistent units before gap and market-hours searches, so open sessions are not mistaken for closed intervals on pandas 3.
+
+## 4.6.3 - 2026-09-30
+
+Deploy marker: `950916e438598b66e8bca0540f2b7c321c182cb3`
+
+### Changed
+- AI example runners explicitly distinguish `Strategy.backtest(...)` from broker execution with `Trader.run_all()` / `strategy.run_live()`, with a new execution-mode guide and updated onboarding.
+- AI examples use reusable agents and plain-language prompts, with dedicated trading/risk ownership where the strategy needs it. Shared trading-agent guidance covers target weights, sell-before-buy cash budgeting, existing positions and pending orders, and bounded option risk.
+- AI examples include actual historical tear sheets, refreshed workflow artwork, searchable page titles and redirects from their previous documentation URLs. Pelosi research distinguishes annual holdings reports, transaction reports, partial sales and exercised calls; the copy example supports smaller accounts with a bounded options allocation.
+- Agent price tools (`market_last_price`, `market_last_prices`, `market_historical_prices`) say where to find a market index they have no data for. Broker data often has no indexes (Alpaca has no VIX), and agents told to "skip the day if the VIX closed above 25" refused to trade because they never looked at FRED. A miss on VIX, VIX3M, VXN, OVX, GVZ, SPX, DJIA or the Nasdaq Composite now returns a `fred_hint` naming the FRED series (VIX is `VIXCLS`). The research-data skill says the same. New eval `research_vix_from_fred`.
+- The AI Iron Condor example sells a one-day SPY iron condor at 3:45 PM and holds it to expiry, with a plain-Python early close when SPY runs 40% of the way toward a short strike. It copies the core of the older options_condor_martingale bot, without the martingale.
+
+### Added
+- `read_document` agent tool: reads any file or page at a URL (PDF, Word, Excel, CSV, tab-separated text, JSON, HTML with its links, and ZIP archives with every file inside). Every table in the file is loaded for `duckdb_query`, so agents filter and add up rows with SQL. `find` keeps matching lines and `start`/`next_start` page through long text. ZIPs that unpack past 100 MB are refused. The result does not report the download time as a date, because agents treated it as the document's date and refused to use documents in backtests.
+- `web-documents` built-in skill: how to find a document on a website, read it, do table math with SQL, and in backtests skip every document dated after the backtest time.
+- Agent eval `web_documents_holdings_from_yearly_and_trade_reports`: from a ZIP filing index and PDF reports, work out a member's holdings from the yearly report plus newer trade reports, and never open the report filed after the simulated date. Red on the old tools (3/3), green with `read_document` (3/3).
+
+### Removed
+- The `house_public_disclosures` agent tool and the House-only code behind it (`lumibot/components/house_ptr.py`, `lumibot/components/disclosure_signals.py`, `lumibot/example_strategies/disclosure_replay.py`). They were built for one example. The Nancy Pelosi example reads the House Clerk website with the generic browser and `http_request` tools, the way any strategy reads any website.
+
+### Changed
+- Agent option tools can see expirations more than 90 days out in backtests. `options_get_chain` takes an optional `max_expiration`, and `options_get_strikes`, `options_find_strike_for_delta` and `options_find_expiration` widen the chain window to the expiration they are asked about. Backtest chains list about 90 days by default, so a copy of a January 2027 call found no contract in January 2026. Live brokers already list every expiration.
+- The `duckdb_query` description tells agents it is also their calculator (a `VALUES` list), after a portfolio agent scaled holdings 1,000x wrong doing the math in its head.
+- `http_request` turns any PDF into plain page text. It used to run House trade-report cleanup on every PDF.
+
+### Fixed
+- Document readers apply the unpacked-size limit to Word and Excel archives as well as ZIPs; tables with identical sheet/file labels stay independently queryable. Malformed CSV/TSV keeps readable text and exposes a parse error instead of losing the document or silently dropping rows.
+- Pelosi examples preserve the last known filing ID when a partial research answer omits it. Historical research runner jobs receive Alpaca credentials only when Alpaca is selected and its account mode has been validated.
+- The standard release gate no longer runs paid-service historical benchmarks as offline tests. Those integrations use the existing `apitest` marker; portable Alpaca adapter/backtest acceptance covers real orders, fills and cash without vendor subscriptions, and existing options limit/fee regressions remain required. CI and publishing no longer inject ThetaData/downloader/S3 credentials into the portable test gate.
+- Multi-leg option limit backtests fill every leg together only when the package's net price meets the credit/debit limit. Missing quotes use current-bar opens for all legs; stale or future bars cannot partially fill a package.
+- Backtests charge the buy fee when closing a short option (`buy_to_close`). That side was in neither fee list, so the short legs of every closing spread or iron condor paid no commission and option backtests looked cheaper than live trading.
+
 ## 4.6.2 - 2026-09-27
 
 ### Changed
