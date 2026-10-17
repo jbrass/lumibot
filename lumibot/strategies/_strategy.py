@@ -3895,7 +3895,7 @@ class _Strategy:
         if not hasattr(self, "lumiwealth_api_key") or self.lumiwealth_api_key is None or self.lumiwealth_api_key == "":
             # Log that we are not sending the update to the cloud
             if not self._logged_missing_lumiwealth_api_key:
-                self.logger.warning("LUMIWEALTH_API_KEY not set. Not sending an update to the cloud because "
+                self.logger.debug("LUMIWEALTH_API_KEY not set. Not sending an update to the cloud because "
                                     "lumiwealth_api_key is not set. If you would like to be able to track your bot "
                                     "performance on www.botspot.trade, please set the lumiwealth_api_key parameter "
                                     "in the strategy initialization or the LUMIWEALTH_API_KEY environment variable.")
