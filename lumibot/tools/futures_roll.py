@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from functools import lru_cache
 from typing import Dict, List, Optional, Tuple
 
 import pytz
@@ -31,6 +32,7 @@ class RollRule:
     offset_business_days: int
     anchor: str
     contract_months: Optional[Tuple[int, ...]] = None
+    roll_anchor: Optional[str] = None
 
 
 _DEFAULT_CONTRACT_MONTHS: Tuple[int, ...] = (3, 6, 9, 12)
@@ -48,11 +50,13 @@ ROLL_RULES.update(
             offset_business_days=7,
             anchor="third_last_business_day",
             contract_months=(2, 4, 6, 8, 10, 12),
+            roll_anchor="metal_first_notice",
         ),
         "MGC": RollRule(
             offset_business_days=7,
             anchor="third_last_business_day",
             contract_months=(2, 4, 6, 8, 10, 12),
+            roll_anchor="metal_first_notice",
         ),
         "SI": RollRule(
             offset_business_days=7,
@@ -69,6 +73,14 @@ ROLL_RULES.update(
         "MCL": RollRule(
             offset_business_days=5,
             anchor="mcl_last_trade",
+            contract_months=_MONTHLY_CONTRACT_MONTHS,
+        ),
+        # Henry Hub gas trades every delivery month and expires three trading
+        # days before that month starts (CME/NYMEX rule 220102.F). The five-day
+        # roll offset is LumiBot's synthetic energy convention, not an expiry.
+        "NG": RollRule(
+            offset_business_days=5,
+            anchor="ng_last_trade",
             contract_months=_MONTHLY_CONTRACT_MONTHS,
         ),
         # CME Crypto futures (IBKR roots). These expire on the last Friday trading day of the
@@ -270,17 +282,56 @@ def _mcl_last_trade_date(year: int, month: int) -> datetime:
     return _prior_month_25th_minus_trading_days(year, month, trading_days_before_25th=4)
 
 
+@lru_cache(maxsize=4096)
+def _ng_last_trade_date(year: int, month: int) -> datetime:
+    """Henry Hub gas: three trading days before the first delivery-month day."""
+    delivery_start = date(year, month, 1)
+    # Expiry business days exclude holidays such as Thanksgiving even when
+    # Globex opens for a shortened session. Use CME's trade-date calendar.
+    import pandas_market_calendars as mcal
+    cal = mcal.get_calendar("CME_TradeDate")
+    valid = cal.valid_days(start_date=delivery_start - timedelta(days=45),
+                           end_date=delivery_start - timedelta(days=1))
+    if valid is None or len(valid) < 3:
+        raise ValueError("CME expiry calendar did not provide three prior business days")
+    return _to_timezone(datetime.combine(valid[-3].date(), datetime.min.time()))
+
+
+@lru_cache(maxsize=8192)
 def _calculate_roll_trigger(year: int, month: int, rule: RollRule) -> datetime:
-    if rule.anchor == "third_friday":
+    # RollRule is immutable and part of the key: replacing a rule cannot reuse
+    # the old date. Calendar failures raise and are never cached by lru_cache.
+    roll_anchor = rule.roll_anchor or rule.anchor
+    if roll_anchor == "metal_first_notice":
+        # COMEX 706.C: first notice is the last business day of the prior
+        # month, well before the last trade in the delivery month. Keeping
+        # the latter as the roll anchor selects thin delivery-month gold.
+        # Seven business days is our synthetic roll convention, not a CME
+        # mandated roll date. Preserve actual expiry in rule.anchor.
+        import pandas_market_calendars as mcal
+
+        delivery_start = date(year, month, 1)
+        valid = mcal.get_calendar("CME_TradeDate").valid_days(
+            start_date=delivery_start - timedelta(days=60),
+            end_date=delivery_start - timedelta(days=1),
+        )
+        offset = max(0, rule.offset_business_days) + 1
+        if valid is None or len(valid) < offset:
+            raise ValueError("CME notice calendar did not provide enough prior business days")
+        roll = _to_timezone(datetime.combine(valid[-offset].date(), datetime.min.time()))
+        return roll + timedelta(minutes=5)
+    if roll_anchor == "third_friday":
         anchor = _third_friday(year, month)
-    elif rule.anchor == "last_friday":
+    elif roll_anchor == "last_friday":
         anchor = _last_friday_trading_day(year, month)
-    elif rule.anchor == "third_last_business_day":
+    elif roll_anchor == "third_last_business_day":
         anchor = _third_last_business_day(year, month)
-    elif rule.anchor == "cl_last_trade":
+    elif roll_anchor == "cl_last_trade":
         anchor = _cl_last_trade_date(year, month)
-    elif rule.anchor == "mcl_last_trade":
+    elif roll_anchor == "mcl_last_trade":
         anchor = _mcl_last_trade_date(year, month)
+    elif roll_anchor == "ng_last_trade":
+        anchor = _ng_last_trade_date(year, month)
     else:
         anchor = _to_timezone(datetime(year, month, 15))
     if rule.offset_business_days <= 0:
@@ -320,7 +371,6 @@ def _select_contract(year: int, month: int, months: Tuple[int, ...]) -> YearMont
 
 
 def _legacy_mid_month(reference_date: datetime) -> YearMonth:
-    quarter_months = [3, 6, 9, 12]
     year = reference_date.year
     month = reference_date.month
     day = reference_date.day
@@ -431,7 +481,6 @@ def build_roll_schedule(asset, start: datetime, end: datetime, year_digits: int 
 
     symbol_upper = asset.symbol.upper()
     rule = ROLL_RULES.get(symbol_upper)
-    contract_months = _get_contract_months(rule)
 
     schedule = []
     cursor = start

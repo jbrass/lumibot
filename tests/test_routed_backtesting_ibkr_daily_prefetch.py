@@ -10,10 +10,35 @@ from lumibot.backtesting.routed_backtesting import RoutedBacktestingPandas
 from lumibot.entities import Asset
 
 
+@pytest.mark.parametrize("when,expected", [
+    ("2026-09-18 17:55", 104.), ("2026-09-20 17:55", 104.),
+    ("2026-09-20 18:05", None),
+])
+def test_routed_futures_closed_market_mark(monkeypatch, when, expected):
+    from lumibot.backtesting.thetadata_backtesting_pandas import ThetaDataBacktestingPandas
+    from lumibot.entities import Data
+
+    source = RoutedBacktestingPandas.__new__(RoutedBacktestingPandas)
+    source._routing = {"default": "ibkr"}
+    source._update_cadence_from_dt = lambda dt: None
+    source.get_datetime = lambda: pd.Timestamp(when, tz="America/New_York").to_pydatetime()
+    source._has_loaded_intraday_series = lambda *a: True
+    source.datetime_end = pd.Timestamp("2026-09-21", tz="America/New_York").to_pydatetime()
+    source._update_pandas_data = lambda *a, **kw: None
+    asset = Asset("MES", asset_type="future", expiration=datetime(2026, 12, 18).date())
+    quote = Asset("USD", "forex")
+    idx = pd.date_range("2026-09-18 16:58", periods=2, freq="min", tz="America/New_York")
+    frame = pd.DataFrame({"open": [100., 101.], "high": [103., 105.],
+                          "low": [99., 100.], "close": [102., 104.], "volume": 10}, index=idx)
+    source._data_store = {(asset, quote, "minute"): Data(asset, frame, timestep="minute", quote=quote)}
+    monkeypatch.setattr(ThetaDataBacktestingPandas, "get_last_price", lambda *a, **kw: None)
+    assert source.get_last_price(asset, quote=quote) == expected
+
+
 def test_routed_backtesting_prefetches_ibkr_crypto_daily_window_once(monkeypatch):
     calls: list[tuple[datetime, datetime, str]] = []
 
-    def _fake_get_price_data(*, asset, quote, timestep, start_dt, end_dt, exchange=None, include_after_hours=True, source=None):
+    def _fake_get_price_data(*, asset, quote, timestep, start_dt, end_dt, exchange=None, include_after_hours=True, source=None, history_as_of=None):
         calls.append((start_dt, end_dt, str(timestep)))
         idx = pd.date_range(start=start_dt, end=end_dt, freq="D")
         df = pd.DataFrame(
@@ -80,7 +105,7 @@ def test_routed_backtesting_prefetches_ibkr_crypto_daily_window_once(monkeypatch
 
 
 def test_routed_backtesting_crypto_daily_tuple_lookup_uses_prefetched_canonical_key(monkeypatch):
-    def _fake_get_price_data(*, asset, quote, timestep, start_dt, end_dt, exchange=None, include_after_hours=True, source=None):
+    def _fake_get_price_data(*, asset, quote, timestep, start_dt, end_dt, exchange=None, include_after_hours=True, source=None, history_as_of=None):
         idx = pd.date_range(start=start_dt, end=end_dt, freq="D")
         df = pd.DataFrame(
             {
@@ -129,7 +154,7 @@ def test_routed_ibkr_crypto_intraday_rejects_stale_underfilled_last_price_and_qu
     sim_ts = pd.Timestamp("2026-04-17 10:00", tz=ny)
     calls: list[tuple[datetime, datetime, str]] = []
 
-    def _fake_get_price_data(*, asset, quote, timestep, start_dt, end_dt, exchange=None, include_after_hours=True, source=None):
+    def _fake_get_price_data(*, asset, quote, timestep, start_dt, end_dt, exchange=None, include_after_hours=True, source=None, history_as_of=None):
         calls.append((start_dt, end_dt, str(timestep)))
         df = pd.DataFrame(
             {
@@ -185,7 +210,7 @@ def test_routed_ibkr_crypto_intraday_rejects_future_underfilled_last_price_and_q
     sim_ts = pd.Timestamp("2026-03-12 07:00", tz=ny)
     calls: list[tuple[datetime, datetime, str]] = []
 
-    def _fake_get_price_data(*, asset, quote, timestep, start_dt, end_dt, exchange=None, include_after_hours=True, source=None):
+    def _fake_get_price_data(*, asset, quote, timestep, start_dt, end_dt, exchange=None, include_after_hours=True, source=None, history_as_of=None):
         calls.append((start_dt, end_dt, str(timestep)))
         df = pd.DataFrame(
             {
@@ -236,9 +261,12 @@ def test_routed_ibkr_crypto_intraday_rejects_future_underfilled_last_price_and_q
 def test_routed_backtesting_prefetches_ibkr_stock_daily_with_full_lookback(monkeypatch):
     calls: list[tuple[datetime, datetime, str]] = []
 
-    def _fake_get_price_data(*, asset, quote, timestep, start_dt, end_dt, exchange=None, include_after_hours=True, source=None):
+    def _fake_get_price_data(*, asset, quote, timestep, start_dt, end_dt, exchange=None, include_after_hours=True, source=None, history_as_of=None):
         calls.append((start_dt, end_dt, str(timestep)))
-        idx = pd.date_range(start=start_dt, end=end_dt, freq="D")
+        import pandas_market_calendars as mcal
+
+        schedule = mcal.get_calendar("NYSE").schedule(start_dt.date(), end_dt.date())
+        idx = pd.DatetimeIndex(schedule["market_close"])
         df = pd.DataFrame(
             {
                 "open": 100.0,
@@ -274,8 +302,8 @@ def test_routed_backtesting_prefetches_ibkr_stock_daily_with_full_lookback(monke
     def _get_timestep(self):
         return "day"
 
-    # For 200+ day SMA lookbacks, the start window should be substantially deeper than
-    # "backtest start - ~225 calendar days".
+    # The generic caller padding is deliberately too deep. The equity adapter
+    # must request exactly 220 completed exchange sessions and then reuse them.
     def _get_start_datetime_and_ts_unit(self, length, ts, start_dt=None, start_buffer=timedelta(0)):
         end_dt = start_dt if isinstance(start_dt, datetime) else backtest_start
         return end_dt - timedelta(days=352), "day"
@@ -295,7 +323,10 @@ def test_routed_backtesting_prefetches_ibkr_stock_daily_with_full_lookback(monke
 
     routed._update_pandas_data(base, quote, 220, "day", start_dt=backtest_start)
     assert calls, "Expected ibkr_helper.get_price_data to be called"
-    assert calls[0][0] == backtest_start - timedelta(days=352)
+    # Feb 20 through Dec 31 contains 220 NYSE sessions, including holiday closures.
+    assert calls[0][0] == datetime(2020, 2, 20, 14, 30, tzinfo=timezone.utc)
+    data = routed._data_store[(base, quote, "day")]
+    assert len(data.df.loc[data.df.index < backtest_start]) == 220
     assert calls[0][1] == backtest_end
 
     routed._update_pandas_data(base, quote, 220, "day", start_dt=backtest_start + timedelta(days=1))
@@ -305,7 +336,7 @@ def test_routed_backtesting_prefetches_ibkr_stock_daily_with_full_lookback(monke
 def test_routed_backtesting_stock_daily_prefetch_stays_unloaded_when_coverage_fails(monkeypatch):
     calls: list[tuple[datetime, datetime, str]] = []
 
-    def _fake_get_price_data(*, asset, quote, timestep, start_dt, end_dt, exchange=None, include_after_hours=True, source=None):
+    def _fake_get_price_data(*, asset, quote, timestep, start_dt, end_dt, exchange=None, include_after_hours=True, source=None, history_as_of=None):
         calls.append((start_dt, end_dt, str(timestep)))
         idx = pd.date_range(start=start_dt, periods=5, freq="D")
         df = pd.DataFrame(
@@ -370,7 +401,7 @@ def test_routed_backtesting_stock_daily_prefetch_stays_unloaded_when_coverage_fa
 def test_routed_backtesting_stock_minute_prefetch_stays_unloaded_when_coverage_fails(monkeypatch):
     calls: list[tuple[datetime, datetime, str]] = []
 
-    def _fake_get_price_data(*, asset, quote, timestep, start_dt, end_dt, exchange=None, include_after_hours=True, source=None):
+    def _fake_get_price_data(*, asset, quote, timestep, start_dt, end_dt, exchange=None, include_after_hours=True, source=None, history_as_of=None):
         calls.append((start_dt, end_dt, str(timestep)))
         idx = pd.date_range(start=start_dt, periods=5, freq="1min")
         df = pd.DataFrame(
@@ -433,7 +464,7 @@ def test_routed_backtesting_stock_minute_prefetch_stays_unloaded_when_coverage_f
 def test_routed_backtesting_future_minute_prefetch_stays_unloaded_when_coverage_fails(monkeypatch):
     calls: list[tuple[datetime, datetime, str]] = []
 
-    def _fake_get_price_data(*, asset, quote, timestep, start_dt, end_dt, exchange=None, include_after_hours=True, source=None):
+    def _fake_get_price_data(*, asset, quote, timestep, start_dt, end_dt, exchange=None, include_after_hours=True, source=None, history_as_of=None):
         calls.append((start_dt, end_dt, str(timestep)))
         idx = pd.date_range(start=start_dt, periods=5, freq="1min")
         df = pd.DataFrame(
@@ -496,7 +527,7 @@ def test_routed_backtesting_future_minute_prefetch_stays_unloaded_when_coverage_
 def test_routed_backtesting_crypto_daily_prefetch_stays_unloaded_when_coverage_fails(monkeypatch):
     calls: list[tuple[datetime, datetime, str]] = []
 
-    def _fake_get_price_data(*, asset, quote, timestep, start_dt, end_dt, exchange=None, include_after_hours=True, source=None):
+    def _fake_get_price_data(*, asset, quote, timestep, start_dt, end_dt, exchange=None, include_after_hours=True, source=None, history_as_of=None):
         calls.append((start_dt, end_dt, str(timestep)))
         idx = pd.date_range(start=start_dt, periods=5, freq="D")
         df = pd.DataFrame(

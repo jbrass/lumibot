@@ -46,6 +46,12 @@ def _get_bars_class():
     return Bars
 
 
+def _shared_bar_cache():
+    from lumibot.tools import shared_bar_cache
+
+    return shared_bar_cache
+
+
 def _get_quote_class():
     from lumibot.entities import Quote
 
@@ -108,6 +114,7 @@ class SchwabData(DataSource):
 
     MIN_TIMESTEP = "minute"
     SOURCE = "Schwab"
+    CHAIN_FULL_INFO_REQUIRES_PRICING_INPUTS = False
 
     def __init__(self, client=None, api_key=None, secret=None, account_number=None, auto_create_client=True, **kwargs):
         """
@@ -270,21 +277,27 @@ class SchwabData(DataSource):
             if strike_range is not None:
                 params["strike_range"] = strike_range
 
-            response = self.client.get_option_chain(**params)
-
-            # Process response
-            if not response:
-                logger.error(colored(f"No response from API for {asset.symbol}", "red"))
-                return {}
-
-            if hasattr(response, 'status_code'):
-                if response.status_code == 200:
-                    data = response.json()
+            def fetch_chain_data():
+                response = self.client.get_option_chain(**params)
+                if not response:
+                    logger.error(colored(f"No response from API for {asset.symbol}", "red"))
+                    return None
+                if hasattr(response, "status_code"):
+                    if response.status_code != 200:
+                        logger.error(colored(f"Error fetching options for {asset.symbol}: {response.status_code}", "red"))
+                        return None
+                    result = response.json()
                 else:
-                    logger.error(colored(f"Error fetching options for {asset.symbol}: {response.status_code}", "red"))
-                    return {}
-            else:
-                data = response
+                    result = response
+                if (not isinstance(result, dict) or result.get("error")
+                        or str(result.get("status", "SUCCESS")).upper() != "SUCCESS"):
+                    logger.error(colored(f"Invalid or unsuccessful option chain for {asset.symbol}", "red"))
+                    return None
+                return result
+
+            data = fetch_chain_data()
+            if data is None:
+                return {}
 
             # Extract option data for both call and put types
             success = False
@@ -311,12 +324,25 @@ class SchwabData(DataSource):
                     # Sort the strikes in ascending order
                     chains["Chains"][option_type][exp_date].sort()
 
-                return True
+                return any(chains["Chains"][option_type].values())
 
             # Extract data for both call and put options
             call_success = extract_option_data("CALL")
             put_success = extract_option_data("PUT")
             success = call_success or put_success
+
+            # A retry must actually change the request. Recursing through this
+            # method recreated NTM every time and could issue unbounded reads.
+            if not success and strike_range is not None and strike_range != self.client.Options.StrikeRange.ALL:
+                logger.warning(colored("No option data found with current strike range. Trying with ALL strikes...", "yellow"))
+                params["strike_range"] = self.client.Options.StrikeRange.ALL
+                data = fetch_chain_data()
+                if data is None:
+                    return {}
+                chains["Chains"] = {"CALL": {}, "PUT": {}}
+                call_success = extract_option_data("CALL")
+                put_success = extract_option_data("PUT")
+                success = call_success or put_success
 
             # Extract underlying data if available
             if 'underlying' in data and (not chains.get("Exchange") or not chains.get("Multiplier")):
@@ -332,13 +358,6 @@ class SchwabData(DataSource):
                     if exchange_name:
                         chains["Exchange"] = exchange_name
 
-            # If we got no data and we're not already using ALL strikes, try again with ALL strikes
-            if not success and strike_range is not None and strike_range != self.client.Options.StrikeRange.ALL:
-                logger.warning(colored("No option data found with current strike range. Trying with ALL strikes...", "yellow"))
-                # Set to ALL for the recursive call
-                params["strike_range"] = self.client.Options.StrikeRange.ALL
-                return self.get_chains(asset, quote, exchange, strike_count)
-
             if not success:
                 logger.error(colored(f"No option data found for {asset.symbol}", "red"))
 
@@ -351,6 +370,96 @@ class SchwabData(DataSource):
         except Exception as e:
             logger.error(colored(f"Error getting option chains for {asset.symbol}: {str(e)}", "red"))
             return {}
+
+    def get_chain_full_info(
+        self, asset: Asset, expiry, chains=None, underlying_price=None,
+        risk_free_rate=None, strike_min=None, strike_max=None,
+    ):
+        """Fetch one expiration's prices and Greeks in one Schwab request.
+
+        This overrides DataSource's per-contract reconstruction using the
+        existing public full-chain API. ``chains`` may be previously fetched
+        strike metadata; it is not a quote cache. Each call requests a fresh
+        snapshot. Missing prices and timestamps stay missing, so callers must
+        apply their own liquidity and freshness requirements before trading.
+        Provider failures raise rather than masquerading as an empty market.
+        """
+        if isinstance(expiry, datetime.datetime):
+            expiry = expiry.date()
+        elif isinstance(expiry, str):
+            expiry = datetime.date.fromisoformat(expiry)
+        elif not isinstance(expiry, datetime.date):
+            raise TypeError("expiry must be an ISO date string, datetime.date or datetime.datetime instance")
+        if self.client is None:
+            raise ConnectionError("No Schwab client available for full option chain")
+        if strike_min is not None and strike_max is not None and strike_min > strike_max:
+            raise ValueError("strike_min must not exceed strike_max")
+
+        response = self.client.get_option_chain(
+            symbol=asset.symbol,
+            contract_type=self.client.Options.ContractType.ALL,
+            strategy=self.client.Options.Strategy.SINGLE,
+            from_date=expiry,
+            to_date=expiry,
+            include_underlying_quote=False,
+        )
+        status = getattr(response, "status_code", None)
+        if status != 200:
+            # Do not include provider bodies: they may contain account details.
+            raise ConnectionError(f"Schwab full option chain request failed (status {status})")
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError("Invalid Schwab full option chain response")
+        if payload.get("error") or str(payload.get("status", "SUCCESS")).upper() != "SUCCESS":
+            raise ConnectionError("Schwab full option chain reported failure")
+
+        rows = []
+        for right, map_name in (("CALL", "callExpDateMap"), ("PUT", "putExpDateMap")):
+            expiration_map = payload.get(map_name) or {}
+            if not isinstance(expiration_map, dict):
+                raise ValueError("Invalid Schwab option expiration map")
+            for expiration_key, strikes in expiration_map.items():
+                if str(expiration_key).split(":", 1)[0] != expiry.isoformat():
+                    continue
+                if not isinstance(strikes, dict):
+                    raise ValueError("Invalid Schwab option strike map")
+                for contracts in strikes.values():
+                    if not isinstance(contracts, list):
+                        raise ValueError("Invalid Schwab option contracts")
+                    for item in contracts:
+                        if not isinstance(item, dict):
+                            raise ValueError("Invalid Schwab option contract")
+                        strike = item.get("strikePrice")
+                        if strike is None or not item.get("symbol"):
+                            continue
+                        strike = float(strike)
+                        if strike_min is not None and strike < strike_min:
+                            continue
+                        if strike_max is not None and strike > strike_max:
+                            continue
+                        row = {
+                            "symbol": item["symbol"], "last": item.get("last"),
+                            "expiration_date": expiry, "strike": strike,
+                            "option_type": right, "underlying": asset.symbol,
+                            "open_interest": item.get("openInterest"),
+                            "bid": item.get("bid"), "ask": item.get("ask"),
+                            "bidsize": item.get("bidSize"), "asksize": item.get("askSize"),
+                            "volume": item.get("totalVolume"),
+                            "last_volume": item.get("lastSize"),
+                            "average_volume": None, "type": "option",
+                            "implied_volatility": item.get("volatility"),
+                            "is_delayed": payload.get("isDelayed"),
+                            "non_standard": item.get("nonStandard"),
+                            "multiplier": item.get("multiplier"),
+                            "deliverables": item.get("optionDeliverablesList"),
+                            "quote_time": self.convert_epoch_ms_to_datetime(item.get("quoteTimeInLong")),
+                            "trade_time": self.convert_epoch_ms_to_datetime(item.get("tradeTimeInLong")),
+                        }
+                        for greek in ("delta", "gamma", "theta", "vega", "rho"):
+                            value = item.get(greek)
+                            row[f"greeks.{greek}"] = None if value == -999 else value
+                        rows.append(row)
+        return pd.DataFrame(rows).sort_values(["strike", "option_type"]).reset_index(drop=True) if rows else pd.DataFrame()
 
     def convert_timestep_str_to_timedelta(self, timestep_str):
         """
@@ -512,82 +621,76 @@ class SchwabData(DataSource):
                 frequency_type = self.client.PriceHistory.FrequencyType.DAILY
                 frequency = 1
 
-            # Get price history using the simplified API function
-            if timestep_unit == "day":
-                response = self.client.get_price_history_every_day(
-                    symbol,
-                    start_datetime=start_date,
-                    end_datetime=end_date,
-                    need_extended_hours_data=include_after_hours,
-                )
-            else:
-                # Convert raw frequency integer to Enum if required
-                freq_enum = frequency
-                try:
-                    if isinstance(frequency, int):
-                        freq_enum = self.client.PriceHistory.Frequency(frequency)
-                except Exception:
-                    pass
+            freq_enum = frequency
+            try:
+                if isinstance(frequency, int):
+                    freq_enum = self.client.PriceHistory.Frequency(frequency)
+            except Exception:
+                pass
 
-                response = self.client.get_price_history(
-                    symbol=symbol,
-                    frequency_type=frequency_type,
-                    frequency=freq_enum,
-                    start_datetime=start_date,
-                    end_datetime=end_date,
-                    need_extended_hours_data=include_after_hours
-                )
-
-            # Check if the response is a Response object and handle accordingly
-            if hasattr(response, 'status_code'):
-                # It's a Response object from requests library
-                if response.status_code != 200:
-                    logger.error(colored(f"Error fetching historical prices for {asset.symbol}: {response.status_code}, {response.text}", "red"))
-                    return None
-
-                # Parse the JSON response
-                try:
+            def fetch(range_start, range_end):
+                """One Schwab candle read for [range_start, range_end]. Errors raise; nothing is cached."""
+                if timestep_unit == "day":
+                    response = self.client.get_price_history_every_day(
+                        symbol,
+                        start_datetime=range_start.to_pydatetime(),
+                        end_datetime=range_end.to_pydatetime(),
+                        need_extended_hours_data=include_after_hours,
+                    )
+                else:
+                    response = self.client.get_price_history(
+                        symbol=symbol,
+                        frequency_type=frequency_type,
+                        frequency=freq_enum,
+                        start_datetime=range_start.to_pydatetime(),
+                        end_datetime=range_end.to_pydatetime(),
+                        need_extended_hours_data=include_after_hours,
+                    )
+                if hasattr(response, 'status_code'):
+                    if response.status_code != 200:
+                        raise RuntimeError(f"Schwab price history returned {response.status_code}: {response.text}")
                     data = response.json()
-                except ValueError as e:
-                    logger.error(colored(f"Invalid JSON in response for {asset.symbol}: {e}", "red"))
-                    return None
-            else:
-                # It's already a dictionary or other data structure
-                data = response
+                else:
+                    data = response
+                if not data or 'candles' not in data:
+                    raise RuntimeError("Schwab price history response has no candles field")
+                frame = pd.DataFrame(data['candles'])
+                if frame.empty:
+                    return frame
+                expected_columns = ['open', 'high', 'low', 'close', 'volume', 'datetime']
+                if not all(col in frame.columns for col in expected_columns):
+                    logger.warning(colored(f"Missing expected columns in response. Got: {frame.columns.tolist()}", "yellow"))
+                # Epoch milliseconds identify UTC instants, never local wall time.
+                frame['datetime'] = pd.to_datetime(frame['datetime'], unit='ms', utc=True)
+                frame = frame.set_index('datetime')
+                return frame[~frame.index.duplicated(keep='first')]
 
-            # Check if data contains candles data
-            if not data or 'candles' not in data:
-                logger.error(colored(f"No candles data found in the response for {asset.symbol}", "red"))
-                return None
-
-            candles = data['candles']
+            # Charts, bots and broker-backed backtests share one bar cache per connection.
+            provider_timestep = {
+                "minute": f"{frequency}minute",
+                "hour": "30minute",
+                "day": "1day",
+                "week": "1week",
+                "month": "1month",
+            }.get(timestep_unit, "1day")
+            series = _shared_bar_cache().BarSeries.make(
+                "schwab",
+                symbol,
+                provider_timestep,
+                scope=self.shared_bars_scope,
+                adjusted=True,
+                assetType=str(asset.asset_type),
+                extendedHours=bool(include_after_hours),
+            )
+            df = _shared_bar_cache().read_bars(series, start_date, end_date, fetch)
 
             # If no candles were returned, return None
-            if not candles or len(candles) == 0:
+            if df.empty:
                 logger.warning(colored(f"No price data available for {asset.symbol} in the requested time range", "yellow"))
                 return None
 
-            # Convert candles to a DataFrame
-            df = pd.DataFrame(candles)
-
-            # Ensure expected columns are present
-            expected_columns = ['open', 'high', 'low', 'close', 'volume', 'datetime']
-            if not all(col in df.columns for col in expected_columns):
-                logger.warning(colored(f"Missing expected columns in response. Got: {df.columns.tolist()}", "yellow"))
-
-            # Set datetime as the index
-            if 'datetime' in df.columns:
-                df['datetime'] = pd.to_datetime(df['datetime'], unit='ms')
-                df.set_index('datetime', inplace=True)
-
-            # Drop any duplicate indices
-            df = df[~df.index.duplicated(keep='first')]
-
-            # Ensure index is timezone-aware
-            if df.index.tz is None:
-                df.index = df.index.tz_localize(LUMIBOT_DEFAULT_TIMEZONE)
-            else:
-                df.index = df.index.tz_convert(LUMIBOT_DEFAULT_TIMEZONE)
+            df = _shared_bar_cache().to_timezone(df, LUMIBOT_DEFAULT_TIMEZONE)
+            df.index.name = 'datetime'
 
             # Create and return the Bars object
             bars = _get_bars_class()(df, self.SOURCE, asset, raw=df, quote=quote)
@@ -640,120 +743,79 @@ class SchwabData(DataSource):
             logger.error(colored(f"Error converting timestamp: {e}", "red"))
             return None
 
-    def get_quote(self, asset, quote=None, exchange=None) -> Quote:
+    def _quote_from_response(self, asset, symbol, asset_quote):
+        """The same exact-symbol parser serves singleton and bulk requests."""
+        quote_info = asset_quote.get("quote", {})
+        if not isinstance(quote_info, dict):
+            raise ValueError("Invalid Schwab quote fields")
+        quote_time = self.convert_epoch_ms_to_datetime(quote_info.get("quoteTime"))
+        bid_time = self.convert_epoch_ms_to_datetime(quote_info.get("bidTime"))
+        ask_time = self.convert_epoch_ms_to_datetime(quote_info.get("askTime"))
+        times = [value for value in (quote_time, bid_time, ask_time) if value is not None]
+        timestamp = max(times) if times else datetime.datetime.now(datetime.timezone.utc)
+        return _get_quote_class()(
+            asset=asset, price=quote_info.get("lastPrice"),
+            bid=quote_info.get("bidPrice"), ask=quote_info.get("askPrice"),
+            volume=quote_info.get("totalVolume"), timestamp=timestamp,
+            quote_time=quote_time, bid_time=bid_time, ask_time=ask_time,
+            bid_size=quote_info.get("bidSize"), ask_size=quote_info.get("askSize"),
+            change=quote_info.get("netChange"),
+            percent_change=quote_info.get("netPercentChangeInDouble"),
+            raw_data=asset_quote, symbol_used=symbol,
+        )
+
+    def get_quotes(self, assets, quote=None, exchange=None):
+        """Fetch exact stock/option/future contracts in batches of at most 50.
+
+        Return every requested Asset mapped to a Quote or None when its symbol
+        is absent. Preserve recorded quote times and missing bid/ask values.
+        No last-price substitution, persistent cache or per-contract retries.
+        Provider/shape failures raise; callers must not treat them as no market.
         """
-        This function returns the quote of an asset as a Quote object.
-        
-        Parameters
-        ----------
-        asset: Asset
-            The asset to get the quote for
-        quote: Asset
-            The quote asset to get the quote for (not currently used for Schwab)
-        exchange: str
-            The exchange to get the quote for (not currently used for Schwab)
-
-        Returns
-        -------
-        Quote
-            Quote object containing detailed information about the asset
-        """
-        if self.client is None:
-            logger.error(colored("No Schwab client available for get_quote", "red"))
-            return None
-
-        if getattr(asset, "asset_type", None) == "crypto":
-            logger.error(colored(
-                "Schwab does not support the crypto asset type. Equity tickers such as BTC and ETH are unchanged.",
-                "red",
-            ))
-            return None
-
-        try:
-            # Format the symbol according to asset type
+        assets = list(dict.fromkeys(assets))
+        if not assets:
+            return {}
+        symbols = {}
+        for asset in assets:
             symbol = _schwab_market_symbol(asset)
             if not symbol:
-                logger.error(colored(f"No Schwab symbol for {getattr(asset, 'symbol', asset)}", "red"))
-                return None
+                raise ValueError("Schwab does not support the requested quote asset")
+            symbols[asset] = symbol
+        if self.client is None:
+            raise ConnectionError("No Schwab client available for quotes")
+        result = {}
+        for offset in range(0, len(assets), 50):
+            batch = assets[offset:offset + 50]
+            response = self.client.get_quotes([symbols[asset] for asset in batch])
+            if getattr(response, "status_code", None) != 200:
+                raise ConnectionError(f"Schwab quote request failed (status {getattr(response, 'status_code', None)})")
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise ValueError("Invalid Schwab quotes response")
+            for asset in batch:
+                symbol = symbols[asset]
+                matches = [key for key in payload if isinstance(key, str) and key.upper() == symbol.upper()]
+                if len(matches) > 1:
+                    raise ValueError("Ambiguous Schwab quote symbol")
+                data = payload[matches[0]] if matches else None
+                if data is None:
+                    result[asset] = None
+                    continue
+                if not isinstance(data, dict):
+                    raise ValueError("Invalid Schwab quote response")
+                if not data:
+                    result[asset] = None
+                    continue
+                reported = data.get("symbol")
+                if reported is not None and str(reported).upper() != symbol.upper():
+                    raise ValueError("Schwab quote contract does not match the requested asset")
+                result[asset] = self._quote_from_response(asset, matches[0], data)
+        return result
 
-            # Get quotes from Schwab API
-            response = self.client.get_quotes([symbol])
-
-            # Check for valid response
-            if not hasattr(response, 'status_code'):
-                logger.error(colored(f"Unexpected response type from get_quotes: {type(response)}", "red"))
-                return None
-
-            if response.status_code != 200:
-                logger.error(colored(f"Error fetching quote for {symbol}: {response.status_code}, {response.text}", "red"))
-                return None
-
-            # Parse response JSON
-            quote_data = response.json()
-
-            # Get quote for our symbol
-            asset_quote = quote_data.get(symbol)
-
-            if not asset_quote:
-                # Try case-insensitive match
-                for key in quote_data:
-                    if key.upper() == symbol.upper():
-                        asset_quote = quote_data[key]
-                        symbol = key  # Update symbol to the matched key
-                        break
-
-            if not asset_quote:
-                logger.warning(colored(f"No quote data found for {symbol}", "yellow"))
-                return None
-
-            # Extract quote information
-            quote_info = asset_quote.get('quote', {})
-
-            # Get timestamps as datetime objects
-            quote_time = self.convert_epoch_ms_to_datetime(quote_info.get('quoteTime'))
-            bid_time = self.convert_epoch_ms_to_datetime(quote_info.get('bidTime'))
-            ask_time = self.convert_epoch_ms_to_datetime(quote_info.get('askTime'))
-
-            # Use most recent timestamp as the main quote timestamp
-            timestamp = quote_time
-            if bid_time and (not timestamp or bid_time > timestamp):
-                timestamp = bid_time
-            if ask_time and (not timestamp or ask_time > timestamp):
-                timestamp = ask_time
-
-            # If we still don't have a timestamp, use current time
-            if not timestamp:
-                timestamp = datetime.datetime.now(datetime.timezone.utc)
-
-            # Extract additional useful fields that might be available
-            bid_size = quote_info.get('bidSize')
-            ask_size = quote_info.get('askSize')
-            last_price = quote_info.get('lastPrice')
-            bid_price = quote_info.get('bidPrice')
-            ask_price = quote_info.get('askPrice')
-            volume = quote_info.get('totalVolume')
-            change = quote_info.get('netChange')
-            percent_change = quote_info.get('netPercentChangeInDouble')
-
-            # Create and return Quote object
-            return _get_quote_class()(
-                asset=asset,
-                price=last_price,
-                bid=bid_price,
-                ask=ask_price,
-                volume=volume,
-                timestamp=timestamp,
-                quote_time=quote_time,
-                bid_time=bid_time,
-                ask_time=ask_time,
-                bid_size=bid_size,
-                ask_size=ask_size,
-                change=change,
-                percent_change=percent_change,
-                raw_data=asset_quote,
-                symbol_used=symbol
-            )
-
-        except Exception as e:
-            logger.error(colored(f"Error in get_quote for {asset.symbol}: {str(e)}", "red"))
+    def get_quote(self, asset, quote=None, exchange=None) -> Quote:
+        """Get one quote, preserving the existing None-on-error contract."""
+        try:
+            return self.get_quotes([asset], quote=quote, exchange=exchange)[asset]
+        except Exception as exc:
+            logger.error(colored(f"Error in get_quote for {getattr(asset, 'symbol', asset)}: {exc}", "red"))
             return None

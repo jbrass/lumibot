@@ -2,193 +2,219 @@ BotSpot MCP Integration
 =======================
 
 .. meta::
-   :description: BotSpot exposes a public MCP server for strategy generation, backtesting, deployment monitoring, artifact analysis, and chart/visual retrieval.
+   :description: Connect your AI assistant to BotSpot to create LumiBot strategies, run historical backtests, inspect charts, and report on your account.
 
-BotSpot exposes a public MCP server for strategy generation, backtesting,
-deployment monitoring, artifact analysis, and chart/visual retrieval.
+Use BotSpot MCP when you want your AI assistant to create and edit LumiBot
+strategies, run hosted historical backtests, inspect results, and report on
+your existing bots. Connecting is free. Paid BotSpot plans exist only for some
+heavier features, and usage limits depend on your plan.
 
-This is the piece that makes BotSpot useful even when you already use Codex,
-Claude Code, Cursor, or another coding agent. A generic agent can write Python,
-but the BotSpot MCP gives that agent Lumibot-specific tools: launch hosted
-backtests, inspect charts and artifacts, compare runs, work with strategies in
-the marketplace, and prepare deployment without leaving the coding workflow.
+.. _why-botspot-mcp:
 
-This page is intentionally practical: endpoint URLs, auth, client setup,
-and verification commands.
+Why connect the free BotSpot MCP
+--------------------------------
+
+We strongly recommend it if you build with an AI assistant. One free connection
+gives Claude, ChatGPT, Codex, Cursor or VS Code what it needs to work on real trading
+strategies instead of only writing code:
+
+* **Strategy-building skills.** Your assistant learns how LumiBot strategies are
+  built, so it writes code that runs.
+* **Free data.** News, economic data and SEC filings, ready for research.
+* **Backtests and charts.** Your assistant can run a historical backtest on
+  BotSpot's servers and read the charts, trades and logs.
+* **Cheap scheduled deployments.** Run a bot on BotSpot's servers on a schedule.
+  For a bot that runs once a day, that is usually cheaper than keeping your own
+  computer or server on all the time.
+* **The community.** Read and post, and see what other people's bots and trades
+  are doing.
+* **The marketplace.** Research strategies other people published, and publish
+  your own so others can use it.
+* **Easy broker linking.** Connect a broker on the website instead of managing
+  keys on a server.
+* **More tools for LumiBot's own AI agents.** With ``lumibot connect botspot``,
+  agents inside your strategies get BotSpot research tools (macro data, SEC
+  research, marketplace and community reads).
+
+Backtests are simulations. They do not promise future results.
+
+`Connect it free at botspot.trade/agents <https://botspot.trade/agents?utm_source=documentation&utm_medium=mcp_page&utm_campaign=lumibot&utm_content=why_section>`__
+
+Start with the `maintained setup guide <https://botspot.trade/agents>`_.
+It contains current Claude Code, Cursor, Codex and hosted-client instructions,
+first-use prompts, pricing and connection troubleshooting.
 
 .. image:: ../docs/assets/readme/cta_botspot_mcp.png
    :alt: Use BotSpot MCP
    :align: center
    :width: 520px
-   :target: https://botspot.trade/agents?utm_source=documentation&utm_medium=mcp_guide&utm_campaign=lumibot&utm_content=mcp_primary_button
+   :target: https://botspot.trade/agents
 
-Last verified
--------------
+Connect and try one workflow
+----------------------------------------
 
-- This doc was updated for the current production MCP behavior on ``March 16, 2026``.
-- Canonical host is ``https://mcp.botspot.trade``.
+1. Add the Streamable HTTP endpoint ``https://mcp.botspot.trade/mcp`` in your client.
+2. Complete the client's normal BotSpot OAuth sign-in.
+3. Ask the assistant to check account access, create a strategy, run a historical
+   backtest, and inspect that exact run using the `starter prompts
+   <https://github.com/Lumiwealth/botspot-mcp#your-first-useful-result>`_.
 
-Canonical endpoints
--------------------
+Strategy creation uses ``create_strategy`` followed by the saved-file and
+revision tools. Every edit creates a new revision; start a backtest from the
+newest saved revision. Keep the returned backtest ID for status, chart and
+artifact requests. A queued backtest is not a completed result.
 
-- Production MCP root (hosted connectors): ``https://mcp.botspot.trade``
-- Production MCP path (explicit endpoint): ``https://mcp.botspot.trade/mcp``
-- Production API (non-MCP REST): ``https://api.botspot.trade``
+No brokerage connection is needed for the starter historical example when
+your plan includes its required data. Backtests are simulations and do not
+guarantee future returns.
 
-Important transport note
-------------------------
+Permissions and availability
+----------------------------------------
 
-BotSpot runs MCP over HTTP JSON-RPC (POST). ``GET /mcp`` now returns a small
-capability JSON document for connector reachability checks.
-Tool execution still uses ``POST /mcp``.
+The direct MCP connection includes trading and deployment actions, subject
+to account permissions, plan entitlements and normal product approvals.
+An account connection alone does not authorize a trade. Protect API keys;
+never paste them into a chat or commit them to source control.
 
-Authentication modes
---------------------
+Custom MCP installation and public app-store approval are separate. The
+planned restricted store connection is still awaiting qualification and
+release. Check the `distribution tracker
+<https://github.com/Lumiwealth/botspot-mcp/blob/main/docs/distribution-status.md>`_
+for submitted, approved and installation-tested destinations.
 
-BotSpot supports two modes:
+To disconnect, use your client's connector controls. Revoke any separate
+BotSpot API key through BotSpot Account Settings.
 
-1. **OAuth 2.1 + PKCE** (recommended for hosted connector UIs like Claude app/web and ChatGPT custom apps)
-2. **API key bearer token** (recommended for CLI/IDE clients like Claude Code, Cursor, Codex, and scripts)
+LumiBot strategy agents
+----------------------
 
-Create an API key
------------------
-
-1. Sign in to BotSpot.
-2. Go to **Account Settings**.
-3. In **API Keys**, click **Create New API Key**.
-4. Copy the key immediately (it begins with ``botspot_`` and is shown once).
-
-Use the key as:
-
-.. code-block:: text
-
-   Authorization: Bearer botspot_YOUR_API_KEY
-
-Client quickstarts
-------------------
-
-Claude app (Desktop/Web)
-^^^^^^^^^^^^^^^^^^^^^^^^
-
-1. Open Claude.
-2. Go to **Customize -> Connectors**.
-3. Add custom connector URL ``https://mcp.botspot.trade``.
-4. Click **Connect** and finish Auth0 sign-in + consent.
-
-Claude Code (API key)
-^^^^^^^^^^^^^^^^^^^^^
+Create a named key in BotSpot's API Keys settings. Enable the independent public
+research, Marketplace and Community-read permissions you need. Leave trading,
+deployment, backtest-control, secret-management and Community-publication
+permissions off unless you separately intend those capabilities. Expiry defaults
+to Never; choose an expiry if needed. Store your key in your environment or
+secret manager:
 
 .. code-block:: bash
 
-   export BOTSPOT_API_KEY="botspot_YOUR_API_KEY"
-   claude mcp add --transport http botspot https://mcp.botspot.trade/mcp \
-     --header "Authorization: Bearer $BOTSPOT_API_KEY"
-   claude mcp list
+   export BOTSPOT_RESEARCH_MCP_URL="https://api.botspot.trade/research-mcp"
+   export BOTSPOT_RESEARCH_MCP_TOKEN="botspot_YOUR_RESEARCH_KEY"
 
-Cursor (API key)
-^^^^^^^^^^^^^^^^
-
-Add this to your Cursor MCP config (commonly ``.cursor/mcp.json``):
-
-.. code-block:: json
-
-   {
-     "mcpServers": {
-       "botspot": {
-         "url": "https://mcp.botspot.trade/mcp",
-         "headers": {
-           "Authorization": "Bearer botspot_YOUR_API_KEY"
-         }
-       }
-     }
-   }
-
-Codex CLI (API key)
-^^^^^^^^^^^^^^^^^^^
+Or skip the key page entirely. One command signs you in and writes both values
+to ``.env``:
 
 .. code-block:: bash
 
-   export BOTSPOT_API_KEY="botspot_YOUR_API_KEY"
-   codex mcp add botspot --url https://mcp.botspot.trade/mcp \
-     --bearer-token-env-var BOTSPOT_API_KEY
-   codex mcp list
+   lumibot connect botspot
 
-ChatGPT custom app (OAuth)
-^^^^^^^^^^^^^^^^^^^^^^^^^^
+It prints a short login code and opens the BotSpot page where you sign in (a
+free account is created if you do not have one) and approve the code. You can
+also approve it by asking an AI app that is already connected to BotSpot.
+BotSpot then creates a key for you, the command checks it and saves it. The key
+is never printed. This is the standard device login (OAuth 2.0 device
+authorization grant, RFC 8628) used by tools such as the GitHub CLI. Use
+``--no-browser`` to only print the link, ``--token`` to save a key you already
+have, or ``--paste`` to paste one made on the website. If the BotSpot server
+you point at does not offer code login yet, the command falls back to the key
+page flow. Connecting is free.
 
-If your ChatGPT plan has custom apps/connectors enabled:
+LumiBot attaches that connection when you create a strategy agent. Static keys
+do not need a renewal URL. BotSpot-hosted runtimes supply their own short-lived
+capability and renewal endpoint; never copy those runtime tokens elsewhere.
+Endpoints require HTTPS outside loopback, and renewal must use the same origin.
+Never put credentials in a URL, query string or fragment.
 
-1. Open ChatGPT settings for apps/connectors.
-2. Add BotSpot MCP URL ``https://mcp.botspot.trade``.
-3. Complete OAuth sign-in/consent when prompted.
+The connection discovers datasets through ``search_data_catalog`` and reads
+structured observations with ``query_data`` or documents with
+``search_documents`` and ``get_document``. It also reads permitted Marketplace
+listings, code and accounts, and the Community feed. Protected code and private
+positions retain the owner's sharing and purchase rules.
 
-What BotSpot MCP enables
-------------------------
+In a backtest, LumiBot limits research requests to the strategy's actual UTC
+clock. Hosted server authorization must also verify that simulation clock; an
+authenticated backtest workload alone does not establish the current timestamp.
+Without a trusted server clock binding, time-dependent reads return
+``unsupported_capability`` before fetching data. Never bypass this by requesting
+live data or substituting an external key.
+Sources without original-version and publication-time proof return a visible
+``unsupported_capability`` error. Calendar dates or today's revised economic
+tables do not establish what was available historically. Record missing
+evidence and the provider used; changing a news source requires a new backtest.
 
-- Generate/refine strategies
-- Start/stop/status backtests
-- List/sort/filter backtests with server-side ordering
-- Query CSV artifacts using SQL
-- Fetch strategy visuals and backtest visual artifacts
-- Fetch chart-ready time series (equity, drawdown, returns, portfolio)
-- Read account status and billing links
+Edit the same independent switches to narrow a key or revoke it on the existing
+API Keys page. Hosted bot settings are separate from key creation; disabling
+hosted research or revoking a selected key denies that hosted access too.
+Community publication requires separate explicit account, key and bot consent.
+BotSpot owns supplier credentials, normalization, storage and source qualification;
+LumiBot is the client. Research access never grants deployment, backtest-control,
+trading or secret-management authority.
 
-Known chaining requirement
+Frequently asked questions
 --------------------------
 
-``start_backtest`` and ``get_code`` workflows are revision-specific.
-In practice, call ``list_revisions`` (or use revision IDs returned by other tools)
-before calling tools that require ``revisionId``.
+What is BotSpot MCP?
+~~~~~~~~~~~~~~~~~~~~
 
-Validation checklist (copy/paste)
----------------------------------
+BotSpot MCP connects your AI assistant to BotSpot. Your assistant can then
+create and edit LumiBot strategies, run hosted historical backtests, look at
+the results and report on your existing bots.
 
-1) Metadata endpoint must return 200:
+How is BotSpot related to LumiBot?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-.. code-block:: bash
+LumiBot is the open source Python trading framework. BotSpot is the hosted
+service around it. It runs hosted backtests and handles broker connections,
+results and scheduling for LumiBot strategies. See
+`BotSpot for AI agents <https://botspot.trade/agents>`_.
 
-   curl -i https://mcp.botspot.trade/.well-known/oauth-protected-resource
+Is BotSpot MCP free?
+~~~~~~~~~~~~~~~~~~~~
 
-2) Unauthenticated MCP call must return 401 with ``WWW-Authenticate``:
+Yes, connecting is free. Paid BotSpot plans exist only for some heavier
+features, and usage limits depend on your plan. The
+`setup guide <https://github.com/Lumiwealth/botspot-mcp#connect>`_ has current
+pricing.
 
-.. code-block:: bash
+What is the BotSpot MCP server URL?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-   curl -i -X POST https://mcp.botspot.trade/mcp \
-     -H "Content-Type: application/json" \
-     --data '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+Add the Streamable HTTP endpoint ``https://mcp.botspot.trade/mcp`` in your
+client, then finish the normal BotSpot sign in. The
+`BotSpot agents page <https://botspot.trade/agents>`_ lists the exact steps for
+each client.
 
-3) Authenticated MCP call (replace key) should return tool list/result:
+Which AI assistants work with BotSpot MCP?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-.. code-block:: bash
+The `BotSpot agents page <https://botspot.trade/agents>`_ lists ChatGPT,
+Claude, Claude Code, Codex, Gemini CLI and Cursor. Some sign in with OAuth and
+some use a BotSpot API key.
 
-   curl -i -X POST https://mcp.botspot.trade/mcp \
-     -H "Authorization: Bearer botspot_YOUR_API_KEY" \
-     -H "Content-Type: application/json" \
-     --data '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+Do I need a brokerage account to run a backtest?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Local debugging (recommended)
------------------------------
+No. The starter historical example needs no brokerage connection when your
+plan includes the data it uses. Backtests are simulations and do not promise
+future returns.
 
-- Local Node MCP endpoint: ``http://localhost:8082/mcp``
-- Tunnel endpoint example: ``https://<your-stable-ngrok-domain>/mcp``
+Can my AI assistant place trades through BotSpot MCP?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Keep one stable tunnel URL during a debugging cycle to avoid connector and callback drift.
+The direct MCP connection includes trading and deployment actions. They still
+depend on your account permissions, your plan and the normal product
+approvals. Connecting an account alone does not approve a trade.
 
-Troubleshooting
----------------
+What should I try first?
+~~~~~~~~~~~~~~~~~~~~~~~~
 
-- **"Error connecting to MCP server"**:
-  - Verify exact URL.
-  - Reconnect and complete OAuth consent.
-  - For OAuth clients, verify Auth0 callback/origin settings.
-- **Missing tools or stale schema in a chat session**:
-  - Start a fresh chat/session so tool metadata reloads.
-- **401 / missing scope errors**:
-  - Verify token type and scope set.
-  - Regenerate API key and re-test with a minimal tool call.
+Ask your assistant to check your account access, create a strategy, run a
+historical backtest and then inspect that exact run. The
+`starter prompts <https://github.com/Lumiwealth/botspot-mcp#your-first-useful-result>`_
+show how. Keep the backtest ID it returns, and remember that a queued backtest
+is not a finished result.
 
-More resources
---------------
+How do I disconnect BotSpot MCP?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-- BotSpot AI agent and MCP page: `https://botspot.trade/agents <https://botspot.trade/agents>`_
-- BotSpot MCP server guide: `https://github.com/Lumiwealth/botspot_node/blob/production/docs/mcp/mcp-server-guide.md <https://github.com/Lumiwealth/botspot_node/blob/production/docs/mcp/mcp-server-guide.md>`_
+Use your AI client's connector controls. If you also made a BotSpot API key,
+revoke it in BotSpot Account Settings.

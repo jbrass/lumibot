@@ -46,27 +46,15 @@ def _example_model_defaults():
                 yield path.name, node.args[1].value
 
 
-# These files exist to show a second provider running the same strategy, so
-# their provider is the point of the example. Anything else must use the default.
-PROVIDER_DEMO_MODELS = {
-    "agent_m2_liquidity_anthropic.py": "anthropic/claude-sonnet-4-6",
-    "agent_m2_liquidity_grok.py": "xai/grok-4.20-0309-reasoning",
-    # Rob, 2026-09-29: these four must stay byte-for-byte the BotSpot revisions
-    # that hold the live paper track record, and those run Gemini Flash Lite.
-    "ai_trading_team_citadel_sector_pods.py": "gemini-3.1-flash-lite",
-    "ai_trading_team_citadel_sector_pods_leveraged.py": "gemini-3.1-flash-lite",
-    "ai_trading_team_ray_dalio_idea_meritocracy.py": "gemini-3.1-flash-lite",
-    "ai_trading_team_ray_dalio_idea_meritocracy_leveraged.py": "gemini-3.1-flash-lite",
-}
-
-
 def test_every_example_strategy_defaults_to_gpt_6_luna():
     defaults = list(_example_model_defaults())
     assert defaults
     wrong = [
         (name, model)
         for name, model in defaults
-        if model != PROVIDER_DEMO_MODELS.get(name, "openai/gpt-6-luna")
+        # Copyable examples now all use Luna, including legacy provider-named
+        # examples. Historical result labels are preserved separately.
+        if model != "openai/gpt-6-luna"
     ]
     assert wrong == []
 
@@ -114,7 +102,8 @@ def test_readme_leads_with_runnable_ai_before_education():
     opening = text.split('## What You Can Build')[0]
     assert 'LumiBot AI Trading' in opening
     assert 'Try the development example without API keys' not in opening
-    assert 'ResearcherTraderStrategy.backtest(' in opening
+    # October 26: the first example now exposes its prompts instead of importing a hidden class.
+    assert 'MyAIStrategy.backtest(' in opening
     assert 'export OPENAI_API_KEY=' in opening
     assert opening.index('```python') < opening.index('Join the free challenge')
     assert 'width="640"' in opening
@@ -139,7 +128,8 @@ def test_homepage_and_readme_offer_direct_ai_runner_before_reference_choices():
     runner = 'python -m lumibot.example_strategies.ai_researcher_trader'
     assert home.index(runner) < home.index('lumibot-entry-grid')
     assert home.index(runner) < home.index('.. _first-python-backtest:')
-    assert readme.index(runner) < readme.index('Save as `my_ai_strategy.py`')
+    # October 26: show editable AI code first; the canonical team runner follows it.
+    assert readme.index('system_prompt=') < readme.index(runner)
 
 
 def test_generated_artwork_has_consistent_centered_placements():
@@ -159,9 +149,10 @@ def test_generated_artwork_has_consistent_centered_placements():
 def test_traditional_strategies_are_first_screen_and_start_here_choices():
     readme = (ROOT / 'README.md').read_text().split('## Run your first AI backtest')[0]
     assert '[Python quickstart](#backtest-a-strategy)' in readme
-    assert 'No AI model or model API key is required' in readme
+    # October 26: explain Python, AI-native and hybrid strategies once, without repeated disclaimers.
+    assert 'Python strategies' in readme and 'AI-native strategies' in readme
     home = (ROOT / 'docsrc/index.rst').read_text()
-    assert home.index('Python quickstart <first-python-backtest>') < home.index('Run an AI strategy')
+    assert home.index('Python quickstart <first-python-backtest>') < home.index('Build an AI-native strategy')
     nav = home.split(':caption: Start here')[1].split('.. toctree::')[0]
     assert 'Python Strategy Examples <examples>' in nav
     examples = (ROOT / 'docsrc/examples.rst').read_text()
@@ -182,7 +173,9 @@ def test_benefit_copy_and_tracked_learning_placements():
         assert 'utm_source=documentation&utm_medium=docs&utm_campaign=lumibot_ai_trading' in source
     assert 'blob/dev/' not in (ROOT / 'docsrc/agent_start_here.rst').read_text()
     template = (ROOT / 'docsrc/_templates/base.html').read_text()
-    assert 'benefit-hero.png' in template
+    # Image selection now feeds both card types from Sphinx's shared metadata context.
+    assert 'benefit-hero.png' in (ROOT / 'docsrc/conf.py').read_text()
+    assert 'share_image_url' in template
     assert 'name="description"' in template
 
 
@@ -313,3 +306,25 @@ def test_standalone_page_teaches_the_datetime_trap_for_price_history():
     section = page.split("Read price history")[1].split("Read SEC submissions")[0]
     assert "datetime_start=datetime.now()" in section
     assert "365" in section
+
+
+def test_readme_top_keeps_botspot_and_mcp_links_above_quickstart():
+    """Rob, 2026-10-20: the Sep 18 rewrite (28afefe8) dropped these two links and
+    LumiBot-sourced BotSpot signups fell from about 6 to 2.6 a week. GA4 tracks
+    them by utm_content, so the names must stay stable."""
+    text = (ROOT / 'README.md').read_text()
+    top = text.split('## Sixty seconds')[0]
+    assert 'utm_content=top_text_link' in top
+    assert 'https://botspot.trade/agents?' in top
+    assert 'utm_content=top_mcp_link' in top
+
+
+def test_docs_sidebar_leads_with_build_bots_and_mcp():
+    """The docs sidebar 'Build bots' link fell from 50 to 6 clicks after it moved
+    below the challenge link. Keep it first in the 'Start here' group."""
+    index = (ROOT / 'docsrc/index.rst').read_text()
+    start = index.split(':caption: Start here')[1].split('.. toctree::')[0]
+    entries = [line.strip() for line in start.splitlines() if line.strip()]
+    assert entries[0] == 'Home <self>'
+    assert 'utm_content=sidebar_build_bots' in entries[1]
+    assert entries[2] == 'BotSpot MCP Integration <botspot_mcp>'

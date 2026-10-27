@@ -374,14 +374,28 @@ class Alpaca(Broker):
         data_source=None,
         polling_interval=5.0,
         start_orders_thread=None,
+        trading_client=None,
     ):
+        """Create an adapter, optionally using a caller-owned trading client.
+
+        ``trading_client`` implements the Alpaca SDK TradingClient interface and
+        owns its authentication. Provide ``data_source`` or separate data
+        credentials for market data. Injected HTTP clients use order polling.
+        Config may also provide ``TRADING_CLIENT``; the keyword argument wins.
+        """
+        if not isinstance(config, dict):
+            config = vars(config)
         # Calling init methods
         self.api_key = ""
         self.api_secret = ""
         self.oauth_token = ""
         self.is_paper = False
         self.polling_interval = polling_interval
-        self._api = None
+        if trading_client is None:
+            trading_client = _config_value(config, "TRADING_CLIENT")
+        # A caller-owned SDK-compatible client manages its own authentication.
+        self._injected_trading_client = trading_client
+        self._api = trading_client
 
         _validate_alpaca_data_credentials_config(config)
 
@@ -391,6 +405,8 @@ class Alpaca(Broker):
 
         # Check if we have OAuth-only (no API key/secret)
         self.is_oauth_only = bool(self.oauth_token and not (self.api_key and self.api_secret))
+        # Injected HTTP clients use the existing polling lifecycle.
+        self._use_polling = trading_client is not None or self.is_oauth_only
 
         # Debug logging for OAuth detection
         logger.debug(f"Alpaca Broker Init: oauth_token={'present' if self.oauth_token else 'missing'}, api_key={'present' if self.api_key else 'missing'}, api_secret={'present' if self.api_secret else 'missing'}")
@@ -420,9 +436,9 @@ class Alpaca(Broker):
 
         # Validate authentication early, but defer TradingClient creation until the first
         # broker API call. Importing the Alpaca SDK dominates cold startup for scheduled runs.
-        if not ((self.api_key and self.api_secret) or self.oauth_token):
+        if trading_client is None and not ((self.api_key and self.api_secret) or self.oauth_token):
             raise ValueError("Either OAuth token or API key/secret must be provided for Alpaca authentication")
-        if TradingClient is not None:
+        if trading_client is None and TradingClient is not None:
             self._api = self._create_trading_client()
 
     @property
@@ -440,6 +456,8 @@ class Alpaca(Broker):
         self._api = None
 
     def _create_trading_client(self):
+        if self._injected_trading_client is not None:
+            return self._injected_trading_client
         # Initialize TradingClient based on available authentication method (API keys have precedence)
         try:
             client_cls = TradingClient
@@ -463,7 +481,7 @@ class Alpaca(Broker):
                     error_msg += (
                         "1. Check that your ALPACA_OAUTH_TOKEN environment variable is set correctly\n"
                         "2. Verify your OAuth token is valid and not expired\n"
-                        "3. Re-authenticate at: https://localhost:3000/oauth/alpaca/success\n"
+                        "3. Re-authorize through your application or broker\n"
                         "4. Or use API key/secret instead by setting ALPACA_API_KEY and ALPACA_API_SECRET\n\n"
                     )
                 else:
@@ -472,9 +490,13 @@ class Alpaca(Broker):
                         "2. Verify your API credentials are valid\n"
                         "3. Check that your account has trading permissions\n\n"
                     )
-                error_msg += f"Original error: {e}"
+                error_msg += f"Provider error type: {type(e).__name__}"
+                if "401" in error_message:
+                    error_msg += " (401 Unauthorized)"
+                elif "403" in error_message:
+                    error_msg += " (403 Forbidden)"
                 logger.error(error_msg)
-                raise ValueError(error_msg)
+                raise ValueError(error_msg) from None
             else:
                 # Re-raise the original exception for other errors
                 raise e
@@ -1341,7 +1363,87 @@ class Alpaca(Broker):
         Order
             The order that was cancelled
         """
-        self.api.cancel_order_by_id(order.identifier)
+        from alpaca.common.exceptions import APIError
+
+        try:
+            self.api.cancel_order_by_id(order.identifier)
+        except APIError as cancel_error:
+            if cancel_error.status_code != 422:
+                raise
+            # A fill can win the cancellation race while stream delivery is
+            # absent/delayed. The rejection is not proof of a fill: confirm the
+            # exact order through REST before processing any terminal event.
+            try:
+                confirmed = self._pull_broker_order(order.identifier)
+            except Exception:
+                raise cancel_error from None
+            if str(getattr(confirmed, "id", "")) != str(order.identifier):
+                raise
+            status = getattr(confirmed, "status", None)
+            status = getattr(status, "value", status)
+            if status == "canceled":
+                if not order.is_canceled():
+                    self._process_trade_event(order, self.CANCELED_ORDER)
+                return
+            if status != "filled":
+                raise
+            if not self._reconcile_confirmed_fill(order, confirmed):
+                raise cancel_error
+
+    def _reconcile_confirmed_fill(self, order, confirmed):
+        """Process only unrecorded quantity from a confirmed cumulative fill.
+
+        Account synchronization and submit responses can copy a terminal status
+        before the fill lifecycle runs. Transactions are the processed receipt;
+        a matching status string alone is not proof of callback delivery.
+        """
+        with self._lock:
+            if str(getattr(confirmed, "id", "")) != str(order.identifier):
+                return False
+            try:
+                total_quantity = Decimal(str(confirmed.filled_qty))
+                price = Decimal(str(confirmed.filled_avg_price))
+                prior_quantity = sum(
+                    (Decimal(str(transaction.quantity)) for transaction in order.transactions), Decimal(0)
+                )
+                prior_value = sum(
+                    (Decimal(str(transaction.quantity)) * Decimal(str(transaction.price))
+                     for transaction in order.transactions), Decimal(0)
+                )
+                remaining_quantity = total_quantity - prior_quantity
+                if (order.is_filled() and total_quantity.is_finite() and price.is_finite()
+                        and total_quantity == Decimal(str(order.quantity)) == prior_quantity
+                        and price > 0):
+                    return True
+                remaining_price = (total_quantity * price - prior_value) / remaining_quantity
+                valid_fill = (
+                    str(confirmed.id) == str(order.identifier)
+                    and total_quantity.is_finite() and price.is_finite()
+                    and total_quantity == Decimal(str(order.quantity))
+                    and price > 0 and remaining_quantity > 0
+                    and prior_quantity.is_finite() and prior_quantity >= 0
+                    and remaining_price.is_finite() and remaining_price > 0
+                )
+            except Exception:
+                return False
+            if not valid_fill:
+                return False
+            if getattr(order, "_alpaca_confirmed_fill_pending", False):
+                return True
+            order._alpaca_confirmed_fill_pending = True
+            order.update_raw(confirmed)
+            order.avg_fill_price = float(price)
+        # Never call a strategy subscriber while holding the broker tracker
+        # lock: the strategy executor can hold its own lock while querying it.
+        try:
+            self._process_trade_event(
+                order, self.FILLED_ORDER, price=float(remaining_price),
+                filled_quantity=float(remaining_quantity), multiplier=order.asset.multiplier,
+            )
+            return True
+        finally:
+            with self._lock:
+                order._alpaca_confirmed_fill_pending = False
 
 
     def _modify_order(
@@ -1638,11 +1740,11 @@ class Alpaca(Broker):
     def _get_stream_object(self):
         """
         Get the broker stream connection.
-        Returns PollingStream for OAuth-only configurations, TradingStream otherwise.
+        Returns PollingStream for OAuth or injected HTTP clients, TradingStream for API keys.
         """
-        if self.is_oauth_only:
-            # OAuth-only configurations use polling since TradingStream doesn't support OAuth tokens
-            logger.debug("Alpaca Stream: Using PollingStream for OAuth-only configuration")
+        if self._use_polling:
+            # OAuth and injected HTTP clients share the polling lifecycle.
+            logger.debug("Alpaca Stream: Using PollingStream for HTTP client configuration")
             from lumibot.trading_builtins import PollingStream
 
             return PollingStream(self.polling_interval)
@@ -1660,7 +1762,7 @@ class Alpaca(Broker):
     def _register_stream_events(self):
         """Register the function on_trade_event
         to be executed on each trade_update event"""
-        if self.is_oauth_only:
+        if self._use_polling:
             # For OAuth-only, use polling events
             logger.debug("Alpaca Stream: Registering OAuth polling events")
             broker = self
@@ -1745,7 +1847,7 @@ class Alpaca(Broker):
 
             # Get current orders from Alpaca and dispatch them to the stream for processing
             raw_orders = self._pull_broker_all_orders()
-            stored_orders = {x.identifier: x for x in self.get_all_orders()}
+            stored_orders = {str(x.identifier): x for x in self.get_all_orders()}
 
             # Only log summary, not detailed per-order processing
             logger.debug(f"OAuth Polling: Found {len(raw_orders)} raw orders from Alpaca, {len(stored_orders)} stored orders in Lumibot")
@@ -1763,11 +1865,12 @@ class Alpaca(Broker):
                 logger.debug(f"OAuth Polling: Processing Alpaca order {order.identifier} with status {order.status}")
 
                 # Check if this order exists in our stored orders
-                if order.identifier in stored_orders:
-                    stored_order = stored_orders[order.identifier]
+                if str(order.identifier) in stored_orders:
+                    stored_order = stored_orders[str(order.identifier)]
 
                     # Check if the status has changed
-                    if stored_order.status != order.status:
+                    if (stored_order.status != order.status
+                            or (order.is_filled() and not stored_order._filled_event.is_set())):
                         logger.debug(f"OAuth Polling: Order status changed - {order.identifier}: {stored_order.status} -> {order.status}")
 
                         # Update the stored order with new data and dispatch the event
@@ -1786,14 +1889,8 @@ class Alpaca(Broker):
 
                         # Dispatch the appropriate event based on the new status
                         if order.status == "filled" or order.status == "fill": 
-                            # Get price and quantity with proper fallbacks for Alpaca API
-                            price = (getattr(alpaca_order, 'filled_avg_price', None) or
-                                   getattr(alpaca_order, 'avg_fill_price', None) or
-                                   getattr(order, 'limit_price', None))
-                            filled_qty = (getattr(alpaca_order, 'filled_qty', None) or
-                                        getattr(alpaca_order, 'qty', None) or
-                                        getattr(order, 'quantity', None))
-                            self.stream.dispatch(self.FILLED_ORDER, order=stored_order, price=price, filled_quantity=filled_qty)
+                            if not self._reconcile_confirmed_fill(stored_order, alpaca_order):
+                                raise ValueError("Alpaca fill observation has inconsistent quantity or price")
                         elif order.status == "partially_filled":
                             # Get price and quantity with proper fallbacks for Alpaca API
                             price = (getattr(alpaca_order, 'filled_avg_price', None) or
@@ -1812,13 +1909,13 @@ class Alpaca(Broker):
                         stored_order.status = order.status
 
             # Check for orders that are no longer in the broker's list
-            tracked_orders = {x.identifier: x for x in self.get_tracked_orders()}
-            broker_ids = [getattr(o, 'id', None) for o in raw_orders if hasattr(o, 'id')]
+            tracked_orders = {str(x.identifier): x for x in self.get_tracked_orders()}
+            broker_ids = [str(o.id) for o in raw_orders if getattr(o, 'id', None) is not None]
 
             logger.debug(f"OAuth Polling: Checking {len(tracked_orders)} tracked orders against {len(broker_ids)} broker order IDs")
 
             for order_id, order in tracked_orders.items():
-                if order_id not in broker_ids and order.is_active():
+                if order_id not in broker_ids and (order.is_active() or not order._closed_event.is_set()):
                     # Instead of assuming cancellation, verify the order individually
                     # This is much more robust than relying on timing or presence in bulk lists
                     try:
@@ -1827,7 +1924,9 @@ class Alpaca(Broker):
                         logger.debug(f"OAuth Polling: Individual lookup found order {order_id} with status {individual_order.status}")
 
                         # Update status based on individual lookup
-                        if individual_order.status != order.status:
+                        if (individual_order.status != order.status
+                                or (str(individual_order.status) in ("filled", "fill")
+                                    and not order._filled_event.is_set())):
                             logger.debug(f"OAuth Polling: Individual order status changed - {order_id}: {order.status} -> {individual_order.status}")
                             order.update_raw(individual_order)
 
@@ -1844,14 +1943,8 @@ class Alpaca(Broker):
 
                             # Dispatch appropriate event based on new status
                             if individual_order.status in ["filled", "fill"]:
-                                # Get price and quantity with proper fallbacks for Alpaca API
-                                price = (getattr(individual_order, 'filled_avg_price', None) or
-                                       getattr(individual_order, 'avg_fill_price', None) or
-                                       getattr(order, 'limit_price', None))
-                                filled_qty = (getattr(individual_order, 'filled_qty', None) or
-                                            getattr(individual_order, 'qty', None) or
-                                            getattr(order, 'quantity', None))
-                                self.stream.dispatch(self.FILLED_ORDER, order=order, price=price, filled_quantity=filled_qty)
+                                if not self._reconcile_confirmed_fill(order, individual_order):
+                                    raise ValueError("Alpaca fill observation has inconsistent quantity or price")
                             elif individual_order.status == "canceled":
                                 self.stream.dispatch(self.CANCELED_ORDER, order=order)
 
@@ -1877,7 +1970,7 @@ class Alpaca(Broker):
                     error_msg += (
                         "1. Check that your ALPACA_OAUTH_TOKEN environment variable is set correctly\n"
                         "2. Verify your OAuth token is valid and not expired\n"
-                        "3. Re-authenticate at: https://localhost:3000/oauth/alpaca/success\n"
+                        "3. Re-authorize through your application or broker\n"
                         "4. Or use API key/secret instead by setting ALPACA_API_KEY and ALPACA_API_SECRET\n\n"
                     )
                 else:
@@ -1886,9 +1979,13 @@ class Alpaca(Broker):
                         "2. Verify your API credentials are valid\n"
                         "3. Check that your account has trading permissions\n\n"
                     )
-                error_msg += f"Original error: {e}"
+                error_msg += f"Provider error type: {type(e).__name__}"
+                if "401" in error_message:
+                    error_msg += " (401 Unauthorized)"
+                elif "403" in error_message:
+                    error_msg += " (403 Forbidden)"
                 logger.error(error_msg)
-                raise ValueError(error_msg)
+                raise ValueError(error_msg) from None
             else:
                 is_rate_limited = (
                     "rate limit" in error_message
@@ -1905,7 +2002,7 @@ class Alpaca(Broker):
     def _run_stream(self):
         """Run the broker stream - either polling or WebSocket streaming depending on authentication method"""
 
-        if self.is_oauth_only:
+        if self._use_polling:
             # For OAuth-only, use polling approach like Tradier
             self._stream_established()
             try:

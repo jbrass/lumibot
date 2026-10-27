@@ -1,16 +1,17 @@
 import asyncio
 import logging
 import time
-from datetime import date
+from datetime import date, datetime, timezone
 from threading import Barrier, BrokenBarrierError, Event, RLock, Thread
 from types import SimpleNamespace
 
 import pytest
 
-from lumibot.brokers.broker import LumibotBrokerAPIError
+from lumibot.brokers.broker import Broker, LumibotBrokerAPIError
 from lumibot.brokers.schwab import Schwab
 from lumibot.entities import Asset, Order, Position
 from lumibot.trading_builtins import SafeList
+from lumibot.strategies import Strategy
 
 
 class _Response:
@@ -224,6 +225,7 @@ def _observed_order(status, cumulative_filled=0, average_fill_price=None, identi
 
 def _broker_for_lifecycle(stored_order):
     broker = Schwab.__new__(Schwab)
+    broker._lock = RLock()
     broker._schwab_observed_fill_quantities = {}
     broker._schwab_terminal_observations = set()
     broker.get_tracked_order = lambda identifier: stored_order if identifier == stored_order.identifier else None
@@ -244,6 +246,208 @@ def _broker_for_lifecycle(stored_order):
 
     broker._process_trade_event = process_trade_event
     return broker
+
+
+@pytest.fixture
+def real_lifecycle_broker(monkeypatch):
+    """Real Broker reducers and Order transactions, with no threads or Strategy."""
+    monkeypatch.setenv("LUMIBOT_TELEMETRY", "false")
+    broker = Schwab.__new__(Schwab)
+    Broker.__init__(
+        broker, name="synthetic-schwab", connect_stream=False, start_orders_thread=False,
+        data_source=SimpleNamespace(get_datetime=lambda: datetime(2026, 10, 12, tzinfo=timezone.utc)),
+    )
+    broker._strategy_name = "unit-test"
+    broker._schwab_observed_fill_quantities = {}
+    broker._schwab_terminal_observations = set()
+    events = []
+
+    def receive(event, payload):
+        current = payload["order"]
+        events.append((event, payload.get("quantity"), sum(t.quantity for t in current.transactions)))
+
+    broker._subscribers.append(SimpleNamespace(
+        name="unit-test", add_event=receive, NEW_ORDER=broker.NEW_ORDER,
+        ERROR_ORDER=broker.ERROR_ORDER, CANCELED_ORDER=broker.CANCELED_ORDER,
+        PARTIALLY_FILLED_ORDER=broker.PARTIALLY_FILLED_ORDER, FILLED_ORDER=broker.FILLED_ORDER,
+    ))
+    stored = _order()
+    stored.quantity = 100
+    broker._new_orders.append(stored)
+    return broker, stored, events
+
+
+def test_real_schwab_local_error_then_fresh_fill_records_one_hundred(real_lifecycle_broker):
+    broker, stored, events = real_lifecycle_broker
+    broker._process_trade_event(stored, broker.ERROR_ORDER, error=RuntimeError("transport outcome unknown"))
+    observed = _observed_order(Order.OrderStatus.FILLED, 100, 10.0)
+    observed.quantity = 100
+    for _ in range(2):
+        broker._process_schwab_order_snapshot(observed)
+    assert stored.is_filled()
+    assert [t.quantity for t in stored.transactions] == [100]
+    assert events[-1] == (broker.FILLED_ORDER, 100.0, 100)
+    assert sum(event[0] == broker.FILLED_ORDER for event in events) == 1
+    assert broker.get_tracked_order(stored.identifier) is stored
+    assert list(broker._tracked_orders).count(stored) == 1
+
+
+def test_real_schwab_partial_forty_local_error_then_final_fill_adds_only_sixty(real_lifecycle_broker):
+    broker, stored, events = real_lifecycle_broker
+    broker._process_schwab_order_snapshot(_observed_order(Order.OrderStatus.PARTIALLY_FILLED, 40, 10.0))
+    broker._process_trade_event(stored, broker.ERROR_ORDER, error=RuntimeError("stream failure"))
+    observed = _observed_order(Order.OrderStatus.FILLED, 100, 10.0)
+    observed.quantity = 100
+    for _ in range(2):
+        broker._process_schwab_order_snapshot(observed)
+    assert stored.is_filled()
+    assert [t.quantity for t in stored.transactions] == [40, 60]
+    assert events[-1] == (broker.FILLED_ORDER, 60.0, 100)
+    assert list(broker._tracked_orders).count(stored) == 1
+
+
+@pytest.mark.parametrize("late_status", [Order.OrderStatus.CANCELED, Order.OrderStatus.PARTIALLY_FILLED])
+def test_real_schwab_canceled_zero_then_late_cumulative_forty_records_once(real_lifecycle_broker, late_status):
+    broker, stored, events = real_lifecycle_broker
+    broker._process_schwab_order_snapshot(_observed_order(Order.OrderStatus.CANCELED))
+    observed = _observed_order(late_status, 40, 10.0)
+    observed.quantity = 100
+    for _ in range(2):
+        broker._process_schwab_order_snapshot(observed)
+    assert stored.is_canceled()
+    assert [t.quantity for t in stored.transactions] == [40]
+    assert [event for event in events if event[0] == broker.PARTIALLY_FILLED_ORDER] == [
+        (broker.PARTIALLY_FILLED_ORDER, 40.0, 40),
+    ]
+    assert sum(event[0] == broker.CANCELED_ORDER for event in events) == 1
+    assert list(broker._tracked_orders).count(stored) == 1
+
+
+@pytest.mark.parametrize("broker_confirmed", [False, True])
+def test_real_schwab_partial_fill_distinguishes_confirmed_rejection_from_local_error(
+    real_lifecycle_broker, broker_confirmed,
+):
+    broker, stored, events = real_lifecycle_broker
+    if broker_confirmed:
+        broker._process_schwab_order_snapshot(_observed_order(Order.OrderStatus.ERROR))
+    else:
+        broker._process_trade_event(stored, broker.ERROR_ORDER, error=RuntimeError("local transport failure"))
+    observed = _observed_order(Order.OrderStatus.PARTIALLY_FILLED, 40, 10.0)
+    for _ in range(2):
+        broker._process_schwab_order_snapshot(observed)
+    assert stored.status == (Order.OrderStatus.ERROR if broker_confirmed else Order.OrderStatus.PARTIALLY_FILLED)
+    assert stored._closed_event.is_set() is broker_confirmed
+    assert [t.quantity for t in stored.transactions] == [40]
+    assert events[-1] == (broker.PARTIALLY_FILLED_ORDER, 40.0, 40)
+    assert list(broker._tracked_orders).count(stored) == 1
+    broker._process_schwab_order_snapshot(_observed_order(Order.OrderStatus.NEW))
+    if broker_confirmed:
+        assert stored.status == Order.OrderStatus.ERROR
+
+
+def test_real_schwab_restart_high_water_uses_existing_confirmed_transactions(real_lifecycle_broker):
+    broker, stored, events = real_lifecycle_broker
+    broker._process_trade_event(stored, broker.PARTIALLY_FILLED_ORDER, price=10, filled_quantity=40)
+    broker._process_trade_event(stored, broker.ERROR_ORDER, error=RuntimeError("local transport failure"))
+    assert broker._schwab_observed_fill_quantities == {}
+    observed = _observed_order(Order.OrderStatus.FILLED, 100, 10.0)
+    observed.quantity = 100
+    broker._process_schwab_order_snapshot(observed)
+    assert [t.quantity for t in stored.transactions] == [40, 60]
+    assert events[-1] == (broker.FILLED_ORDER, 60.0, 100)
+
+
+@pytest.mark.parametrize("terminal_status", [
+    Order.OrderStatus.CANCELED, Order.OrderStatus.ERROR, Order.OrderStatus.EXPIRED,
+])
+def test_real_schwab_late_partial_preserves_exact_confirmed_terminal_status(real_lifecycle_broker, terminal_status):
+    broker, stored, events = real_lifecycle_broker
+    if terminal_status == Order.OrderStatus.EXPIRED:
+        # Restored terminal data can retain the parser's exact EXPIRED status.
+        # Native Broker events/buckets below still perform every fill mutation.
+        stored.status = terminal_status
+        stored.raw_order_status = "EXPIRED"
+        stored.error_message = "Confirmed order expiry"
+        stored._closed_event.set()
+        broker._new_orders.remove(stored.identifier, key="identifier")
+        broker._error_orders.append(stored)
+        broker._schwab_terminal_observations.add((stored.identifier, str(terminal_status)))
+    else:
+        broker._process_schwab_order_snapshot(_observed_order(terminal_status))
+    reason = stored.error_message
+    observed = _observed_order(Order.OrderStatus.PARTIALLY_FILLED, 40, 10.0)
+    for _ in range(2):
+        broker._process_schwab_order_snapshot(observed)
+    assert stored.status == terminal_status
+    assert stored._closed_event.is_set()
+    assert [t.quantity for t in stored.transactions] == [40]
+    assert stored.error_message == reason
+    assert list(broker._tracked_orders).count(stored) == 1
+    assert sum(event[0] == broker.PARTIALLY_FILLED_ORDER for event in events) == 1
+
+
+def test_real_schwab_error_after_recorded_full_fill_restores_status_without_another_fill(real_lifecycle_broker):
+    broker, stored, events = real_lifecycle_broker
+    observed = _observed_order(Order.OrderStatus.FILLED, 100, 10.0)
+    observed.quantity = 100
+    broker._process_schwab_order_snapshot(observed)
+    broker._process_trade_event(stored, broker.ERROR_ORDER, error=RuntimeError("late local transport error"))
+    for _ in range(2):
+        broker._process_schwab_order_snapshot(observed)
+    assert stored.is_filled()
+    assert [t.quantity for t in stored.transactions] == [100]
+    assert sum(event[0] == broker.FILLED_ORDER for event in events) == 1
+    assert list(broker._tracked_orders).count(stored) == 1
+
+
+def test_real_schwab_recovery_never_exposes_a_gap_between_terminal_and_filled_buckets(real_lifecycle_broker):
+    broker, stored, _events = real_lifecycle_broker
+    broker._process_trade_event(stored, broker.ERROR_ORDER, error=RuntimeError("local transport failure"))
+    entered, release, reader_done = Event(), Event(), Event()
+    native_process = broker._process_trade_event
+    readbacks = []
+
+    def paused_native_event(*args, **kwargs):
+        entered.set()
+        assert release.wait(2)
+        native_process(*args, **kwargs)
+
+    def read_current():
+        readbacks.append(broker.get_tracked_order(stored.identifier))
+        reader_done.set()
+
+    broker._process_trade_event = paused_native_event
+    observed = _observed_order(Order.OrderStatus.FILLED, 100, 10.0)
+    observed.quantity = 100
+    writer = Thread(target=broker._process_schwab_order_snapshot, args=(observed,))
+    reader = Thread(target=read_current)
+    writer.start()
+    try:
+        assert entered.wait(1)
+        reader.start()
+        assert not reader_done.wait(0.2), "Tracked reads must wait for this atomic lifecycle move"
+    finally:
+        release.set()
+        writer.join(2)
+        if reader.ident is not None:
+            reader.join(2)
+    assert readbacks == [stored]
+    assert stored.is_filled()
+
+
+def test_real_schwab_terminal_and_foreign_controls_do_not_regress_or_duplicate(real_lifecycle_broker):
+    broker, stored, events = real_lifecycle_broker
+    observed = _observed_order(Order.OrderStatus.FILLED, 100, 10.0)
+    observed.quantity = 100
+    broker._process_schwab_order_snapshot(observed)
+    for value in [observed, _observed_order(Order.OrderStatus.NEW),
+                  _observed_order(Order.OrderStatus.PARTIALLY_FILLED, 40, 10.0),
+                  _observed_order(Order.OrderStatus.CANCELED),
+                  _observed_order(Order.OrderStatus.FILLED, 100, 10.0, identifier="foreign")]:
+        broker._process_schwab_order_snapshot(value)
+    assert stored.is_filled()
+    assert [t.quantity for t in stored.transactions] == [100]
+    assert events == [(broker.FILLED_ORDER, 100.0, 100)]
 
 
 def _option_asset():
@@ -527,6 +731,27 @@ def test_schwab_stock_market_replacement_spec_uses_normal_session():
     assert order_spec["session"] == "NORMAL"
     assert order_spec["duration"] == "DAY"
     assert order_spec["orderType"] == "MARKET"
+
+
+@pytest.mark.parametrize("duration, expected", [(None, "GOOD_TILL_CANCEL"), ("day", "DAY"), ("gtc", "GOOD_TILL_CANCEL")])
+def test_schwab_stock_short_duration_through_public_strategy_api(duration, expected):
+    strategy = SimpleNamespace(
+        name="unit-test", quote_asset=Asset("USD", asset_type="forex"),
+        broker=SimpleNamespace(IS_BACKTESTING_BROKER=False),
+        get_datetime=lambda: datetime(2026, 1, 2, 15, tzinfo=timezone.utc),
+        _sanitize_user_asset=lambda asset: asset,
+    )
+    kwargs = {} if duration is None else {"time_in_force": duration}
+    order = Strategy.create_order(
+        strategy, Asset("LW"), 100, Order.OrderSide.SELL_SHORT,
+        order_type=Order.OrderType.MARKET, **kwargs,
+    )
+    broker = Schwab.__new__(Schwab)
+    broker.name = "Schwab"
+    spec = broker._prepare_stock_order_spec(order)
+    assert spec["duration"] == expected
+    assert spec["orderLegCollection"][0]["instruction"] == "SELL_SHORT"
+    assert spec["orderLegCollection"][0]["quantity"] == 100
 
 
 def test_schwab_stock_submit_succeeds_without_stream():
@@ -1373,6 +1598,195 @@ def test_schwab_parsed_terminal_snapshot_preserves_broker_rejection_reason(raw_s
     if description:
         expected += f" ({description})"
     assert str(details["error"]) == expected
+
+
+def test_schwab_direct_lookup_delivers_rejection_details_once_before_terminalizing():
+    stored = _order()
+    broker = _broker_for_lifecycle(stored)
+    payload = _OrderResponse().json()
+    payload.update(status="REJECTED", statusDescription="Good until canceled short sale orders are not accepted for hard to borrow securities.")
+    broker._pull_broker_order = lambda identifier: payload
+
+    assert broker._refresh_missing_active_order_from_broker(stored, stored.strategy)
+    broker._refresh_missing_active_order_from_broker(stored, stored.strategy)
+    broker._process_schwab_order_snapshot(broker._parse_broker_order(payload, stored.strategy))
+
+    assert stored.status == Order.OrderStatus.ERROR
+    assert stored.raw_order_status == "REJECTED"
+    assert stored.raw_broker_payload["statusDescription"] == payload["statusDescription"]
+    assert len(broker._lifecycle_events) == 1
+    event, details = broker._lifecycle_events[0]
+    assert event == broker.ERROR_ORDER
+    assert payload["statusDescription"] in str(details["error"])
+
+
+@pytest.mark.parametrize("has_underlying_symbol", [True, False])
+def test_real_schwab_option_parse_and_direct_refresh_preserve_underlying_symbol(
+    real_lifecycle_broker, has_underlying_symbol,
+):
+    broker, initial_order, events = real_lifecycle_broker
+    payload = _option_order_payload()
+    if not has_underlying_symbol:
+        payload["orderLegCollection"][0]["instrument"].pop("underlyingSymbol")
+    stored = broker._parse_broker_order(payload, initial_order.strategy)
+
+    assert stored.asset.symbol == "LW"
+    assert stored.asset.asset_type == Asset.AssetType.OPTION
+    assert stored.asset.expiration == date(2026, 5, 29)
+    assert stored.asset.strike == 38
+    assert stored.asset.right == "CALL"
+    assert stored.asset.underlying_asset is None
+    broker._new_orders.remove(initial_order.identifier, key="identifier")
+    broker._new_orders.append(stored)
+    original_asset = stored.asset
+    payload.update(status="FILLED", filledQuantity=1, averagePrice=4.84)
+    broker.schwab_authorization_error = False
+    broker.hash_value = "synthetic-account-hash"
+    broker.client = _OrderClient(SimpleNamespace(status_code=200, json=lambda: payload))
+
+    assert broker._refresh_missing_active_order_from_broker(stored, stored.strategy)
+    broker._refresh_missing_active_order_from_broker(stored, stored.strategy)
+    refreshed = broker.get_tracked_order(stored.identifier)
+
+    assert refreshed is stored
+    assert refreshed.is_filled()
+    assert refreshed.asset is original_asset
+    assert refreshed.asset.symbol == "LW"
+    assert refreshed.asset.underlying_asset is None
+    assert [transaction.quantity for transaction in refreshed.transactions] == [1]
+    assert events == [(broker.FILLED_ORDER, 1.0, 1)]
+    assert broker.client.get_order_calls == [(stored.identifier, broker.hash_value)] * 2
+
+
+def test_schwab_direct_lookup_delivers_partial_then_final_fill_without_losing_delta():
+    stored = _order()
+    stored.quantity = 100
+    broker = _broker_for_lifecycle(stored)
+    snapshots = iter([
+        _observed_order(Order.OrderStatus.PARTIALLY_FILLED, 40, 10),
+        _observed_order(Order.OrderStatus.FILLED, 100, 10),
+    ])
+    def parse_snapshot(*args, **kwargs):
+        observation = next(snapshots)
+        observation.quantity = 100
+        return observation
+    broker._pull_broker_order = lambda identifier: {"orderId": identifier}
+    broker._parse_broker_order = parse_snapshot
+
+    broker._refresh_missing_active_order_from_broker(stored, stored.strategy)
+    broker._refresh_missing_active_order_from_broker(stored, stored.strategy)
+
+    assert [(event, details["filled_quantity"]) for event, details in broker._lifecycle_events] == [
+        (broker.PARTIALLY_FILLED_ORDER, 40), (broker.FILLED_ORDER, 60),
+    ]
+
+
+def test_schwab_immediate_stream_disconnects_increase_retry_delay(monkeypatch):
+    broker = Schwab.__new__(Schwab)
+    broker._schwab_activity_stop = Event()
+    broker.client = object()
+    broker.account_number = "test-account"
+    broker.stream_client = SimpleNamespace()
+    delays = []
+
+    async def configure(client):
+        async def handle_message():
+            raise ConnectionError("connection closed after login")
+        client.handle_message = handle_message
+
+    async def sleep(delay):
+        delays.append(delay)
+        if len(delays) == 3:
+            broker._schwab_activity_stop.set()
+
+    broker._configure_schwab_account_activity_stream = configure
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    monkeypatch.setattr("lumibot.brokers.schwab._get_stream_client_class", lambda: lambda *args, **kwargs: SimpleNamespace())
+    asyncio.run(broker._run_schwab_account_activity_async())
+
+    assert delays == [1, 2, 4]
+
+
+@pytest.mark.parametrize("terminal_status", ["FILLED", "CANCELED"])
+def test_schwab_cancel_race_reconciles_authoritative_terminal_snapshot(terminal_status):
+    stored = _order(status=Order.OrderStatus.CANCELLING)
+    broker = _broker_for_lifecycle(stored)
+    broker.schwab_authorization_error = False
+    broker.hash_value = "account-hash"
+    payload = _OrderResponse().json()
+    payload.update(status=terminal_status, price=10.0, filledQuantity=1 if terminal_status == "FILLED" else 0)
+    broker.client = _CancelClient(_CancelResponse(400, "Order is already terminal."))
+    broker.client.get_order = lambda *args: SimpleNamespace(status_code=200, json=lambda: payload)
+
+    broker.cancel_order(stored)
+    broker._process_schwab_order_snapshot(broker._parse_broker_order(payload, stored.strategy))
+
+    assert stored.status == (Order.OrderStatus.FILLED if terminal_status == "FILLED" else Order.OrderStatus.CANCELED)
+    assert len(broker._lifecycle_events) == 1
+    assert broker._lifecycle_events[0][0] == (broker.FILLED_ORDER if terminal_status == "FILLED" else broker.CANCELED_ORDER)
+
+
+def test_schwab_canceled_snapshot_accounts_for_unobserved_partial_fill_before_cancel():
+    stored = _order(status=Order.OrderStatus.CANCELLING)
+    stored.quantity = 100
+    broker = _broker_for_lifecycle(stored)
+    observation = _observed_order(Order.OrderStatus.CANCELED, 40, 10.0)
+    broker._process_schwab_order_snapshot(observation)
+    broker._process_schwab_order_snapshot(observation)
+
+    assert broker._lifecycle_events == [
+        (broker.PARTIALLY_FILLED_ORDER, {"price": 10.0, "filled_quantity": 40.0, "multiplier": 1}),
+        (broker.CANCELED_ORDER, {}),
+    ]
+
+
+@pytest.mark.parametrize("snapshot", [None, "WORKING"])
+def test_schwab_cancel_error_is_not_swallowed_without_terminal_broker_evidence(snapshot):
+    stored = _order(status=Order.OrderStatus.CANCELLING)
+    broker = _broker_for_lifecycle(stored)
+    broker.schwab_authorization_error = False
+    broker.hash_value = "account-hash"
+    broker.client = _CancelClient(_CancelResponse(400, "Invalid cancel request."))
+    broker._pull_broker_order = lambda identifier: None if snapshot is None else _OrderResponse().json()
+
+    with pytest.raises(LumibotBrokerAPIError, match="HTTP 400"):
+        broker.cancel_order(stored)
+    assert stored.status == Order.OrderStatus.CANCELLING
+    assert broker._lifecycle_events == []
+
+
+def test_schwab_stream_backoff_resets_only_after_sustained_connection(monkeypatch):
+    broker = Schwab.__new__(Schwab)
+    broker._schwab_activity_stop = Event()
+    broker.client = object()
+    broker.account_number = "test-account"
+    broker.stream_client = SimpleNamespace()
+    delays = []
+    clock = [0.0]
+    connection = [0]
+
+    async def configure(client):
+        connection[0] += 1
+        messages = [0]
+        async def handle_message():
+            messages[0] += 1
+            if connection[0] == 3 and messages[0] == 1:
+                clock[0] += 61
+                return
+            raise ConnectionError("closed")
+        client.handle_message = handle_message
+
+    async def sleep(delay):
+        delays.append(delay)
+        if len(delays) == 3:
+            broker._schwab_activity_stop.set()
+
+    broker._configure_schwab_account_activity_stream = configure
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    monkeypatch.setattr("lumibot.brokers.schwab._get_stream_client_class", lambda: lambda *args, **kwargs: SimpleNamespace())
+    asyncio.run(broker._run_schwab_account_activity_async())
+    assert delays == [1, 2, 1]
 
 
 @pytest.mark.parametrize(

@@ -12,6 +12,22 @@ LumiBot supports configuring many behaviors via environment variables. This page
 
    **Never commit secrets** (API keys, passwords, AWS secret keys) into any repo or docs. Document variable names and semantics only.
 
+ChatGPT subscription profiles
+-----------------------------
+
+``LUMIBOT_CHATGPT_HOME`` selects the private configuration directory (default
+``~/.config/lumibot-chatgpt``). ``LUMIBOT_CHATGPT_PROFILE`` selects an existing
+profile ID; ``LUMIBOT_CHATGPT_PROFILE_PATH`` explicitly selects a protected file
+from your own supported SIWC registration. Processes pin their selected
+profile, and refresh rotation is serialized across local processes.
+
+These variables authenticate explicit ``chatgpt/<model>`` agents and canonical
+subscription-funded evaluations. They do not supply an API key, a broker
+credential or a BotSpot research grant. Keep all profile files outside source
+control. For subscription-only execution, separately disable connected-app
+credit fallback in ChatGPT Usage. See :doc:`agents_chatgpt` for login, model
+discovery, sign-out and self-hosted setup.
+
 Backtesting configuration
 -------------------------
 
@@ -198,10 +214,14 @@ BotSpot managed research
 ------------------------
 
 - ``BOTSPOT_RESEARCH_MCP_URL``: optional BotSpot Research MCP endpoint.
-- ``BOTSPOT_RESEARCH_MCP_TOKEN``: secret, short-lived bearer capability bound to an authenticated user or hosted deployment.
+- ``BOTSPOT_RESEARCH_MCP_TOKEN``: secret bearer credential. External users supply their own scoped BotSpot key; hosted runtimes receive a short-lived deployment-bound capability.
+- ``BOTSPOT_API_URL``: optional BotSpot API origin used by ``lumibot connect botspot`` for its device login (default ``https://api.botspot.trade``). Point it at another BotSpot environment for testing.
 - ``BOTSPOT_RESEARCH_MCP_RENEW_URL``: optional HTTPS renewal endpoint. Localhost is permitted for local development; otherwise its origin must match the MCP endpoint.
-- All three variables are required for automatic attachment. BotSpot-hosted runtimes inject them; external users can link a BotSpot account and configure the same contract.
-- Missing or incomplete configuration preserves ordinary LumiBot strategy and agent behavior and emits one deduplicated capability notice.
+- The URL and token enable automatic attachment. The renewal URL is optional for an external static key and required only when the hosted capability needs automatic renewal.
+- Missing or incomplete configuration preserves ordinary LumiBot strategy and agent behavior and emits one deduplicated capability notice. The "not connected" notice appears at most once per process and never in CI.
+- ``LUMIBOT_NO_BOTSPOT_HINT``: set to ``1`` to hide the "BotSpot research is not connected" notice. ``DO_NOT_TRACK=1`` also hides it.
+- ``LUMIBOT_HIDE_BOTSPOT_TIP``: set to ``1`` to hide the one-time "BotSpot MCP is not connected" tip that LumiBot logs when a backtest or live run starts without a BotSpot connection. The tip is also hidden in CI, with ``LUMIBOT_NO_BOTSPOT_HINT=1`` or ``DO_NOT_TRACK=1``, and when ``BOTSPOT_RESEARCH_MCP_TOKEN``, ``BOTSPOT_RESEARCH_MCP_RENEW_URL`` or ``BOTSPOT_API_KEY`` is set.
+- ``lumibot connect botspot`` checks a Research key with BotSpot and writes the URL and token to ``.env``. See :doc:`cli`.
 
 ``GITHUB_TOKEN`` is used only in tagged release CI with repository ``actions: read`` permission to restore compatible agent-eval freshness evidence. The source workflow commit must be an ancestor of the exact tagged candidate. If no trustworthy artifact is available, stale cases run normally. Never log or commit token values.
 
@@ -366,6 +386,31 @@ LUMIBOT_CACHE_FOLDER
 
 - Purpose: Override the local cache folder (useful to simulate a fresh container/task).
 
+LUMIBOT_SHARED_BARS
+^^^^^^^^^^^^^^^^^^^
+
+- Purpose: Turn the shared history cache on or off. Live reads (charts, trading bots) and
+  backtests that read bars from the same broker connection share one cache, for every broker
+  (Alpaca, Schwab, Tradier, Interactive Brokers Client Portal, CCXT exchanges).
+- Default: ``true``. Set ``false`` to read every bar from the broker.
+- Notes: Only real broker bars are stored. Completed bars never expire; the still-open newest
+  bar is always read again. Split- or dividend-adjusted history is re-checked against the broker
+  and rebuilt when the broker rewrites old prices. With ``LUMIBOT_CACHE_BACKEND=s3`` the files are
+  also shared through S3 (uploads run in the background, so callers never wait on them).
+
+LUMIBOT_SHARED_BARS_SCOPE
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+- Purpose: Who may reuse cached bars.
+- Values: ``credential`` (default: each broker connection keeps its own bars) or ``provider``
+  (all connections of one broker share bars).
+
+LUMIBOT_SHARED_BARS_SETTLE_MINUTES
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+- Purpose: How long after a bar ends it counts as final and may be stored.
+- Default: ``15``.
+
 LUMIBOT_CACHE_S3_BUCKET / LUMIBOT_CACHE_S3_PREFIX / LUMIBOT_CACHE_S3_REGION
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
@@ -441,6 +486,10 @@ TRADING_BROKER
   - ``ib``, ``interactivebrokers``, ``ibrest``, ``interactivebrokersrest``
   - ``tradovate``, ``schwab``, ``bitunix``, ``polymarket``, ``polymarket_clob``
   - ``projectx`` / ``projectx-topstepx`` for TopstepX futures (via ProjectX)
+  - Any other CCXT exchange ID (for example ``okx``, ``binance``, ``hyperliquid``), with credentials in
+    ``<EXCHANGE>_API_KEY``, ``<EXCHANGE>_API_SECRET``, ``<EXCHANGE>_API_PASSPHRASE``, ``<EXCHANGE>_UID``,
+    ``<EXCHANGE>_PRIVATE_KEY``, ``<EXCHANGE>_WALLET_ADDRESS`` (only the fields that exchange requires) and
+    optional ``<EXCHANGE>_SANDBOX`` / ``<EXCHANGE>_MARGIN``. See the CCXT broker guide.
 - Note: If not set, broker is auto-detected based on available credentials.
 
 DATA_SOURCE
@@ -450,6 +499,7 @@ DATA_SOURCE
 - Values (case-insensitive):
   - ``alpaca``, ``tradier``, ``polygon``, ``yahoo``, ``thetadata``, ``databento``
   - ``ccxt``, ``coinbase``, ``kraken``, ``weex``, ``schwab``, ``bitunix``, ``projectx``, ``polymarket``, ``polymarket_clob``
+  - Any other CCXT exchange ID (public market data needs no credentials on most exchanges)
 - Note: If not set, uses broker's default data source.
 
 Alpaca broker
@@ -567,6 +617,32 @@ POLYMARKET_TEST_TOKEN_ID / POLYMARKET_LIVE_TRADING_ENABLED / POLYMARKET_TEST_MAX
   supports explicit order-matrix cases such as ``fak-buy``, ``fok-buy``, ``fak-sell``, ``fok-sell``, ``gtc-buy``,
   ``gtd-buy``, ``post-only-buy``, ``cancel-single``, ``cancel-multiple``, ``cancel-all``, ``cancel-market``, and
   ``--websocket``.
+
+Kalshi connection and trading
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+- ``TRADING_BROKER=kalshi`` selects the native adapter. Standard order, position,
+  quote, historical-price and account methods are implemented. Whole and fractional
+  demo trading and completed-candle backtesting are verified; live settlement
+  reconciliation and advanced execution fidelity remain separate qualification.
+- ``KALSHI_API_KEY_ID`` identifies the separately configured demo or production key.
+- ``KALSHI_PRIVATE_KEY`` supplies PEM text (Ed25519 or RSA); alternatively use
+  ``KALSHI_PRIVATE_KEY_PATH`` for your own protected PEM file. Inline text wins.
+- ``KALSHI_IS_DEMO`` defaults to ``true``; use ``false`` for a production connection.
+- ``KALSHI_SUBACCOUNT`` is optional; absence preserves the key's provider binding.
+  ``KALSHI_EXCHANGE_INDEX`` optionally scopes the account to a fund pool; market
+  metadata routes trading, and a conflicting configured pool produces an error.
+  The adapter does not transfer funds automatically.
+- ``KALSHI_BASE_URL`` optionally replaces the standard REST endpoint. Configured
+  query parameters are retained, and secrets in endpoint configuration are not logged.
+- ``DATA_SOURCE=kalshi`` optionally selects the metadata/price/quote source. With the Kalshi
+  broker it reuses that broker's client.
+- ``BACKTESTING_DATA_SOURCE=kalshi`` selects ``KalshiBacktesting`` through the
+  existing backtest source override. Preload selected YES/NO assets with ``assets=``
+  and a minute/hour/day ``timestep``, or pass ordinary ``pandas_data``. Public
+  market history needs no trading keys; orders in a backtest are simulated.
+- Account-only check: ``python -m lumibot.example_strategies.kalshi_account_check``.
+  It uses the existing Strategy cash/equity methods and submits no orders.
 
 Polymarket CLOB implementation notes
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -850,6 +926,54 @@ COINBASE_SANDBOX
 - Purpose: Use Coinbase sandbox environment.
 - Values: ``true`` / ``false``.
 - Default: ``false``.
+
+LUMIBOT_CCXT_PARTNER_IDS
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+- Purpose: LumiBot's own exchange partner (broker) IDs for CCXT exchanges. CCXT's
+  own partner IDs are always removed; these are attached instead. A partner ID
+  does not change what the user pays.
+- Values: JSON object keyed by CCXT exchange id, for example
+  ``{"bybit": "<partner-id>", "kucoin": {"id": "<id>", "key": "<partner-key>"}}``.
+- Default: empty (no partner ID is attached).
+
+LUMIBOT_CCXT_BUILDER_FEES
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+- Purpose: An extra builder fee on DEXes that support one (Hyperliquid, Lighter,
+  GRVT, Aster, Pacifica, Extended). **This costs the user extra on every order.**
+  LumiBot logs a warning whenever one is enabled.
+- Values: JSON object of CCXT option overrides per exchange, for example
+  ``{"hyperliquid": {"builder": "0x...", "feeRate": "0.01%", "feeInt": 10}}``.
+- Default: empty. CCXT's own builder fees are turned off.
+
+LUMIBOT_CCXT_REFERRAL_CODES
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+- Purpose: Referral code to register when a wallet first connects (Hyperliquid).
+- Values: JSON object, for example ``{"hyperliquid": "<code>"}``.
+- Default: empty. CCXT's own referrer registration is skipped.
+
+PARADEX_L2_PRIVATE_KEY / PARADEX_L2_ADDRESS / PARADEX_L2_PUBLIC_KEY
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+- Purpose: Trade Paradex with a subkey (can trade, cannot withdraw) instead of the
+  wallet's private key. ``PARADEX_L2_ADDRESS`` is the Paradex account address.
+- Values: from Paradex Key Management (**do not hardcode**).
+
+LIGHTER_API_KEY_PRIVATE_KEY / LIGHTER_API_KEY_INDEX / LIGHTER_ACCOUNT_INDEX / LIGHTER_LIBRARY_PATH
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+- Purpose: Trade Lighter with an existing API key instead of the wallet's private
+  key. All four are needed; the library path points to Lighter's signer library.
+- Values: Lighter API key details (**do not hardcode** the private key).
+
+DYDX_MNEMONIC
+^^^^^^^^^^^^^
+
+- Purpose: Use the dYdX Chain secret phrase instead of the Ethereum wallet key.
+  It still has full control of the dYdX account.
+- Values: secret phrase (**do not hardcode**).
 
 Bitunix broker
 --------------
@@ -1140,3 +1264,79 @@ TELEGRAM_CHAT_ID
 
 - Purpose: Telegram chat/channel/user id for strategy notifications.
 - Values: Telegram chat id.
+
+Frequently asked questions
+--------------------------
+
+Where do I put LumiBot environment variables?
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+You can export them in your shell before you start your strategy, or put them
+in a ``.env`` file. LumiBot looks upward from the folder of the script you run
+for the nearest ``.env`` file. If it finds none there, it also looks upward
+from your current working directory.
+
+If a ``.env`` file is found, LumiBot also loads a ``.env.local`` file next to
+it. Use ``.env.local`` only for your own local overrides.
+
+Which value wins: my shell, .env, or .env.local?
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+A value you export in your shell wins over the primary ``.env`` file. A
+``.env.local`` file can override both. If a backtest picks a provider you did
+not expect, check all three places before you launch.
+
+How do I stop LumiBot from loading my .env file?
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Set ``LUMIBOT_DISABLE_DOTENV=1`` to turn off ``.env`` loading. To keep ``.env``
+but skip ``.env.local``, set ``LUMIBOT_DISABLE_DOTENV_LOCAL=1``. In hosted or
+deployed runs, injected variables plus ``LUMIBOT_DISABLE_DOTENV=1`` keep local
+files from overriding runtime secrets.
+
+How do I choose the backtest data source with an environment variable?
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Set ``BACKTESTING_DATA_SOURCE``, for example ``BACKTESTING_DATA_SOURCE=yahoo``.
+This value overrides the data source class in your Python code. Set it to
+``none`` if you want LumiBot to use the class from your code instead. See
+:ref:`backtest-data-source-selection` for every supported value.
+
+How do I set the starting cash for a backtest?
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Set ``BACKTESTING_BUDGET``, for example ``BACKTESTING_BUDGET=10000``. It wins
+over a ``budget=`` value in your code. If you set neither one, a backtest starts
+with ``100000``.
+
+Which API key do I need for AI agents?
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+It depends on the model. The default model ``openai/gpt-6-luna`` needs
+``OPENAI_API_KEY``. Gemini models need ``GEMINI_API_KEY``, Anthropic models
+need ``ANTHROPIC_API_KEY``, and xAI Grok models need ``XAI_API_KEY`` (or
+``GROK_API_KEY``). You only need a model key if your strategy uses AI agents.
+
+Does LumiBot read EDGAR_USER_AGENT or SEC_EDGAR_USER_AGENT?
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+No. LumiBot reads ``LUMIBOT_SEC_USER_AGENT`` for SEC EDGAR requests. If it is
+not set, LumiBot sends its own support contact as the user agent. The SEC asks
+automated tools to declare a user agent in request headers. See the SEC page on
+`accessing EDGAR data <https://www.sec.gov/os/accessing-edgar-data>`_.
+
+How do I send strategy alerts to Discord or Telegram?
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+For Discord, set ``DISCORD_WEBHOOK_URL`` to your full Discord webhook URL. For
+Telegram, set ``TELEGRAM_BOT_TOKEN`` to the token from BotFather and
+``TELEGRAM_CHAT_ID`` to the chat that should get the messages.
+
+Is it safe to keep API keys in a .env file?
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Keep keys in a ``.env`` file, your shell, or a secret manager, and never commit
+them to a repository. Do not commit ``.env.local`` either. If a key was ever
+pushed to a repository, GitHub's guide says the first step is to revoke or
+rotate that secret. See
+`Removing sensitive data from a repository <https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/removing-sensitive-data-from-a-repository>`_.

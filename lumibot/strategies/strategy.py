@@ -7,6 +7,7 @@ import time
 import warnings
 
 from lumibot._lazy_imports import LazyModule, lazy_class, lazy_typing
+from lumibot.data_sources.exceptions import UnsupportedAsset
 
 from ._strategy import IS_BACKTESTING, _Strategy
 
@@ -572,6 +573,9 @@ class Strategy(_Strategy):
         type: Union[Order.OrderType, None] = None,  # Deprecated, use 'order_type' instead
         smart_limit: SmartLimitConfig = None,
         custom_params: dict = None,
+        position_side: str = None,
+        position_id: str = None,
+        reduce_only: bool = False,
     ):
         # noinspection PyShadowingNames,PyUnresolvedReferences
         """Creates a new order for this specific strategy. Once created, an order must still be submitted.
@@ -654,7 +658,9 @@ class Strategy(_Strategy):
                 - ``'day'`` Orders valid for the remainder of the day.
                 - ``'gtc'`` Good until cancelled.
                 - ``'gtd'`` Good until date.
-            (Default: 'day')
+            (Default: 'gtc'). Pass ``time_in_force='day'`` explicitly for an
+            intraday order. Constructing ``Order`` directly defaults to 'day';
+            this Strategy API defaults to 'gtc'.
         good_till_date : datetime.datetime
             This is the time order is valid for Good Though Date orders.
         take_profit_price : float
@@ -919,6 +925,9 @@ class Strategy(_Strategy):
             order_class=order_class,
             smart_limit=smart_limit,
             custom_params=custom_params,
+            position_side=position_side,
+            position_id=position_id,
+            reduce_only=reduce_only,
             identifier=identifier,
         )
 
@@ -1271,6 +1280,8 @@ class Strategy(_Strategy):
         asset: Union[str, Asset],
         broker_refresh: bool = True,
         broker_refresh_ttl_seconds: float = 0.0,
+        position_side: str = None,
+        position_id: str = None,
     ):
         """Get a tracked position given an asset for the current
         strategy.
@@ -1318,7 +1329,9 @@ class Strategy(_Strategy):
         
         # For non-continuous futures, use existing exact matching
         if asset.asset_type != Asset.AssetType.CONT_FUTURE:
-            return self.broker.get_tracked_position(self.name, asset)
+            selectors = {key: value for key, value in (("position_side", position_side), ("position_id", position_id))
+                         if value is not None}
+            return self.broker.get_tracked_position(self.name, asset, **selectors)
         
         # For continuous futures, implement smart matching
         return self._get_continuous_future_position(asset)
@@ -1712,10 +1725,10 @@ class Strategy(_Strategy):
     def get_order(self, identifier: str, broker_refresh: bool = True, broker_refresh_ttl_seconds: float = 0.0):
         """Get a tracked order given an identifier. Check the details of the order including status, etc.
 
-        In live trading this refreshes broker order state before returning by default. Use this
-        direct lookup after submitting an order if you need to verify that same order immediately.
-        Some brokers can expose a just-submitted order through direct order lookup before it appears
-        in broad account order-list endpoints.
+        In live trading this refreshes broker order state before returning by default.
+        Refresh normally reads the broker order list; a tracked active order absent from
+        that list may also receive a direct lookup. This is not an unconditional
+        single-order HTTP request. Set broker_refresh=False to read only tracked state.
 
         Returns
         -------
@@ -1853,7 +1866,86 @@ class Strategy(_Strategy):
         asset = self._sanitize_user_asset(asset)
         return self.broker.get_asset_potential_total(self.name, asset)
 
-    def submit_order(self, order: Order|list[Order], **kwargs):
+    def _journal_order_action(self, orders, *, operation, reason, evidence=None, changes=None):
+        from lumibot.components.agents.tool_context import current_agent_tool_context
+        from lumibot.components.memory.store import validate_order_reason
+
+        context = current_agent_tool_context()
+        reason = validate_order_reason(reason, required=bool(context.get("agent_name") or context.get("model_call_id")))
+        if reason is None:
+            return None
+        orders = orders if isinstance(orders, list) else [orders]
+        snapshots = [
+            {"identifier": o.identifier, "symbol": o.symbol, "side": str(o.side),
+             "quantity": str(o.quantity), "order_type": str(o.order_type),
+             "limit_price": o.limit_price, "stop_price": o.stop_price, "changes": changes or {},
+             "previous_reference": getattr(o, "decision_journal", None) if operation != "submit" else None}
+            for o in orders
+        ]
+        reference = self.memory.record_order_action(
+            operation=operation, reason=reason, orders=snapshots, evidence=evidence,
+            previous=getattr(orders[0], "decision_journal", None) if operation != "submit" and len(orders) == 1 else None,
+            agent_name=context.get("agent_name"), model_call_id=context.get("model_call_id"),
+        )
+        for order, snapshot in zip(orders, snapshots):
+            linked = dict(reference)
+            previous = snapshot["previous_reference"]
+            if previous:
+                linked["previous_action_id"] = previous.get("action_id")
+                linked["decision_id"] = previous.get("decision_id") or reference["decision_id"]
+            self._attach_order_journal(order, linked)
+        return reference
+
+    @staticmethod
+    def _attach_order_journal(order, reference, *, preserve_existing=False):
+        if order is None:
+            return
+        if isinstance(order, list):
+            for item in order:
+                Strategy._attach_order_journal(item, reference, preserve_existing=preserve_existing)
+            return
+        if preserve_existing and getattr(order, "decision_journal", {}).get("action_id") == reference["action_id"]:
+            return
+        order.decision_journal = dict(reference)
+        if reference.get("operation") in {"submit", "modify"}:
+            order.trade_decision_journal = dict(reference)
+        order.decision_provenance = {key: reference.get(key) for key in ("deployment_id", "run_id", "decision_id", "model_call_id")}
+        for child in getattr(order, "child_orders", None) or []:
+            Strategy._attach_order_journal(child, reference)
+
+    def _perform_journaled_order_action(self, reference, operation):
+        try:
+            result = operation()
+        except Exception as exc:
+            if reference:
+                self._record_order_action_outcome(reference, certainty="unknown", error_type=type(exc).__name__)
+            raise
+        if reference:
+            self._attach_order_journal(result, reference, preserve_existing=True) if isinstance(result, (Order, list)) else None
+            self._record_order_action_outcome(reference, certainty="returned")
+        return result
+
+    def _record_order_action_outcome(self, reference, **kwargs):
+        # An acknowledged broker call must never appear to fail and invite a retry
+        # because an observability write failed after execution.
+        try:
+            self.memory.record_order_action_outcome(reference, **kwargs)
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception("Unable to persist order action outcome for %s", reference["action_id"])
+
+    def submit_order(self, order: Order|list[Order], *, reason: str | None = None, evidence: dict | None = None, **kwargs):
+        """Submit with an optional private explanation; agent actions require one.
+
+        ``reason`` is committed before the broker call. ``evidence`` is an
+        optional JSON object of sources, timestamps, sizing and risks. Full
+        explanations remain in the private memory journal; orders carry compact
+        references. An unknown broker outcome must be reconciled before retrying.
+        """
+        reference = self._journal_order_action(order, operation="submit", reason=reason, evidence=evidence)
+        return self._perform_journaled_order_action(reference, lambda: self._submit_order_impl(order, **kwargs))
+
+    def _submit_order_impl(self, order: Order|list[Order], **kwargs):
         """Submit an order or a list of orders for assets
 
         Submits an order or a list of orders for processing by the active broker.
@@ -2013,7 +2105,7 @@ class Strategy(_Strategy):
                 # Multiple independent SMART_LIMIT orders.
                 submitted_orders = []
                 for o in order:
-                    submitted_orders.append(self.submit_order(o))
+                    submitted_orders.append(self._submit_order_impl(o))
                 return submitted_orders
 
             # Broker-agnostic multi-leg LIMIT UX:
@@ -2429,7 +2521,7 @@ class Strategy(_Strategy):
         """
         return self.broker.wait_for_orders_execution(orders)
 
-    def cancel_order(self, order: Order):
+    def cancel_order(self, order: Order, *, reason: str | None = None, evidence: dict | None = None):
         """Cancel an order.
 
         Cancels a single open order provided.
@@ -2450,13 +2542,14 @@ class Strategy(_Strategy):
         >>> self.cancel_order(order)
 
         """
+        reference = self._journal_order_action(order, operation="cancel", reason=reason, evidence=evidence)
         # Set the status to CANCELLING
         order.status = Order.OrderStatus.CANCELLING
 
         # Cancel the order
-        return self.broker.cancel_order(order)
+        return self._perform_journaled_order_action(reference, lambda: self.broker.cancel_order(order))
 
-    def cancel_orders(self, orders: List[Order]):
+    def cancel_orders(self, orders: List[Order], *, reason: str | None = None, evidence: dict | None = None):
         """Cancel orders in all strategies.
 
         Cancels all open orders provided in any of the running
@@ -2480,9 +2573,12 @@ class Strategy(_Strategy):
         >>> # Cancel all orders
         >>> self.cancel_orders([order1, order2])
         """
-        return self.broker.cancel_orders(orders)
+        if not orders:
+            return []
+        reference = self._journal_order_action(orders, operation="cancel", reason=reason, evidence=evidence)
+        return self._perform_journaled_order_action(reference, lambda: self.broker.cancel_orders(orders))
 
-    def cancel_open_orders(self, orders: list[Order] | None = None):
+    def cancel_open_orders(self, orders: list[Order] | None = None, *, reason: str | None = None, evidence: dict | None = None):
         """Cancel all the strategy open orders.
 
         Cancels all orders that are open and awaiting execution within
@@ -2529,9 +2625,10 @@ class Strategy(_Strategy):
         if not active_orders:
             return []
 
-        return self.broker.cancel_open_orders(self.name, active_orders)
+        reference = self._journal_order_action(active_orders, operation="cancel", reason=reason, evidence=evidence)
+        return self._perform_journaled_order_action(reference, lambda: self.broker.cancel_open_orders(self.name, active_orders))
 
-    def modify_order(self, order: Order, limit_price: Union[float, None] = None, stop_price: Union[float, None] = None):
+    def modify_order(self, order: Order, limit_price: Union[float, None] = None, stop_price: Union[float, None] = None, *, reason: str | None = None, evidence: dict | None = None):
         """Modify an order.
 
         Modifies a single open order provided.
@@ -2563,7 +2660,9 @@ class Strategy(_Strategy):
         if not order.identifier:
             raise ValueError("Order identifier is not set, unable to modify order. Did you remember to submit it?")
 
-        result = self.broker.modify_order(order, limit_price=limit_price, stop_price=stop_price)
+        reference = self._journal_order_action(order, operation="modify", reason=reason, evidence=evidence,
+                                               changes={"limit_price": limit_price, "stop_price": stop_price})
+        result = self._perform_journaled_order_action(reference, lambda: self.broker.modify_order(order, limit_price=limit_price, stop_price=stop_price))
         if limit_price is not None:
             order.limit_price = limit_price
         if stop_price is not None:
@@ -2598,7 +2697,7 @@ class Strategy(_Strategy):
         """
         self.broker.sell_all(self.name, cancel_open_orders=cancel_open_orders, strategy=self, is_multileg=is_multileg)
 
-    def close_position(self, asset, fraction: float = 1.0):
+    def close_position(self, asset, fraction: float = 1.0, position_side=None, position_id=None):
         """
         Close a single position for the specified asset.
 
@@ -2617,14 +2716,21 @@ class Strategy(_Strategy):
         """
         asset_obj = self._sanitize_user_asset(asset)
 
+        position = None
         try:
-            position = self.get_position(asset_obj)
+            selectors = {key: value for key, value in (("position_side", position_side), ("position_id", position_id))
+                         if value is not None}
+            position = self.get_position(asset_obj, **selectors)
             qty = getattr(position, "quantity", 0) if position else 0
             self.log_message(
                 f"close_position -> asset={asset_obj.symbol if hasattr(asset_obj, 'symbol') else asset_obj}, "
                 f"fraction={fraction}, current_qty={qty}",
                 color="yellow",
             )
+        except ValueError as exc:
+            # An unselected hedge position may have multiple legs; the broker
+            # closes all of them below without requiring a single-position view.
+            self.logger.debug("Position lookup before close_position: %s", exc)
         except Exception as exc:  # pragma: no cover - defensive logging
             self.logger.exception("Unable to inspect position prior to close_position: %s", exc)
 
@@ -2638,7 +2744,9 @@ class Strategy(_Strategy):
                 )
             except Exception:  # pragma: no cover - best effort logging
                 pass
-        result = self.broker.close_position(self.name, target_asset, fraction)
+        selectors = {key: value for key, value in (("position_side", position_side), ("position_id", position_id))
+                     if value is not None}
+        result = self.broker.close_position(self.name, target_asset, fraction, **selectors)
         if result is None:
             self.log_message("close_position -> broker returned None (no order submitted)", color="yellow")
         else:
@@ -2670,6 +2778,14 @@ class Strategy(_Strategy):
         for asset in assets:
             results.append(self.close_position(asset))
         return results
+
+    def get_contract_exposure(self, asset, quantity, price):
+        """Return base/quote derivative exposure using the selected broker's native units."""
+        return self.broker.get_contract_exposure(asset, quantity, price, quote=self.quote_asset)
+
+    def get_quantity_for_notional(self, asset, notional, price=None):
+        """Native derivative quantity for a notional in the instrument's quote currency."""
+        return self.broker.get_quantity_for_notional(asset, notional, price=price, quote=self.quote_asset)
 
     def get_last_price(self, asset: Union[Asset, str], quote=None, exchange=None) -> Union[float, Decimal, None]:
         """Takes an asset and returns the last known price
@@ -2867,6 +2983,8 @@ class Strategy(_Strategy):
                 cache[cache_key] = result
                 self._record_usable_backtest_price(result)
             return result
+        except UnsupportedAsset:
+            raise
         except Exception as e:
             self.log_message(f"Could not get last price for {asset}", color="red")
             self.log_message(f"{e}")
@@ -2988,9 +3106,40 @@ class Strategy(_Strategy):
                 return self.broker.option_source.get_quote(asset, quote=quote, exchange=exchange)
             else:
                 return self.broker.data_source.get_quote(asset, quote=quote, exchange=exchange)
+        except UnsupportedAsset:
+            raise
         except Exception as e:
             self.log_message(f"Error getting quote from data source: {e}", color="red")
             return _quote_class()(asset=asset)
+
+    def get_quotes(self, assets: List[Asset], quote: Asset = None, exchange: str = None):
+        """Return exact Assets mapped to Quote objects (or None when absent).
+
+        Schwab batches up to 50 symbols per request, including selected option
+        contracts. Other providers retain their existing get_quote behavior;
+        no batching speed is promised without a native adapter. Option assets
+        honor the configured option_source just like get_quote. A native batch
+        failure raises instead of silently triggering serial retries. Snapshot
+        freshness and trading decisions remain the strategy's responsibility.
+        """
+        assets = list(dict.fromkeys(self._sanitize_user_asset(asset) for asset in assets))
+        groups = {}
+        for asset in assets:
+            source = self.broker.option_source if self.broker.option_source and asset.asset_type == "option" else self.broker.data_source
+            groups.setdefault(id(source), (source, []))[1].append(asset)
+        result = {}
+        for source, selected in groups.values():
+            native = getattr(source, "get_quotes", None)
+            if callable(native):
+                quotes = native(selected, quote=quote, exchange=exchange)
+                if not isinstance(quotes, dict) or any(asset not in quotes for asset in selected):
+                    raise ValueError("Bulk quote adapter omitted requested asset results")
+                if any(value is not None and getattr(value, "asset", None) != asset for asset, value in quotes.items() if asset in selected):
+                    raise ValueError("Bulk quote adapter returned another asset's quote")
+                result.update({asset: quotes[asset] for asset in selected})
+            else:
+                result.update({asset: self.get_quote(asset, quote=quote, exchange=exchange) for asset in selected})
+        return {asset: result[asset] for asset in assets}
 
     def get_tick(self, asset: Union[Asset, str]):
         """Takes an Asset and returns the last known price"""
@@ -3243,14 +3392,16 @@ class Strategy(_Strategy):
         >>> print(f"Strike: {df.iloc[0]['strike']}, Delta: {df.iloc[0]['greeks.delta']}")
         """
         asset = self._sanitize_user_asset(asset)
-        risk_free_rate = risk_free_rate if risk_free_rate is not None else self.risk_free_rate
-        if underlying_price is None:
-            underlying_asset = Asset(symbol=asset.symbol, asset_type="stock")
-            und_price = self.get_last_price(underlying_asset)
-        else:
-            und_price = underlying_price
+        # Native chain snapshots already contain provider Greeks. Do not fetch
+        # interest rates or underlying prices that those adapters never use.
+        needs_pricing = getattr(self.broker.data_source, "CHAIN_FULL_INFO_REQUIRES_PRICING_INPUTS", True)
+        if needs_pricing:
+            risk_free_rate = risk_free_rate if risk_free_rate is not None else self.risk_free_rate
+            if underlying_price is None:
+                underlying_asset = Asset(symbol=asset.symbol, asset_type="stock")
+                underlying_price = self.get_last_price(underlying_asset)
 
-        return self.broker.get_chain_full_info(asset, expiry, chains=chains, underlying_price=und_price,
+        return self.broker.get_chain_full_info(asset, expiry, chains=chains, underlying_price=underlying_price,
                                                risk_free_rate=risk_free_rate, strike_min=strike_min,
                                                strike_max=strike_max)
 
@@ -3833,7 +3984,7 @@ class Strategy(_Strategy):
         expiration: datetime.datetime = None,
         strike: float = None,
         right: str = None,
-        multiplier: int = 1,
+        multiplier: float | None = None,
     ):
         """Creates an asset object. This is used to create an asset object.
 
@@ -3854,8 +4005,9 @@ class Strategy(_Strategy):
         right : str
             The right of the option (optional, only required for options).
 
-        multiplier : int
-            The multiplier of the asset (optional, only required for options and futures).
+        multiplier : float
+            Contract price multiplier. When omitted, defaults to 100 for options
+            and 1 for other asset types. Explicit provider contract terms are preserved.
 
         Returns
         -------
@@ -4555,6 +4707,14 @@ class Strategy(_Strategy):
             return (multiplier * 30, "day")
         return (multiplier, unit)
 
+    def _prefetch_indicator_history(self, *args, **kwargs):
+        """Populate optional indicator history through normal asset/timeframe handling.
+
+        The indicator records its actual causal input separately. A cache fill
+        ceiling is not a demand for that many decision-input rows.
+        """
+        return self.get_historical_prices(*args, _history_requirement="prefetch", **kwargs)
+
     def get_historical_prices(
         self,
         asset: Union[Asset, str],
@@ -4581,6 +4741,12 @@ class Strategy(_Strategy):
             object. Cryptocurrencies must also specify the quote currency.
         length : int
             The number of rows (number of timesteps)
+        minimum_bars : int, optional
+            Minimum completed bars required by this backtest decision, between
+            1 and ``length``. Defaults to ``length`` to preserve strict existing
+            requirements. Set this when requesting a generous history window
+            but consuming only its most recent smaller lookback. This changes
+            validation only; returned prices and the download window are unchanged.
         timestep : str
             Time interval for each bar. Supports multiple formats:
 
@@ -4685,6 +4851,10 @@ class Strategy(_Strategy):
                 raise TypeError("get_historical_prices() got multiple values for keyword argument 'return_polars'")
             kwargs["return_polars"] = args[0]
 
+        history_requirement = kwargs.pop("_history_requirement", "required")
+        minimum_bars = kwargs.pop("minimum_bars", None)
+        if history_requirement not in {"required", "prefetch"}:
+            raise ValueError("Unknown internal history requirement mode")
         return_polars_provided = "return_polars" in kwargs
         return_polars = kwargs.pop("return_polars", False)
         if return_polars_provided:
@@ -4707,6 +4877,12 @@ class Strategy(_Strategy):
                     f"Invalid length parameter in get_historical_prices() method. Length must be an int but instead got {length}, "
                     f"which is a type {type(length)}."
                 )
+
+        if minimum_bars is not None and (
+            isinstance(minimum_bars, bool) or not isinstance(minimum_bars, int)
+            or minimum_bars < 1 or minimum_bars > length
+        ):
+            raise ValueError("minimum_bars must be an integer between 1 and length")
 
         if quote is None:
             quote = self.quote_asset
@@ -4882,6 +5058,17 @@ class Strategy(_Strategy):
                     # If resampling fails, log warning and return original data
                     self.logger.warning(f"Failed to resample data from {actual_timestep} to {original_timestep}: {e}")
 
+        if self.is_backtesting and history_requirement == "required":
+            from lumibot.backtesting.market_input_evidence import record_market_input
+
+            record_market_input(source=ds, asset=asset, quote=quote,
+                timestep=original_timestep or actual_timestep, when=self.get_datetime(),
+                frame=bars.pandas_df if bars is not None else None, purpose="history")
+            record_requirement = getattr(ds, "record_history_requirement", None)
+            if callable(record_requirement):
+                record_requirement(asset=asset, timestep=original_timestep or actual_timestep,
+                                   requested_bars=length if minimum_bars is None else minimum_bars,
+                                   bars=bars, timeshift=timeshift)
         return bars
 
     def get_symbol_bars(
@@ -4998,7 +5185,7 @@ class Strategy(_Strategy):
         if effective_sleep_time is None:
             data_source = getattr(getattr(self, "broker", None), "data_source", None)
             effective_sleep_time = 0.0 if getattr(data_source, "IS_BACKTESTING_DATA_SOURCE", False) else 0.1
-        return self.broker.data_source.get_bars(
+        results = self.broker.data_source.get_bars(
             assets,
             length,
             timestep=timestep,
@@ -5009,6 +5196,15 @@ class Strategy(_Strategy):
             include_after_hours=include_after_hours,
             sleep_time=effective_sleep_time
         )
+        if self.is_backtesting:
+            from lumibot.backtesting.market_input_evidence import record_market_input
+
+            for asset in assets:
+                bars = results.get(asset) if isinstance(results, dict) else None
+                record_market_input(source=self.broker.data_source, asset=asset,
+                    quote=self.quote_asset, timestep=timestep, when=self.get_datetime(),
+                    frame=bars.pandas_df if bars is not None else None, purpose="history-batch")
+        return results
 
     def get_bars(
         self,

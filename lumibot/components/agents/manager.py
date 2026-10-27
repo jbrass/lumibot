@@ -30,6 +30,14 @@ _BOTSPOT_RESEARCH_TOOLS = [
     "query_data",
     "search_documents",
     "get_document",
+    "list_marketplace_strategies",
+    "get_marketplace_strategy",
+    "get_marketplace_strategy_code",
+    "list_marketplace_accounts",
+    "get_marketplace_account",
+    # This selects the shared tool contract. BotSpot still authorizes each
+    # Community action, including its separately granted post/reply scopes.
+    "community",
 ]
 # Outbound network tools are default-deny. An agent gets them only with
 # allow_network=True, or by listing one explicitly in tools=[...]. Fetched
@@ -217,13 +225,15 @@ def _botspot_research_server_from_environment() -> tuple[MCPServer | None, str |
     renew_url = str(os.environ.get("BOTSPOT_RESEARCH_MCP_RENEW_URL") or "").strip()
     configured = [bool(url), bool(token), bool(renew_url)]
     if not any(configured):
-        return (
-            None,
-            "BotSpot managed public macro and SEC research are not linked. This optional capability "
-            "is attached automatically on BotSpot; external LumiBot users can link a BotSpot account. "
-            "Ordinary LumiBot tools and strategy execution remain available.",
-        )
-    if not all(configured):
+        # Once per process and silent in CI or when opted out; see botspot_hint.
+        from .botspot_hint import claim_unlinked_hint, unlinked_research_message
+
+        if not claim_unlinked_hint():
+            return None, None
+        return None, unlinked_research_message()
+    # External research keys need only URL + token. Hosted capabilities can
+    # additionally renew; a supplied renewal URL retains MCPServer validation.
+    if not (url and token):
         return (
             None,
             "BotSpot research is only partially configured. Link a BotSpot account or run on BotSpot "
@@ -237,12 +247,12 @@ def _botspot_research_server_from_environment() -> tuple[MCPServer | None, str |
                 url=url,
                 exposed_tools=_BOTSPOT_RESEARCH_TOOLS,
                 auth_token_env="BOTSPOT_RESEARCH_MCP_TOKEN",
-                auth_token_refresh_url=renew_url,
+                auth_token_refresh_url=renew_url or None,
             ),
             None,
         )
-    except ValueError as exc:
-        return None, f"BotSpot research configuration is invalid: {exc}"
+    except ValueError:
+        return None, "BotSpot research configuration is invalid. Check the MCP connection and optional token-renewal settings."
 
 
 def _iso_or_none(value: Any) -> str | None:
@@ -816,7 +826,7 @@ def _managed_ai_provenance(model: str) -> dict[str, Any]:
     managed = managed_gateway_available_for(model)
     return {
         "runtime_version": str(__version__),
-        "ai_access_mode": "botspot_managed" if managed else "byok",
+        "ai_access_mode": "chatgpt_plan" if str(model).startswith("chatgpt/") else "botspot_managed" if managed else "byok",
         "gateway_protocol_version": 2 if managed else None,
         "gateway_component_sha256": _managed_gateway_component_sha256() if managed else None,
     }
@@ -1281,6 +1291,12 @@ class AgentHandle:
             "Use the provided runtime context and tool outputs as the ground truth for the current state of the strategy.",
             "Ground claims in tool results or runtime context instead of unsupported prior knowledge or vague market memory.",
             "If evidence is weak, conflicting, stale, or incomplete, prefer doing nothing and explain why.",
+            "Complete the user's authorized task in this run. Perform relevant available tool calls before finalizing a plan for later. Keep trading permission, historical cutoffs, evidence requirements and risk limits unchanged.",
+            "Available order tools in this run: " + ", ".join(sorted(name for name in available_tool_names if name.startswith("orders_"))) + ". The registered function declarations are authoritative; do not invent missing capabilities.",
+            "An order-submission tool call and its returned acknowledgement are required before claiming submission. A price preview, calculated size, intention or schema-validation error is not an accepted order. A single child order's fill does not prove that its entire package filled.",
+            "When no explicit analysis window is requested, leave optional indicator start/end unset so the indicator tool can obtain its required past warmup. If you selected a window too short to calculate the requested period, expand its earlier start within the user's permitted history; never move its end beyond the simulated cutoff or invent a value.",
+            "An empty catalog lookup requires a bounded refinement or unfiltered catalog lookup before concluding no relevant dataset exists. Catalog metadata alone cannot establish observation availability; query relevant observations before reporting a provider outage.",
+            "After a candidate fails a requested constraint, inspect bounded relevant alternatives from the returned inputs before declaring the setup unavailable. When a real blocker remains, state its observed evidence and the exact missing requirement without fabricating a trade or research result.",
             "Execution mode, current datetime, current timezone, current positions, cash, equity/portfolio value, recent orders, and recent trades are provided in Runtime Context JSON.",
             "Runtime Context JSON includes account_snapshot freshness, counts, and completeness flags. Treat truncated or incomplete snapshots as insufficient and call the relevant account tool before acting.",
             *omitted_warnings,
@@ -1320,6 +1336,7 @@ class AgentHandle:
             "Round down to whole shares when sizing positions.",
             "Before every order, check current cash, portfolio value, current positions, open orders, and the latest price of the asset you are ordering. A complete current injected snapshot satisfies the initial account and open-order checks for non-option orders. Before an option order, call account_portfolio, account_positions, and orders_open_orders in this run even when the snapshot is complete, as the options-trading skill requires. After any order mutation, Lumibot requires fresh complete account_positions and orders_open_orders pagination plus account_portfolio before another order.",
             "In your final decision, name the account state you relied on before any order (the injected snapshot's cash and portfolio value, or the account tools you called), and treat any upstream research or handoff packet as unverified evidence: say so and name what you independently revalidated. When you decide not to order, name the existing position or pending order that already covers the decision, or the missing condition that blocks it. Before relying on an existing position or pending order, call account_positions and orders_open_orders in this run; the injected snapshot can be stale about fills.",
+            "When leaving an existing pending order unchanged, explain how its remaining quantity already covers the intended position change, give its observed status, and say that another order would duplicate that change. State the user's explicit replacement condition if one authorizes modifying it.",
             "After an order fills, report the actual fill prices (avg_fill_price from orders_get_status), credit or debit, cash change, and resulting risk from fresh account reads, never the planned limit or pre-trade estimate. If a fill price or cash change is not available, say so instead of estimating it.",
             "Estimate the order's cash impact before submitting it. Ask whether the order is likely to create negative cash or additional leverage, and only do that when it is intentional for the strategy and suitable for the asset class.",
             "Margin and leverage behave differently across stocks, ETFs, options, futures, forex, crypto, brokers, and jurisdictions. Use judgment instead of assuming the same sizing rule works for every asset class.",
@@ -1375,6 +1392,11 @@ class AgentHandle:
                     "If you leak future information into a backtest, the backtest becomes invalid, misleading, and useless for decision-making.",
                     "Treat the current simulated datetime as a hard wall. Do not cross it. Do not infer across it. Do not hint across it.",
                     "Only use bars, news, macro data, filings, prices, positions, and events that were available at or before the current simulated datetime.",
+                    "Before following document links, compare recorded first public availability and version time with the full simulated datetime. For structured indexes use typed duckdb_query SQL; ordinary dated links and report text are also valid discovery evidence. Parse explicit timezone offsets as TIMESTAMPTZ and compare UTC instants before sorting or limiting; never use lexicographic timestamp strings or observation/transaction dates as substitutes. When a source records only a publication or filing date, conservatively count it as public from the start of the next day and explain that assumption. Check relevant updates as well as the baseline. Never open a disclosure or revision known to have become public after the simulated datetime, even to reject it or reconstruct an earlier version. Prefer dated sources, but a source with no date at all is allowed: estimate when it became public from its contents and context, use it only if that estimate is at or before the simulated datetime, and say in your answer that the date is an estimate and why. Never invent a date or present an estimate as exact; a missing date alone does not make evidence unavailable.",
+                    "Never change a publisher timestamp to make a document eligible. Carry the exact selected URL, any supplied version time and hash together into the read; normalized timestamps must represent the same instant. Excluded rows are diagnostics, never fetch candidates. Do not mistake table previews for a fully inspected index.",
+                    "For an index that supplies publication/version timestamps, query its eligible rows with typed SQL before following its report links, including relevant supplementary tables. Keep those selected URLs separate from unfiltered previews and excluded diagnostics. This does not require a complete archive or inventing missing metadata. Never call read_document, HTTP or browser tools on a known future URL merely to confirm metadata or reject its contents; explain the exclusion from the discovery evidence already returned.",
+                    "Pass recorded availability as read_document available_at and any indexed original hash as expected_sha256 when supplied. Omit unavailable proof rather than inventing it. An exhaustive manifest, exact quantities or original-version hashes are not prerequisites for useful research. Make reasonable approximations from supported evidence when the task permits them; disclose coverage, valuation and version limitations without claiming exact historical validity.",
+                    "Do not request a known future version merely to confirm metadata, test a cutoff error, or check that it should be excluded. Discovery metadata already establishes that exclusion. Read relevant eligible supplements before claiming to have reconciled them. Never describe unread contents or claim exhaustive coverage from a partial search.",
                     "Correct example: if the current simulated time is 2026-03-10 10:15 ET, you may use a news article published at 09:30 ET that same day if it appears in tool output.",
                     "Incorrect example: using a headline published at 14:00 ET, a later macro revision, a later SEC filing, or knowledge of the close when the simulated time is still the morning.",
                     "Incorrect example: saying 'the market later sold off' or 'inflation kept rising after this' unless that fact is explicitly visible in current tool output at or before the simulated datetime.",
@@ -1384,9 +1406,9 @@ class AgentHandle:
                     "If a tool has a start/end date range and you only set start without setting end, the tool will likely return data up to today, which is in the future. ALWAYS set the end bound.",
                     "Correct example: if the current simulated date is 2024-01-22 and a tool accepts end, end_date, time_to, or observation_end, pass 2024-01-22 (or the current simulated datetime) in that field.",
                     "Incorrect example: calling a news, macro, or data tool with only a start parameter and no end parameter, allowing it to return future data by default.",
-                    "If a tool response seems to include future timestamps, treat that as suspicious. Do not rely on those records without calling out the risk in your reasoning.",
+                    "If a tool response includes records published after the simulated datetime, exclude them before selecting evidence or following their links. Calling out the risk does not make future information usable.",
                     "Some backtest data sources have option trade bars but no bid/ask history. When a tool result or another agent's research reports price_basis='last_trade', that last traded price is the price this backtest fills at. Missing bid/ask alone is not a reason to pass, and it does not make that price unverified or unexecutable. A recent trade bar for the exact contract is the liquidity evidence.",
-                    "If you are unsure whether information was available yet, say the evidence is insufficient and do nothing.",
+                    "If availability is uncertain, use the disclosed-estimate procedure in web-documents. If no reasonable estimate or usable evidence supports a decision, explain the remaining gap and preserve existing supported state; do not fabricate evidence or treat a lookup failure as a liquidation signal.",
                     "Backtesting accuracy is more important than being clever. A cautious no-trade is better than a future-biased trade.",
                 ]
             )
@@ -1546,18 +1568,39 @@ class AgentHandle:
             getattr(self.manager.strategy, "is_backtesting", False)
         ):
             return arguments
+        if tool_name not in {"query_data", "search_documents", "get_document"}:
+            return arguments
         current_dt = _current_strategy_datetime(self.manager.strategy)
-        if current_dt is None:
-            raise RuntimeError("BotSpot research requires a current simulated datetime during backtests.")
-        as_of = current_dt.date().isoformat() if hasattr(current_dt, "date") else str(current_dt)[:10]
+        if not isinstance(current_dt, datetime) or current_dt.tzinfo is None or current_dt.utcoffset() is None:
+            raise RuntimeError("BotSpot research requires a timezone-aware simulated datetime during backtests.")
+        ceiling = current_dt.astimezone(timezone.utc)
+        requested_as_of = arguments.get("asOf")
+        if requested_as_of is not None:
+            try:
+                if not isinstance(requested_as_of, str):
+                    raise ValueError("asOf must be a string")
+                if len(requested_as_of) == 10:
+                    requested = datetime.strptime(requested_as_of, "%Y-%m-%d").replace(
+                        hour=23, minute=59, second=59, microsecond=999999, tzinfo=timezone.utc
+                    )
+                else:
+                    # Node's ISO contract permits compact offsets. Python 3.10
+                    # requires their colon; preserve the instant before parsing.
+                    normalized = re.sub(r"([+-]\d{2})(\d{2})$", r"\1:\2", requested_as_of)
+                    requested = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+                    if requested.tzinfo is None or requested.utcoffset() is None:
+                        raise ValueError("asOf must include a timezone")
+                ceiling = min(ceiling, requested.astimezone(timezone.utc))
+            except (ValueError, TypeError, OverflowError) as exc:
+                raise ValueError("BotSpot research asOf must be a valid date or timezone-aware ISO timestamp.") from exc
+        arguments["asOf"] = ceiling.isoformat().replace("+00:00", "Z")
+        as_of_day = ceiling.date().isoformat()
         if tool_name in {"query_data", "search_documents"}:
             time_range = dict(arguments.get("timeRange") or {})
             requested_end = str(time_range.get("endDate") or "").strip()
-            if not requested_end or requested_end[:10] > as_of:
-                time_range["endDate"] = as_of
+            if not requested_end or requested_end[:10] > as_of_day:
+                time_range["endDate"] = as_of_day
             arguments["timeRange"] = time_range
-        elif tool_name == "get_document":
-            arguments["asOf"] = as_of
         return arguments
 
     def _ensure_bound_tools(self) -> list[BoundTool]:
@@ -1637,7 +1680,15 @@ class AgentHandle:
             f"Error:  {exc.__class__.__name__}: {str(exc)[:400]}",
             "",
         ]
-        if category == "auth":
+        if str(model).startswith("chatgpt/"):
+            lines.extend([
+                "The ChatGPT request failed; no API-key fallback is enabled.",
+                "Reconnect with: python -m lumibot.components.agents.chatgpt_auth login",
+                "Check included allowance and existing ChatGPT credits at: https://chatgpt.com/settings/usage",
+                "Your account settings determine whether existing ChatGPT credits can be used.",
+                "Zero included allowance alone does not establish that inference is unavailable.",
+            ])
+        elif category == "auth":
             lines.extend(
                 [
                     f"Likely cause: {env_var} is missing or invalid.",
@@ -1708,8 +1759,10 @@ class AgentHandle:
         builtin_skill_fingerprint: str | None,
         reasoning_effort: str | None,
     ) -> dict[str, Any]:
+        from .replay_cache import runtime_capability_fingerprint
+
         bound_tools = self._ensure_bound_tools()
-        return {
+        payload = {
             "user_system_prompt": self.system_prompt,
             "base_system_prompt": base_system_prompt,
             "effective_system_prompt": effective_system_prompt,
@@ -1720,6 +1773,7 @@ class AgentHandle:
             "memory_state": memory_state or {},
             "model": model,
             "reasoning_effort": reasoning_effort,
+            "runtime_capabilities": runtime_capability_fingerprint(bound_tools, self._runtime),
             "tool_surface": [
                 {
                     "name": tool.name,
@@ -1731,6 +1785,10 @@ class AgentHandle:
             ],
             "memory_notes": self._memory_prompt_notes(),
         }
+        contract = getattr(self._runtime, "agent_tool_contract", None)
+        if contract is not None:
+            payload["agent_tool_contract"] = contract
+        return payload
 
     @staticmethod
     def _cache_root() -> Path:
@@ -1844,8 +1902,36 @@ class AgentHandle:
             first_event_latency_ms=_coerce_usage_int(timing.get("call_first_event_latency_ms")),
         )
 
+    def _tool_journal_callback(self, model_call_id: str):
+        memory = getattr(self.manager.strategy, "memory", None)
+        recorder = getattr(memory, "record_agent_tool_action", None)
+        if not callable(recorder):
+            return None
+
+        def record_private_action(record: dict[str, Any]) -> None:
+            recorder(
+                action_id=record["action_id"],
+                tool_name=record["tool_name"],
+                purpose=record["purpose"],
+                status=record["status"],
+                arguments_sha256=record["arguments_sha256"],
+                agent_name=self.name,
+                model_call_id=model_call_id,
+                error_type=record.get("error_code"),
+            )
+
+        return record_private_action
+
     def _replay_cached_side_effects(self, result: AgentRunResult) -> None:
+        from .runtime import _wrap_agent_tool_callable, agent_purpose_parameter_name
+
         bound_tools = {tool.name: tool for tool in self._ensure_bound_tools()}
+        context = {
+            "agent_name": self.name,
+            "model_call_id": result.cache_key,
+            "tool_calls": [],
+            "tool_journal_callback": self._tool_journal_callback(result.cache_key),
+        }
         for event in result.tool_calls:
             tool_name = event.tool_name
             if not tool_name:
@@ -1858,8 +1944,19 @@ class AgentHandle:
             if not bool(tool.metadata.get("replay_on_cache")):
                 continue
             payload = event.payload if isinstance(event.payload, dict) else {}
-            with agent_tool_context({"agent_name": self.name, "model_call_id": result.cache_key}):
-                tool.function(**payload)
+            if (result.payload or {}).get("agent_tool_contract") == "private-purpose-audit-v1":
+                purpose_name = agent_purpose_parameter_name(inspect.signature(tool.function).parameters)
+                if purpose_name not in payload:
+                    raise RuntimeError("Cached agent tool replay is missing its private purpose.")
+                replayed = _wrap_agent_tool_callable(tool, context)(**payload)
+                if isinstance(replayed, dict) and replayed.get("tool_error") is True:
+                    raise RuntimeError("Cached agent tool replay failed; its completion was not confirmed.")
+            else:
+                # Custom programmatic runtimes do not use ADK's agent argument.
+                # Adapter-generated payloads carry an explicit runtime marker.
+                # Ordinary domain arguments must never select that protocol.
+                with agent_tool_context(context):
+                    tool.function(**payload)
 
     def _derive_warnings(self, result: AgentRunResult, runtime_context: dict[str, Any]) -> list[dict[str, Any]]:
         warnings: list[dict[str, Any]] = []
@@ -2146,8 +2243,10 @@ class AgentHandle:
             strategy = self.manager.strategy
             should_replay = bool(getattr(strategy, "is_backtesting", False))
             if should_replay:
+                from .replay_cache import has_failed_tool_result
+
                 cached = self.manager.replay_cache.load(cache_key)
-                if cached is not None:
+                if cached is not None and not has_failed_tool_result(cached):
                     result = self._result_from_cached(cached, cache_key)
                     result.payload = {
                         **(result.payload or {}),
@@ -2187,6 +2286,7 @@ class AgentHandle:
                 include_builtin_skills=self.include_builtin_skills,
                 builtin_skill_fingerprint=skill_fingerprint,
                 model_call_id=cache_key,
+                tool_journal_callback=self._tool_journal_callback(cache_key),
                 provider_prompt_cache_key=_provider_prompt_cache_key(
                     agent_name=self.name,
                     model=model_name,
@@ -2387,6 +2487,7 @@ class AgentHandle:
             }
             trace_path = self._write_trace(result, trace_payload)
             result.payload = {
+                **(result.payload or {}),
                 "trace_path": trace_path.as_posix(),
                 "warnings": result.warnings,
                 "execution_outcome": execution_outcome,

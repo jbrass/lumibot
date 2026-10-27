@@ -1,5 +1,362 @@
 # Changelog
 
+## 4.6.31 - 2026-10-27
+
+### Added
+- Perpetual contract terms retain exchange contract size, settlement currency and linear/inverse exposure through assets and positions. Backtesting uses those terms for collateral, realized PnL and explicit historical funding events, with provider-backed historical symbol discovery and documented data/fee approximations.
+- Kalshi completed-candle backtesting reuses PandasData and BacktestingBroker with normal Strategy functions: selected-outcome netting/collateral, historical bid/ask execution, actual-time cash settlement, and configurable fee estimates. Real archived-data simulation and existing-provider regressions verified; depth, queues and full historical fee schedules remain explicit approximations.
+- Kalshi historical Bars through normal single/plural data functions: current/archive routing, fixed-point schema normalization, selected NO OHLC/quotes, complete bounded windows and completed custom-interval aggregation. Populated current/archive reads verified in demo and the public production API.
+- Kalshi selected YES/NO trading through normal Strategy order, position, quote and callback methods: metadata-driven routing/ticks, limit and marketable IOC orders, amend/cancel, REST polling, actual fill fees and cumulative reconciliation. Demo whole and fractional execution and netting verified; advanced product and live settlement qualification remains separate.
+- Optional selected-outcome identity on the existing prediction-contract asset, retained through orders, positions and strategy backups. Existing token-ID assets keep their wire shape and identity. Prediction partial-fill averages retain sub-cent precision and zero position marks survive serialization.
+- Kalshi account-read foundation: existing Broker/DataSource interfaces, shared native client, Ed25519 and RSA signing, demo/production configuration, scoped balances and public metadata. The account check uses normal Strategy cash/equity methods; funded-flat demo account values are verified. Current demo API `portfolio_value` excludes cash despite the older changelog description; total adds cash and holdings once.
+
+### Fixed
+- Agent replay identity includes dependency versions and callable implementations; explicit failed tool results no longer block fresh recovery, while compatible successful decisions remain reusable.
+- Standard reduce-only orders retain their close-only intent in Kalshi trading and backtests. Completed Alpaca fills tolerate rounded broker averages without duplicate callbacks; failed funding-history downloads are not repeated on every simulated bar.
+- Contract-metadata and missing-price failures use useful broker errors, and native qualification exports accept automatically replenished informational usage windows.
+- Prediction-market guides and broker discovery include Kalshi, and documentation builds preserve authored API examples instead of replacing them with generated stubs.
+- Kalshi orders accept the normal caller-supplied client order ID while retaining protected request fields, reconciliation checkpoints and no-replay submission behavior.
+- Ordinary stock fill accounting does not access prediction-contract data resolution. Public order explanations keep account-relative sizing in their separate private decision summary.
+- Agent qualification saves completed actor evidence before judging and resumes interrupted judges without replaying actors. Audit checks match the SDK's executed declared arguments while retaining raw requests and rejecting changed recognized arguments.
+- Stock answers derive reported date windows from the selected rows, and undated-source research distinguishes an unknown exact date from a labeled contextual estimate.
+- Documentation distinguishes Python, AI-native and hybrid strategies, shows editable AI prompts and a complete Python example, and gives coding-assistant connection its own section. The homepage and README link to detailed guides instead of repeating them.
+- Documentation explains LumiBot and the AI strategy workflow before hosted setup, replaces duplicate client install badges with one setup-guide button, and keeps shared connection panels compact on desktop and mobile.
+- Option tool descriptions distinguish quote evidence from Greeks and require both for every final opening leg, including protective wings. Agent eval judging follows explicit rubric requirements without adding an unstated SQL cutoff predicate; a recorded safe date-only selection protects that distinction alongside existing unsafe-source controls.
+- Continuous strategies stop scheduler dispatch before joining running jobs, outside the scheduler's jobs lock. An iteration reading its next run can finish before broker cleanup, rather than deadlocking shutdown.
+- Release history and pagination checks isolate both shared-cache modes, preserve provider-instant/cutoff assertions and verify actual sparse-history expansion without another synthetic client's cached bars.
+- Phemex derivatives retain settlement wallet selection and early balance snapshots; missing optional wallet metadata no longer narrows supported account discovery.
+- Phemex streamed account snapshots reconcile each settlement currency independently, retaining other collateral balances and open orders.
+- Bitunix order submission honors the account's existing hedge or one-way mode instead of changing it implicitly. Explicit mode changes remain available; close sides and hedge-leg selectors follow the confirmed mode.
+- Agent subscription usage remains informational and qualification awaits completed model/tool work instead of imposing response or turn deadlines.
+- Alpaca polling delivers a confirmed fill even when account synchronization already copied its terminal status. Cumulative fills retain their unprocessed quantity and price, repeated observations do not duplicate callbacks, and SDK UUID identifiers match serialized identifiers.
+- Historical research can produce disclosed date, quantity and valuation estimates without demanding an exhaustive archive. Instructions retain known-future exclusions, separate snapshot and transaction dates, and use explicit UTC values for mixed-offset source tables.
+- Agent tools retain complete new results, including typed rows and error fields. Context-window pruning still removes older history only when the conversation is oversized.
+- `lumibot connect botspot` handles odd server answers cleanly: a JSON "Not Found" from a server without code login still falls back to the key page, a 429 or 5xx while waiting for approval keeps polling instead of stopping, a non-object answer gives a clear error instead of a traceback, and a missing or invalid `interval`/`expires_in` uses the RFC 8628 defaults.
+
+Deploy marker: `51f8a06601c8ff44d5d34a7d7128dd33c7926110`.
+
+Qualification: 6,330 offline unit tests, 316 offline backtests and 719 affected documentation checks passed. Repaired-source native qualification verifies 105 actor trials and 92 judge controls on the pinned SDK tuple; the original provenance is retained. An isolated wheel install preserves selected YES/NO identity and standard reduce-only intent, with all 323 installed dependencies compatible.
+
+## 4.6.30 - 2026-10-24
+
+### Added
+- `lumibot connect botspot` is one command with no copy and paste: it shows a short code and opens the BotSpot sign-in page (a free account is created if needed). Once the code is approved, BotSpot creates a key for you; the command checks it and writes `BOTSPOT_RESEARCH_MCP_URL` and `BOTSPOT_RESEARCH_MCP_TOKEN` to `.env`. The key is never printed. Standard OAuth 2.0 device login (RFC 8628: polling interval, `slow_down`, denied and expired codes). New flags `--api-url` (or the `BOTSPOT_API_URL` environment variable) and `--timeout`; `--token`, `--paste` and `--no-browser` keep working. A BotSpot server without code login falls back to the key page flow instead of failing.
+- `lumibot init` writes an `AGENTS.md` next to `strategy.py` with short notes for AI coding assistants and one line about the free BotSpot MCP (`lumibot connect botspot` or https://mcp.botspot.trade/mcp). It is written only when missing and never overwritten, not even with `--force`.
+
+## 4.6.29 - 2026-10-24
+
+### Added
+- Alpaca configuration accepts caller-owned SDK clients through `TRADING_CLIENT`, `STOCK_CLIENT`, `CRYPTO_CLIENT` and `OPTION_CLIENT`. Explicit constructor clients take precedence, and default data-source construction retains the configured clients.
+- Docs: new page "Use LumiBot with Claude Code, Codex and Cursor" (`claude_code_codex_cursor.html`). It installs the free LumiBot trading skills (`Lumiwealth/lumibot-trading-skills`) with one command and connects the free BotSpot MCP. Linked from the home page, getting started, the AI agent guide and the sidebar.
+- Docs: new comparison pages `lumibot_vs_freqtrade.html` and `lumibot_vs_backtrader.html`. The LEAN, OpenAlice and TradingAgents pages gain at-a-glance tables and dated sources (checked October 24, 2026). Every comparison page ends with the skills and BotSpot MCP call to action. All existing URLs are unchanged.
+- Docs and README: one-click "Add to Cursor", "Add to VS Code" and "Add to Claude" buttons for the free BotSpot MCP, in the shared BotSpot MCP callout, at the top of the new page and on the README BotSpot MCP line. Claude has no documented pre-filled connector link, so its button opens Customize > Connectors and the text gives the address to paste.
+- README: one line pointing Claude Code, Codex and Cursor users to the trading skills repository.
+- `CITATION.cff`, a PyPI "Changelog" project URL and extra PyPI keywords (`ai-agents`, `agentic-trading`, `llm`, `ccxt`).
+- Test: `tests/test_docs_coding_assistant_and_comparisons.py` fails if the new pages, their links, the call to action or the install buttons disappear.
+
+### Fixed
+- Docs: the Crypto exchanges menu listed Alpaca twice. It now shows Alpaca once (its native broker page); the Alpaca exchange page and URL stay published.
+- The GitHub Sponsor link (`.github/FUNDING.yml`) pointed at the frozen `version/4.5.92` branch; it now points at the live partnerships page.
+
+## 4.6.28 - 2026-10-23
+
+### Added
+- Alpaca adapters accept caller-owned trading and stock, option, and crypto data clients. Injected clients own their authentication, use the existing order-polling lifecycle, and remain configured after data authentication resets. Standalone API-key and OAuth connections keep their existing behavior.
+- Trading-only keys for DEX wallets: Paradex subkeys (`PARADEX_L2_PRIVATE_KEY`, `PARADEX_L2_ADDRESS`), existing Lighter API keys (`LIGHTER_API_KEY_PRIVATE_KEY`, `LIGHTER_API_KEY_INDEX`, `LIGHTER_ACCOUNT_INDEX`, `LIGHTER_LIBRARY_PATH`) and the dYdX Chain mnemonic (`DYDX_MNEMONIC`) replace the main wallet private key when set. Offline tests only so far.
+- Docs: every generated CCXT exchange page includes the shared BotSpot MCP callout (`docsrc/_snippets/botspot_mcp_callout.rst`) and a "Fees and partner IDs" section; 31 exchanges that list spot and perpetuals (with CCXT position reads) gain a perpetual example. Every page example now runs a full iteration offline: the fake exchange fills the order, LumiBot processes the fill and the position appears after a normal position sync. The Lighter "set builderFee False" workaround text is gone.
+- Opt-in live order proof for Coinbase, Kraken, Kraken Futures and Coinbase International (`tests/test_ccxt_live_orders_apitest.py`): skipped unless `LUMIBOT_LIVE_CCXT_ORDER_TESTS=1` and keys are set.
+- Startup tip: when a backtest or live run starts (`Trader.run_all`) and BotSpot is not connected, LumiBot logs one clean block saying the BotSpot MCP is free and how to connect it (`lumibot connect botspot`, https://botspot.trade/agents). Once per run, shared with the agent research hint, never raises, hidden in CI and when `BOTSPOT_RESEARCH_MCP_TOKEN`, `BOTSPOT_RESEARCH_MCP_RENEW_URL` or `BOTSPOT_API_KEY` is set. New env var `LUMIBOT_HIDE_BOTSPOT_TIP=1` silences it (`LUMIBOT_NO_BOTSPOT_HINT=1` still works).
+- Docs: a "Frequently asked questions" section on every hand-written broker page, the backtesting data-source pages and the top docs pages by search impressions. Each FAQ is emitted as FAQPage JSON-LD (`_add_faq_schema` in `docsrc/conf.py`, rendered from `_templates/base.html`, which is the template Furo actually uses; the old FAQ page schema in `layout.html` never rendered).
+- Docs: one shared BotSpot MCP callout (`docsrc/_snippets/botspot_mcp_callout.rst`) near the top of broker, exchange, backtesting, getting started, AI agent pages and the homepage, plus a "Why connect the free BotSpot MCP" section on the BotSpot MCP page.
+- Docs: brokers grouped in the sidebar (Stocks & options, Futures, Crypto exchanges, Prediction markets, Backtesting data sources) and an all brokers A to Z page with a filter box. Every exchange guide sits directly under "Crypto exchanges" with its plain name. Page URLs are unchanged.
+- Docs: an asset-class table (stocks, options, futures, crypto, forex, prediction markets) on the brokers page, each broker listed under every asset class it trades (new Options and Forex groups), and the Bing Webmaster verification file for lumibot.lumiwealth.com.
+
+### Changed
+- CCXT partner IDs and builder fees: CCXT tags orders with its own partner ID on many exchanges (Binance, Bitget, MEXC, BingX, HTX, OKX, Bybit, Phemex, Coinbase, Gate, KuCoin, Bitmart, Blofin, Coinex, Crypto.com, Paradex and others) and adds an extra user-paid builder fee on Hyperliquid, Lighter, GRVT, Aster, Pacifica and Extended, plus a CCXT referrer on Hyperliquid. LumiBot now removes CCXT's IDs, turns CCXT's builder fees and referrer off, and attaches only its own configured IDs (`LUMIBOT_CCXT_PARTNER_IDS`, default empty). A builder fee is added only when configured (`LUMIBOT_CCXT_BUILDER_FEES`) and is logged as a warning because it costs the user extra. New `lumibot.tools.ccxt_partner_ids`, applied to every CCXT client LumiBot creates. HTX perpetual orders, WOO X, WOOFi Pro and ModeTrade still carry CCXT's tag because CCXT re-adds it while signing.
+- CCXT market types follow the Bitunix futures model: an exchange-style contract symbol such as `BTCUSDT` resolves to the perpetual, an opening order on an asset created with `leverage` above 1 sets that leverage once (closing orders and the default 1x never change it), dated futures use their full CCXT symbol, and CCXT option markets map to LumiBot option assets (base, expiration, strike, right). Positions are read for every contract type the exchange lists (swaps, then dated futures and options); swap-only accounts make the same single call as before.
+- Docs: titles and menu labels no longer say "CCXT" (the CCXT library is still named in the body). The BotSpot MCP is described as free to connect; paid plans apply only to some heavier features.
+- README: 100+ brokers and exchanges with links to the A to Z list, and a free BotSpot MCP line below the existing top links (which are unchanged).
+
+### Fixed
+- Simple moving averages over a finite window now request and validate only the history that window needs (positive offsets included), grow smaller lazy caches and keep causal slicing. Custom, recursive and explicit-window calculations keep their existing history contract.
+- Alpaca authentication diagnostics no longer print OAuth token prefixes, raw authentication response bodies, or application-specific sign-in addresses.
+- Docs: the BitMEX page said `BACKTESTING_DATA_SOURCE=bitmex`, which raises "Unknown BACKTESTING_DATA_SOURCE". It now says `ccxt` with `exchange_id="bitmex"`.
+- Docs: the generated Bybit page had the same mistake (`BACKTESTING_DATA_SOURCE=bybit`). The exchange page generator now always writes `ccxt` plus the `exchange_id`, and a test fails if any exchange page uses an exchange id there.
+
+## 4.6.27 - 2026-10-23
+
+### Changed
+- AI agents may use sources with no date in backtests. They still prefer dated sources and never open a document known to be from after the backtest time, but an undated page or file is now used with an estimated publication date that the agent discloses, instead of being refused. The web-documents and research-data skills, the backtest rules in the agent prompt and the `read_document` description say so. Live trading applies no publication-date rules, and the backtest-only document-manifest rule no longer appears in live prompts. New evals: `web_documents_undated_source_estimated_date`, `web_documents_known_future_document_not_opened`, `web_documents_live_undated_source_used_freely`.
+
+### Fixed
+- Interactive Brokers Client Portal history no longer goes through the shared bar cache. The gateway answers "the last N bars" in trading time (at night a one-minute read returns the 16:00 bar), which the cache's calendar windows filtered away: 4.6.25 and 4.6.26 returned no bars for those reads (Bot Manager Dev scheduled smoke, Oct 23). Reads go straight to the gateway as before.
+- The shared bar cache never builds a connection scope from a provider name alone; without an account or key a read is not shared.
+- Bitunix HEDGE mode: a long and a short position on the same symbol are tracked as two positions with `position_side` and `position_id` (the exchange `positionId`). Before, a snapshot holding both raised and positions could not sync. Closing selects the right `positionId`, closing without a selector closes both, and opening and polled orders record the position they trade. Single-position behavior is unchanged.
+- Position sync updates a tracked position that has no side yet in place when the broker first reports its side, keeping its strategy owner, instead of replacing it with an ownerless copy.
+- CCXT: read hedge legs from native `positionIdx` (1 long, 2 short) and `holdSide` fields, and never store an order's buy/sell direction as a position leg.
+
+## 4.6.26 - 2026-10-23
+
+### Added
+- Every CCXT exchange is selectable from the environment: `TRADING_BROKER=<ccxt id>` (or `DATA_SOURCE`) with `<EXCHANGE>_API_KEY`, `_API_SECRET`, `_API_PASSPHRASE`, `_UID`, `_PRIVATE_KEY`, `_WALLET_ADDRESS` and friends, read from each exchange's own CCXT `requiredCredentials`. Before, only Coinbase, Kraken and WEEX worked this way. Missing credentials name the exact variables; exchanges without historical candles raise a clear error on history reads. New `lumibot.tools.ccxt_exchange_catalog` prints every installed exchange with its credential variables and capabilities as JSON. Offline coverage constructs all 105 CCXT 4.5.64 exchanges and submits a unified order on all 88 spot exchanges.
+- Docs: per-exchange CCXT pages generated from installed CCXT metadata plus hand-checked exchange notes (`scripts/generate_ccxt_exchange_facts.py`, `scripts/generate_ccxt_exchange_pages.py`, `docsrc/_data/`). 88 exchange pages (every CCXT exchange whose official pages could be checked; the 17 others are listed with reasons under `skipped` in the notes file), each with sign-up and API key or API wallet steps, a `.env` connect snippet, a regular example (a perpetual version for exchanges with no spot market, limit orders where CCXT has no market orders) and a one-agent agentic example. Short on-page titles for phones with the full search title kept in the HTML title through `:seo_title:`. `tests/test_ccxt_exchange_docs.py` runs every page example offline against a fake exchange with network requests blocked.
+
+### Fixed
+- Shared history cache: Schwab, Tradier, IBKR and CCXT history return the broker's own bars again when a bar is internally inconsistent (Tradier SPY 2024-12-19 has its close below its low). 4.6.25 rejected the whole answer, so Tradier charts came back empty on Dev. Only Alpaca keeps its existing strict OHLCV check.
+- Shared history cache on workers with a remote store: the local Parquet write now runs on the background uploader too, so a cache miss returns right after the broker answers (Dev Lambda misses spent 1.4-3.6 s writing before answering). New `shared_bar_cache.prewarm()` loads the Parquet engine and S3 client in the background for one-request worker processes.
+
+## 4.6.25 - 2026-10-23
+
+### Fixed
+- Resolve CCXT perpetual instruments with settlement and contract-size metadata, preserve hedge legs through native requests and convert linear/inverse fills consistently. Phemex account and V2 stream routes follow product metadata across settlement currencies. Crypto-future execution callbacks no longer debit full spot notional from cash.
+- Add one managed CCXT Pro client per broker for live market data and account order updates, with cumulative-fill reconciliation, REST public-data fallback and explicit shutdown. Public Phemex testnet spot, USDT and inverse streams passed; USDC public production streams passed, while USDC testnet remains unavailable in the observed checks. Authenticated testnet trading and perpetual backtesting remain unqualified; see the CCXT guide.
+- Preserve optional derivative position sides and IDs through order fills, position synchronization, serialization and closing. Separate hedge legs no longer overwrite one another; single-position lookup accepts leg selectors and closing without a selector closes both legs.
+- CCXT spot trading uses the unified order and balance contracts across installed exchange adapters, removing hard-coded exchange approval lists. Use CCXT precision and trigger parameters, preserve crypto wallet dust, correct holdings valuation and cancellation, and accept optional order fields. Offline coverage includes Phemex, Coinbase, Kraken, KuCoin, OKX and Bybit; authenticated testnet trading remains unqualified.
+- Restore normal MCP endpoint handling for automatic BotSpot connections, including private HTTP endpoints, URL authentication, query parameters and fragments. Remove the extra BotSpot-specific URL policy; retain sanitized configuration notices and the shared client's token-renewal checks.
+
+### Changed
+- One shared history cache for every broker (`lumibot/tools/shared_bar_cache.py`). Schwab, Tradier, Interactive Brokers (Client Portal) and CCXT live history now read through it, alongside Alpaca charts and Alpaca backtests. Repeated reads of settled bars make no broker call; live reads fetch only the still-open tail.
+- Completed bars no longer expire (the old Alpaca cache dropped closed months after 24 hours and never stored the current month). Split- or dividend-adjusted history is re-checked against the broker and rebuilt when old prices change.
+- Cache uploads to S3 run in the background; the caller gets its bars after the local write only. Remote partitions load in parallel.
+- New settings: `LUMIBOT_SHARED_BARS`, `LUMIBOT_SHARED_BARS_SCOPE`, `LUMIBOT_SHARED_BARS_SETTLE_MINUTES`. Design: `docs/SHARED_BAR_CACHE.md`.
+
+## 4.6.24 - 2026-10-21
+
+### Fixed
+- IBKR stock history continues with native split-adjusted prices when optional corporate-action metadata is unavailable or stale. Unknown actions are reported as warnings, isolated from verified action caches, and never converted into invented splits or dividends. Added a portable IBKR backtest-engine regression that completes and fills an order with the metadata service unavailable.
+
+### Changed
+- Preserve source-compatible native AI qualification at its original source, model, usage and time. Independently verify immutable Git source and reject changes to actors, judges, cases, fixtures, shared code or dependencies; external IBKR provider repairs do not purchase unchanged Pandas-fixture inference again.
+
+## 4.6.23 - 2026-10-20
+
+### Added
+- `lumibot connect botspot` checks a BotSpot Research key and writes `BOTSPOT_RESEARCH_MCP_URL` and `BOTSPOT_RESEARCH_MCP_TOKEN` to `.env`.
+- The "BotSpot research is not connected" notice now explains what the connection gives and how to set it up, shows once per process, stays silent in CI, and can be hidden with `LUMIBOT_NO_BOTSPOT_HINT=1` or `DO_NOT_TRACK=1`. `llms.txt` describes the optional connection for coding agents.
+- Nonrenewable ChatGPT plan run profiles with request-level call/token admission, private resumable usage receipts and pinned account/model selection. Normal provider connections are unchanged; this does not deploy or provision a hosted subscription integration.
+
+### Fixed
+- External BotSpot research connections: validate managed Research MCP endpoints even for static external keys (HTTPS outside loopback, no credentials in URLs, sanitized configuration notices). Construction contract tests stay offline.
+
+### Changed
+- Release qualification: 18 cases, 90 required repetitions, 87 judge controls passed on Luna through ChatGPT plan login ($0 API spend, about $5.73 equivalent upper bound). Three first attempts were retried and passed: one 600s inference timeout (rules override), a missing unbounded-read disclosure in the researcher handoff, and a five-day average computed over seven bars.
+- Restore the BotSpot and MCP links at the top of the README and put "Build and Deploy with BotSpot" and "BotSpot MCP Integration" first in the docs sidebar.
+
+## 4.6.22 - 2026-10-19
+
+### Changed
+- Requalify the complete real-model actor and judge catalog for the broker timestamp fixes. The 4.6.21 publication was blocked by its previous-source qualification receipt and was not published.
+
+## 4.6.21 - Publication blocked
+
+### Fixed
+- Preserve UTC epoch instants in Schwab historical candles before converting to the configured timezone. Previously bars shifted by the UTC offset and could select a prior session at an account cutoff.
+- Keep CCXT candle timestamps and historical cutoffs UTC-aware, including offset-aware endpoints and timeshift requests. Exchange candle opens remain candle opens.
+
+## 4.6.20 - 2026-10-17
+
+### Fixed
+- IBKR stock history: older pages that omit `volumeFactor` no longer throw away real prices. 4.6.19 raised on those pages, so long backtests logged "No price for TQQQ/UPRO, skipping" for years of real bars. Unknown volume units now mark only volume as missing (never guessed); OHLC is kept. A present but malformed factor still fails.
+- Preserve market-data asset identity, unsupported assets through quote and last-price reads, and normalize verified numeric option contract multipliers for valuation.
+
+### Changed
+- Agents may read sources that record only a publication or filing date in backtests; the date-only rule is applied at end of day in the source's timezone.
+- Pelosi AI examples are AI only: one research agent plus one trading agent, both called every iteration.
+- ChatGPT plan connections fail over to the next connected account when one hits a usage limit before any output.
+- Subscription eval token bounds now cover calls, roles and resume; exact observation coverage is required and unpriced eval history is kept.
+- One eval ledger can now hold a full release catalog: the input-token cap is 60M (was 10M); the $20 equivalent allowance stays the binding limit.
+- Release qualification: 18 cases, 90 required repetitions, 87 judge controls passed on Luna through ChatGPT plan login ($0 API spend, about $5.73 equivalent upper bound). Two flaky first attempts were retried and passed: iron condor wings quoted without Greeks, and one post-cutoff report wrongly called eligible in the holdings web-documents case.
+
+## 4.6.19 - 2026-10-16
+
+Deploy marker: `81a24d66ee26a25be1f516e7771f1a386c56417f`.
+
+- Preserve explicit source timezone offsets through historical document reads and reporting. SQL column aliases do not convert timestamps; release qualification retains the observed double-conversion failure as a negative control.
+
+- Report the successful research response's effective time bound separately from requested bounds and calendar filters. A live retry with `asOf: null` must never be reported as historical cutoff proof; preserve the observed failure as a negative release calibration control.
+
+- Make blocked research packets explicitly hand off the next observations or documents, time bound, qualified source type and deferred decision. Preserve historical ceilings, original-version/publication proof and configured-source limits.
+
+- Timestamp verified cloud account balances before slower position, order and funding reads, preserving the real observation time for both continuous and one-shot snapshots. Funding coverage and return calculations remain independently validated.
+
+- Match Schwab funding coverage to the SDK's whole-second wire precision, overlapping inclusive starts inside the one-year request bound. Preserve continuous producer identity after one-shot snapshots.
+- Enforce Luna subscription-only qualification across top-level and nested calls, reject SDK drift before inference, and keep explicit cumulative-allowance amendments append-only. Calibrate numerical-residue and typed-SQL grading against unchanged safe/unsafe controls.
+
+- Send account/window funding-sync evidence through the shared cloud sender. Audit all non-trade Schwab categories; retain known cash while explicitly reporting unresolved transfers/corrections or unavailable history. Drain every pending batch for one-shot account snapshots, preserve receipt identities on retry, and serialize concurrent cloud updates.
+
+- Harden Schwab funding and token storage: use the official one-year transaction-request maximum with bounded historical slices; reject explicit corrections and malformed provider fields without leaking response details. Preserve saved credentials on login/metadata/storage failures, share private atomic writes across login and refresh, and advance adapter token state only after persistence. Validate read-only account discovery and retain its primary error during cleanup. Correct documentation that incorrectly promised a rolling seven-day authorization.
+- Preserve Schwab credentials on SDK startup and account-discovery errors, including HTTP 401; reject unusable account hashes and stop the failed initialization's proactive refresher. Provider error text cannot decide whether to delete a token or enter startup logs.
+
+- Read recent Schwab cash activities through the existing authenticated client, preserving signed funding, provider IDs and provider timezone offsets. Distinguish internal cash/margin and bank-sweep journals from IRA distribution withholding. Subdivide saturated or timed-out large windows; reject unresolved classification, missing currency, incomplete history and truncating limits. Event retrieval does not certify all-time coverage.
+
+- Add an explicit `chatgpt/<model>` agent connection using supported Sign in with ChatGPT, protected local profiles, model discovery, rotating refresh and logout. Subscription transport requires successful stream completion and never falls back to an API key. Support included plan allowance and explicitly authorized existing ChatGPT credits without changing the account-wide usage setting.
+- Move canonical evaluation actors, semantic judges and rubric calibration to subscription funding with a resumable per-call allowance. Reject API-funded eval model selections and remove ordinary provider/broker credentials from fixture processes. Real model qualification and private CI grant wiring remain release requirements.
+
+- Add exact-asset bulk quotes to Strategy and Schwab, retrieve full Schwab option snapshots in one chain request, bound empty-chain fallback and reject unsuccessful chain responses. OptionsHelper can evaluate a supplied snapshot without redundant market reads while preserving exact contract identity and freshness.
+
+- Reconcile broad order refresh through the adapter lifecycle owner, preserving direct-refresh fills, rejection evidence and option underlying identity.
+
+- Persist explicit private agent tool purpose and ordered tool audit events, with separately authorized public order reasons. Preserve typed remote MCP failures, observed execution evidence and managed replay linkage without exposing private journal content as public reasons.
+- Strengthen general research and trading guidance: verify historical document versions and eligible manifests before reading, retain source identities and timing, distinguish live research from unavailable historical replay, use completed intraday signals, and reconcile executable option packages and existing pending orders. Atomic multi-leg backtest fills enforce quoted package limits. Native actor repetitions and unchanged safe/unsafe calibration controls gate publication.
+
+Earlier IBKR qualification marker: `805f00ab67f87bed5dc5591c4ffe18a03695f425` (not a separately published release).
+
+- Recover independently passing native eval cases from their durable ledger after a timeout, even when the final freshness checkpoint was not written. Preserve failed fingerprints and require distinct completed repetitions; this is qualification recovery, not an agent-policy change.
+
+- Allow an explicit `minimum_bars` for generous historical windows. Validate the required tail without changing returned prices, fetch windows, signals or accounting; omitted minima retain strict existing behavior. Reject invalid minima and missing rows inside the declared required lookback.
+- Reuse bounded serialization of overlapping framework input rows. Preserve exact row/frame fingerprints, timestamps, scalar types, signed zero and corrected-price observations rather than repeatedly converting unchanged rolling windows.
+
+- Treat optional indicator cache prefetch separately from required history. Validate actual causal indicator inputs without requiring a nonexistent 10,000-bar cache; explicit history requests and genuine missing inputs remain strict.
+- Preserve bounded framework-observed market input rows, times, instrument identities and frame fingerprints independently of strategy chart annotations. Export explicit incomplete-capture markers and keep option-source observations separate; the diagnostics never alter orders or data validation.
+
+- Preserve concurrently published S3 rows across subsequent IBKR paging checkpoints and final writes. Reuse unchanged corporate-action columns so public daily warm reads do not upload the full cache again.
+
+- Bind IBKR stock Trades caches and in-memory series to a verified current split-event ledger. Refetch under a new identity after a split instead of guessing corrections from price jumps; preserve genuine market moves and existing cache files.
+- Freeze that verified stock ledger across routed IBKR cadences too; reject changed or missing adjustment provenance before merging rows or publishing repaired data. Add routed split-basis regressions and isolate required-data health between corporate-action tests.
+- Normalize explicitly reported IBKR volume units once, and isolate historical caches whose previous units cannot be established. Missing stock Trades units fail visibly rather than silently scaling volume.
+- Require usable corporate-action evidence, clear corrected/deleted events, preserve separately adjusted dividends, and keep transient Yahoo failures retryable. Current-session action coverage and weekend cache eligibility are explicit.
+- Repair incomplete daily stock/index history through the qualified alternate route without replacing valid overlapping prices. Preserve genuine closed-session gaps and exact cold/warm results.
+- Cancel pending raw-share equity orders through the normal broker cancellation path when a split changes their quantity basis; do not silently adjust outstanding orders.
+- Expose sanitized retry causes and verified history bounds for actionable backtest recovery, with regression coverage for valid zero-trade results.
+- Accept recovered daily prices even when an earlier route's telemetry still reports that day missing. Keep the original download evidence and reject genuinely absent rows; direct and routed replays preserve exact bars, signals, fills, cash, holdings and equity.
+- Add frozen real corporate-event engine regressions, independent cash/share/equity ledgers, split-basis cache extension and replay tests, and volume/provenance regressions. No general live-agent prompt or strategy-rule changes are part of these IBKR repairs.
+
+- Keep backtesting position entry basis accurate across additions, reductions, partial fills, reversals, and reopening after a full close.
+- Align documentation canonical URLs and social metadata, generate the sitemap from built pages, repair indicator API links, and clarify onboarding requirements and comparison claims.
+- Keep the synthetic installation example offline by supplying its risk-free rate instead of fetching it from Yahoo.
+
+## 4.6.18 - 2026-10-10
+
+- Qualify research-evidence judge wording with recorded safe answers and unsafe controls. Preserve independently passing eval cases across workflow runs without reviving a newer failed fingerprint; this changes release tooling, not live agent prompts or policies.
+
+- Separately expose each exact option leg's existing pricing inputs and signed contribution in the multi-leg calculator result. Prices, quote-request counts, prompts and trading policies are unchanged; this makes package-price reconciliation auditable after a real-model gate confused quotes from adjacent strikes.
+
+- Reuse complete daily equity warmup without repeated requests for unused calendar padding; the saved TQQQ SMA200 routed replay falls from 19 history reads to one with identical bars, decisions, fills and accounting.
+
+- Value routed intraday IBKR stocks/indexes using prices available at the simulated clock, not a forming candle’s final close. Preserve completed intraday marks only across verified closures.
+
+- Prevent the direct IBKR fast-fill path from executing at a still-forming minute close when Trades cache bid/ask values are derived from that close. Add direct/routed fill parity regressions.
+
+Deploy marker: `20bf01d9603027246ecd853297a0f2c9174b95e2`.
+
+- Preserve IBKR native daily session timestamps in routed backtests. Cold and warm reads now retain the same completed futures bars, and daily equity fills use the current session's open across holidays.
+- Count equity warmup bars through cached exchange sessions and extend an already-prefetched series when a strategy requests a longer lookback.
+- Expire a closed-session futures mark at the exact reopening instant so the direct reader refreshes the new session price instead of retaining Friday's close.
+- Mark routed futures positions from native intraday prices instead of a prior daily candle; bound final direct-IBKR valuation to the simulation endpoint.
+- Export filled trade artifacts when a backtest has no benchmark, and reuse complete dividend/split event frames without extra backward history requests. Pay each dividend on its ex-date, including events later in the prefetched simulation.
+- Strengthen frozen replay fixtures to obey request bounds and qualify both direct IBKR and routed stock/futures accounting, including the 51-close MGC requirement.
+
+## 4.6.17 - 2026-10-10
+
+- Preserve Schwab rejection descriptions and fill callbacks recovered through direct order reconciliation, and preserve deferred broker error objects during synchronization. Account for unobserved partial fills before cancellation, reconcile cancel/fill races from authoritative order state, and retain increasing retry delays through immediately flapping stream logins. Clarify the Strategy API's GTC default and explicit DAY duration for intraday orders without changing intentional GTC orders.
+- Pure closes of a known held IBKR futures contract no longer depend on resolving the current continuous-chart expiry.
+
+Deploy marker: `60e8fc439a661b652cee07b56977da7436ab4f5f`.
+
+- Recover confirmed lost read requests after downloader replacement without waiting out a full attempt timeout. Preserve correlation IDs, total deadlines and transient-failure deduplication; non-read requests are not replayed.
+- Keep required IBKR valuation gaps visible even when the diagnostic ledger retains an earlier known price.
+- Separately correct stock-agent explanations that broaden a checked price-versus-average condition into an unsupported claim about every constituent bar; retain the failed gate and require five targeted repetitions.
+
+- Bind IBKR continuous-futures backtest orders and protective children to physical expiries. Held positions retain their contract after a chart roll; root closes target that held expiry. Ambiguous multi-expiry closes require an explicit contract. This removes artificial roll-spread profit without adding automatic strategy trades.
+
+- Cool down completed, unresolved TWS contract identities for 15 minutes, while checking recovered positive registry entries first. Gateway timeouts remain retryable and identity absence never becomes an absent-price marker.
+- Retain a completed futures trade close during verified maintenance/weekend closure, without bridging unknown open-market gaps.
+- Reconcile Alpaca cancellation/fill races through an exact REST order lookup and normal fill processing, so delayed stream events cannot leave an already-filled smart-limit order pending until the scheduled deadline. Preserve authentication errors and uncertain order states.
+- Restore legacy untagged instrument backups only at initialized Asset paths, retaining saved contract details and ordinary dictionary metadata. Preserve original scheduled-file bytes before applying a recovered variable tree; hosted remote backups must still be retained independently.
+- Keep FRED HTTP and transport failure diagnostics useful without exposing API-key-bearing URLs in agent results.
+
+- Freeze the IBKR delayed-feed availability boundary per backtest, preventing moving-tail repeat downloads; flag decisions requiring data after that boundary while preserving known market closures.
+- Resolve expired NG/CL/MCL through TWS using their exact last-trade date rather than confusing expiry month with delivery month.
+
+- Reuse complete IBKR stock/index intraday series across strategy iterations and pre-market valuation; larger history requirements can still extend the loaded window.
+- Keep the actual futures valuation clock at session openings. The bar reader already marks forming bars at their open; moving the clock into the maintenance gap could omit an open position from equity.
+- Memoize deterministic futures roll-calendar calculations by contract and rule without caching failed calculations.
+- Record unsatisfied strategy history requirements separately from optional prefetch coverage in backtest data-health artifacts.
+- Add frozen-input engine regressions for 250-session stock/SMA histories, intraday fills, futures margin/P&L, and incomplete versus valid zero-trade runs.
+
+## 4.6.16 - 2026-10-09
+
+Deploy marker: `70a36c55151c8bf67255a5bdac8f5f3cbc3917c5`.
+
+- Futures intraday cache readers evaluate the next aligned bar at a partial starting boundary. An hourly request beginning inside Friday's final hour reuses the complete cached Sunday-to-Friday history instead of repeatedly requesting the closed weekend. Available missing bars and next-session gaps remain retryable.
+- Verified the original deployed October 2 20:16 boundary with 21 configured futures roots, and preserved minute, 5-minute, 15-minute, 30-minute and hourly missing-bar checks.
+
+## 4.6.15 - 2026-10-09
+
+- Reinforce publication-date selection before opening historical documents and explain existing pending-order coverage in the final decision.
+- Retain the stable intraday history boundary for futures, corrected option topology and provenance, and strict release gates.
+
+## 4.6.14 - 2026-10-09
+
+Deploy marker: `77722ef91750a415ba1ea47fcb783b288c7fc116`.
+
+- Carry forward the unpublished 4.6.13 delayed-futures boundary and shared provenance/date-cutoff corrections.
+- Require the existing general option-structure reference and verified opening-leg topology before package pricing. A real release-gate failure reversed one credit spread and incorrectly treated the resulting near-zero package as unavailable market evidence; the unchanged execution case and judge remain production blockers. Closing-side derivation and no-trade safety remain intact.
+
+## 4.6.13 - 2026-10-09
+
+This candidate did not publish: its real-model gate failed an opening option-package topology case. The reviewed repairs carry forward into 4.6.14.
+
+Deploy marker: `3d2635ac8eb98e49f56963e3107b9af00f22fbb5`.
+
+- Carry forward the unpublished 4.6.12 fix for explicit/continuous futures intraday history: clamp current windows and pager overlap to the stable 20-minute boundary, and report wholly unavailable recent windows as partial without caching absence.
+- Strengthen existing shared agent skills after three real release-gate failures: retain returned dataset IDs in final evidence packets, require an actual tool-computed aggregate before attributing a calculation to a tool, and select date-eligible filing links before opening them in a backtest. Existing cases and judge rubrics remain unchanged; preserved failure receipts are in `agent_eval_baselines/2026-10-09_release-4612-provenance-and-cutoff-failures.json`.
+- Reduce the publication eval spending cap to $1.00 while preserving every case, repetition, production blocker and resumable ledger. Standalone targeted validation retains its explicit per-run cap.
+
+## 4.6.12 - 2026-10-09
+
+This candidate did not publish: the required real-model gate failed. Its reviewed futures fixes carry forward into 4.6.13.
+
+Deploy marker: `00c1fb02ec87735b4812ff3f75ba4564a14b544d`.
+
+- IBKR explicit and continuous futures intraday history use the existing 20-minute stable provider boundary. The pager cannot shift the newest page past that boundary, including hourly requests. Previously delayed futures tails could reject the first page and repeatedly postpone otherwise available history. Wholly unavailable current windows report partial health without probing or caching absent prices; completed older pages, daily candles and snapshot APIs retain their separate behavior.
+
+## 4.6.11 - 2026-10-09
+
+Deploy marker: `8bce7c91`
+
+- IBKR futures daily candles exclude the first intraday bar of the next session. Previously the inclusive closing boundary could change the completed day's OHLC and volume using the next session's first hour. Hourly aggregation and minute fallback now use the same exclusive close boundary.
+- Release qualification recovers pruned option-close results only from the unique actual broker parent linked to the decision journal. It retains resolved sides, quantities and expiration without weakening order or model-judge checks.
+- Includes the stock/index daily date and cache migration, private order-decision journals and explicit Community client described under 4.6.10. That tag's publication gate failed before any PyPI publication or downstream rollout; 4.6.11 carries the complete reviewed source forward.
+
+## 4.6.10 - 2026-10-09
+
+Deploy marker: `18d8f25a2489e63a4a612967527b03993a529f49`
+
+- IBKR TWS stock/index daily bars preserve their provider session date before timezone conversion. Previously UTC-midnight date labels appeared on the preceding US calendar day. Daily cache files use a new session-date key so legacy files containing mixed shifted TWS and correctly dated REST prices are rebuilt from provider data without deleting old files or invalidating intraday and futures caches.
+
+- Added an explicit Community client for owner-authorized posting with a dedicated scoped key. Trade verification stays server-owned, and transport errors are never retried automatically.
+
+- Agent order submissions, modifications and cancellations require an explicit, bounded explanation committed to the private memory journal before broker execution. Orders, compact progress and fill exports retain decision/action references; modifications preserve prior actions. Existing deterministic Python strategies remain compatible. Unknown broker outcomes are recorded without automatic retries. A real-model release regression verifies the journal links and explanation quality.
+
+## 4.6.9 - 2026-10-09
+
+Deploy marker: `53f52ae12e5aa32c6d31c356100118b408be25a0`
+
+- IBKR futures readers hydrate the shared exchange metadata before resolving contracts, so an empty local cache can use the published COMEX/CME history without another broker lookup. Missing or unavailable shared metadata retains normal provider discovery.
+- Futures daily history fetches only sessions whose completed daily bars were requested. Calendar padding no longer causes unnecessary provider requests for adjacent days or future sessions when the requested history is already cached.
+
+## 4.6.8 - 2026-10-08
+
+Deploy marker: `f28456aed5d4e0ef5021d4a39055ad1aef7d2ed8`
+
+- Gold (GC/MGC) continuous futures roll seven exchange business days before first notice, instead of seven weekdays before the last trade inside the delivery month. COMEX first notice is the last business day of the prior month; the seven-day offset remains LumiBot's synthetic convention. Contract expiration dates and explicit dated-contract requests retain the actual last-trade rule. This prevents selecting the thin October delivery contract during October, which had no October 2 bars while December had real hourly trades.
+
+## 4.6.7 - 2026-10-08
+
+- IBKR history no longer treats a positive page containing only older bars as confirmed absence of newer bars. Those old inferred tail markers and ambiguous daily markers are retryable, so available completed sessions replace placeholders while explicit no-data responses retain their retry delays and existing real bars are preserved.
+- IBKR history paging stops if the provider keeps returning a page that cannot advance the requested cursor, preserves the real bars already received, and reports partial history instead of looping indefinitely.
+- Futures daily history reports missing completed sessions in history health, including an entirely empty result, instead of silently returning a shorter series with no coverage diagnostics.
+- Natural gas (NG) continuous futures use monthly delivery contracts and expire three trading days before the delivery month. They previously inherited quarterly equity-index months and a third-Friday expiry, which IBKR could not resolve. The shared roll schedule uses the existing five-business-day energy convention before expiry.
+- The calendar dependency requires `pandas_market_calendars>=5.4.0` for the CME expiry business-day calendar. This keeps Thanksgiving and other settlement holidays out of NG expiry calculations even when Globex trades a shortened session.
+
+Deploy marker: `c3e02b504a08e41e6ec16cd0eb5a7627db69736b`
+
+### Fixed
+- IBKR shared contract-registry publication uses conditional writes and preserves unrelated corrected remote IDs. Expired futures absent from REST can be discovered through the shared downloader's bounded TWS contract endpoint. Missing continuous-futures roll segments report partial history, and weekend closure uses Friday 17:00 through Sunday 18:00 New York wall time across daylight-saving changes. Downloader requests have one total deadline covering concurrency, submission, polling and retry waits, so resubmissions cannot wait indefinitely.
+- Routed backtests (BotSpot's botspot_auto, IBKR stocks): an intraday strategy that loads minute bars is now valued on them. Portfolio valuation asks for a price snapshot first, and the snapshot switched to yesterday's daily close whenever any daily series existed (a benchmark or indicator history), so the value stayed flat all session. Strategies that never load intraday bars keep the daily shortcut and download no minutes. Real IBKR check: value equals cash plus 10 SPY at the current minute price at every 30-minute step on 2026-09-23.
+- All copyable AI examples now default to GPT-6 Luna. Ray Dalio examples use high reasoning to match the challenge and Marketplace copy; Citadel no longer overrides the framework default with Gemini. Legacy M2 provider-named examples also default to Luna. Setup instructions now require the matching OpenAI key, while historical results retain their original model labels.
+
 ## 4.6.6 - 2026-10-07
 
 Deploy marker: `3ad90cf2ef071f9e34e9fb0c140618545624c4b2`
@@ -1812,7 +2169,7 @@ Deploy marker: 61b75f24 (`deploy 4.5.6`)
 > the `Strategy.indicators` subsystem.
 
 ### Added
-- **`Strategy.backtest()` now honours `BACKTESTING_START` / `BACKTESTING_END` env vars as overrides for hardcoded `backtesting_start`/`backtesting_end` args.** Strategies typically pin dates in their `if __name__ == "__main__":` block for local dev convenience. When the same code runs in a managed container (bot_manager backtest ECS task, BotSpot MCP `start_backtest`, etc.) the orchestrator sets these env vars from the caller's requested date range — previously those env vars did nothing, the hardcoded datetimes won, and MCP callers had no runtime control over the window. New precedence: env var (if present and parseable) > passed arg. Accepts ISO date (`YYYY-MM-DD`) or full ISO datetime; malformed values are logged and the passed arg is preserved (no silent fallback to the epoch or `now`). Unit tests in `tests/test_strategy_backtest_env_override.py` cover both shapes, empty-string handling, parse failures, and the no-env-set baseline.
+- **`Strategy.backtest()` now honours `BACKTESTING_START` / `BACKTESTING_END` env vars as overrides for hardcoded `backtesting_start`/`backtesting_end` args.** Strategies typically pin dates in their `if __name__ == "__main__":` block for local dev convenience. When the same code runs in a managed container (for example, a caller-configured backtest runner) the orchestrator sets these env vars from the caller's requested date range — previously those env vars did nothing, the hardcoded datetimes won, and MCP callers had no runtime control over the window. New precedence: env var (if present and parseable) > passed arg. Accepts ISO date (`YYYY-MM-DD`) or full ISO datetime; malformed values are logged and the passed arg is preserved (no silent fallback to the epoch or `now`). Unit tests in `tests/test_strategy_backtest_env_override.py` cover both shapes, empty-string handling, parse failures, and the no-env-set baseline.
 - **`Strategy.indicators` subsystem.** New per-strategy indicator accessor that computes any indicator over the full bar series once, then hands back the value at the current bar in O(1) on every subsequent call. Eliminates the per-iteration `df.rolling(...).apply(...)` full-history recompute pattern that dominated wall-time on indicator-heavy strategies. Exposes the entire pandas-ta-classic surface (~130 indicators) via `self.indicators.<indicator>(asset, **kwargs)` passthrough plus `self.indicators.custom(name, fn, asset, **kwargs)` for user-defined indicators. Same API for backtest and live. See `docsrc/indicators.rst` for the full reference and migration guide.
 - `LUMIBOT_CACHE_MISS_DEBUG` env var gates opt-in `[CACHE_MISS]` / `[FETCH]` warning traces in `ibkr_helper.py` for auditing why the cache layer decided to hit the network. Documented in `docs/ENV_VARS.md` and `docsrc/environment_variables.rst`.
 

@@ -208,6 +208,10 @@ class DownloaderQueueTimeout(TimeoutError):
         self.provider_details = dict(provider_details) if isinstance(provider_details, dict) else None
 
 
+class DownloaderQueueRequestLost(RuntimeError):
+    """The downloader explicitly no longer has an accepted queue request."""
+
+
 class QueueClient:
     """Queue-aware client for ThetaData requests.
 
@@ -254,6 +258,7 @@ class QueueClient:
         # single Session across threads. Use thread-local sessions and a generation counter so we
         # can invalidate all sessions on recovery (network wedges, timeouts).
         self._session_local = threading.local()
+        self._request_context = threading.local()
         self._session_generation = 0
         self._session_generation_lock = threading.Lock()
         self._last_session_reset_log = 0.0
@@ -281,6 +286,26 @@ class QueueClient:
         session.mount("http://", adapter)
         session.mount("https://", adapter)
         return session
+
+    def _remaining_budget(self) -> Optional[float]:
+        deadline = getattr(self._request_context, "deadline", None)
+        if deadline is None:
+            return None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise DownloaderQueueTimeout("Downloader request exceeded its total queue deadline")
+        return remaining
+
+    def _http_timeout(self, read_timeout: float) -> tuple[float, float]:
+        remaining = self._remaining_budget()
+        if remaining is None:
+            return QUEUE_CONNECT_HTTP_TIMEOUT, read_timeout
+        # Both phases fit inside the remaining transaction budget.
+        return min(QUEUE_CONNECT_HTTP_TIMEOUT, remaining / 2), min(read_timeout, remaining / 2)
+
+    def _sleep_with_budget(self, delay: float) -> None:
+        remaining = self._remaining_budget()
+        time.sleep(delay if remaining is None else min(delay, remaining))
 
     def _get_session(self) -> requests.Session:
         session = getattr(self._session_local, "session", None)
@@ -430,7 +455,11 @@ class QueueClient:
             existing = self._pending_requests.get(correlation_id)
             if existing and existing.status in ("pending", "processing"):
                 # Refresh status from server
-                self._refresh_status(existing.request_id)
+                try:
+                    self._refresh_status(existing.request_id)
+                except DownloaderQueueRequestLost:
+                    if method.upper() not in {"GET", "HEAD"}:
+                        raise
                 existing = self._pending_requests.get(correlation_id)
                 if existing and existing.status in ("pending", "processing"):
                     logger.debug(
@@ -506,13 +535,15 @@ class QueueClient:
         }
 
         start_time = time.time()
+        submit_budget = QUEUE_SUBMIT_MAX_WAIT if QUEUE_SUBMIT_MAX_WAIT > 0 else (self.timeout or 900.0)
         attempt = 0
         last_error: Optional[BaseException] = None
 
         while True:
+            self._remaining_budget()
             attempt += 1
             elapsed = time.time() - start_time
-            if QUEUE_SUBMIT_MAX_WAIT > 0 and elapsed > QUEUE_SUBMIT_MAX_WAIT:
+            if elapsed >= submit_budget:
                 raise TimeoutError(
                     f"Timed out submitting request to downloader after {elapsed:.1f}s (attempts={attempt})"
                 ) from last_error
@@ -523,7 +554,7 @@ class QueueClient:
                     submit_url,
                     json=payload,
                     headers={self.api_key_header: self.api_key},
-                    timeout=(QUEUE_CONNECT_HTTP_TIMEOUT, QUEUE_SUBMIT_HTTP_TIMEOUT),
+                    timeout=self._http_timeout(QUEUE_SUBMIT_HTTP_TIMEOUT),
                 )
             except (
                 requests_exceptions.ReadTimeout,
@@ -544,7 +575,7 @@ class QueueClient:
                     attempt,
                     exc,
                 )
-                time.sleep(delay)
+                self._sleep_with_budget(delay)
                 continue
 
             data: Optional[Dict[str, Any]] = None
@@ -569,7 +600,7 @@ class QueueClient:
                     delay,
                     attempt,
                 )
-                time.sleep(delay)
+                self._sleep_with_budget(delay)
                 continue
 
             try:
@@ -596,7 +627,7 @@ class QueueClient:
                     delay,
                     attempt,
                 )
-                time.sleep(delay)
+                self._sleep_with_budget(delay)
                 continue
 
             if not data:
@@ -649,6 +680,12 @@ class QueueClient:
             pass
         return request_id, status
 
+    def _forget_lost_request(self, request_id: str) -> None:
+        with self._lock:
+            correlation_id = self._request_id_to_correlation.pop(request_id, None)
+            if correlation_id:
+                self._pending_requests.pop(correlation_id, None)
+
     def _refresh_status(self, request_id: str) -> Optional[QueuedRequestInfo]:
         """Refresh status of a request from the server."""
         try:
@@ -656,16 +693,11 @@ class QueueClient:
             resp = self._get_session().get(
                 f"{self.base_url}/queue/status/{request_id}",
                 headers={self.api_key_header: self.api_key},
-                timeout=(QUEUE_CONNECT_HTTP_TIMEOUT, QUEUE_STATUS_HTTP_TIMEOUT),
+                timeout=self._http_timeout(QUEUE_STATUS_HTTP_TIMEOUT),
             )
             if resp.status_code == 404:
-                # Request not found, remove from tracking
-                with self._lock:
-                    correlation_id = self._request_id_to_correlation.get(request_id)
-                    if correlation_id:
-                        self._pending_requests.pop(correlation_id, None)
-                        self._request_id_to_correlation.pop(request_id, None)
-                return None
+                self._forget_lost_request(request_id)
+                raise DownloaderQueueRequestLost(f"Downloader no longer has request {request_id}")
 
             resp.raise_for_status()
             data = resp.json()
@@ -701,6 +733,8 @@ class QueueClient:
                     self._status_refresh_error_streak = 0
                     return info
             return None
+        except DownloaderQueueRequestLost:
+            raise
         except Exception as exc:
             self._last_status_refresh_error = str(exc)
             self._last_status_refresh_error_time = time.time()
@@ -718,8 +752,11 @@ class QueueClient:
             resp = self._get_session().get(
                 f"{self.base_url}/queue/{request_id}/result",
                 headers={self.api_key_header: self.api_key},
-                timeout=(QUEUE_CONNECT_HTTP_TIMEOUT, QUEUE_RESULT_HTTP_TIMEOUT),
+                timeout=self._http_timeout(QUEUE_RESULT_HTTP_TIMEOUT),
             )
+            if resp.status_code == 404:
+                self._forget_lost_request(request_id)
+                raise DownloaderQueueRequestLost(f"Downloader no longer has result {request_id}")
             data = resp.json()
             status_code = resp.status_code
 
@@ -731,6 +768,8 @@ class QueueClient:
                 return None, status_code, "dead"
             else:
                 return None, status_code, data.get("status", "unknown")
+        except DownloaderQueueRequestLost:
+            raise
         except Exception as exc:
             logger.warning("Failed to get result for %s: %s", request_id, exc)
             return None, 0, "error"
@@ -764,6 +803,13 @@ class QueueClient:
         terminal_result_error_streak = 0
 
         while True:
+            try:
+                self._remaining_budget()
+            except DownloaderQueueTimeout as exc:
+                with self._lock:
+                    correlation = self._request_id_to_correlation.get(request_id)
+                    info = self._pending_requests.get(correlation) if correlation else None
+                raise DownloaderQueueTimeout(str(exc), provider_details=info.error_details if info else None) from None
             elapsed = time.time() - start_time
 
             # Check timeout (0 = wait forever)
@@ -937,9 +983,35 @@ class QueueClient:
                     last_info_time = time.time()
 
             # Still pending/processing, wait before next poll
-            time.sleep(poll_interval)
+            self._sleep_with_budget(poll_interval)
 
     def execute_request(
+        self,
+        method: str,
+        path: str,
+        query_params: Dict[str, Any],
+        headers: Optional[Dict[str, str]] = None,
+        body: Optional[bytes] = None,
+        timeout: Optional[float] = None,
+        max_timeout_attempts: Optional[int] = None,
+    ) -> Tuple[Optional[Any], int]:
+        """Execute with one deadline covering slot, submission, polling and retry waits.
+
+        Normal calls allow three configured attempt windows. Best-effort calls
+        with a finite attempt cap use exactly that many windows. The deadline
+        never resets on resubmission and is isolated between calling threads.
+        """
+        attempt_timeout = timeout if timeout is not None and timeout > 0 else (self.timeout or 900.0)
+        budget = attempt_timeout * (max(1, int(max_timeout_attempts)) if max_timeout_attempts is not None else 3)
+        previous = getattr(self._request_context, "deadline", None)
+        deadline = time.monotonic() + budget
+        self._request_context.deadline = min(previous, deadline) if previous is not None else deadline
+        try:
+            return self._execute_request(method, path, query_params, headers, body, timeout, max_timeout_attempts)
+        finally:
+            self._request_context.deadline = previous
+
+    def _execute_request(
         self,
         method: str,
         path: str,
@@ -977,6 +1049,7 @@ class QueueClient:
         start_wait = time.monotonic()
         last_wait_log = 0.0
         while True:
+            self._remaining_budget()
             if self._concurrency_semaphore.acquire(timeout=1.0):
                 break
             waited = time.monotonic() - start_wait
@@ -1021,6 +1094,7 @@ class QueueClient:
             correlation_override: Optional[str] = None
 
             while True:
+                self._remaining_budget()
                 request_id, status, was_pending = self.check_or_submit(
                     method=method,
                     path=path,
@@ -1034,8 +1108,22 @@ class QueueClient:
                     logger.debug("Request already in queue, waiting for existing: %s", request_id)
 
                 try:
-                    return self.wait_for_result(request_id=request_id, timeout=attempt_timeout)
+                    remaining = self._remaining_budget()
+                    return self.wait_for_result(request_id=request_id,
+                                                timeout=min(attempt_timeout, remaining) if remaining is not None else attempt_timeout)
+                except DownloaderQueueRequestLost:
+                    if method.upper() not in {"GET", "HEAD"}:
+                        raise
+                    # A replacement may lose its local queue. Reissue the same
+                    # idempotent read without spending an entire attempt timeout.
+                    # Transient failures and provider waits do not enter this path.
+                    correlation_override = None
+                    self._sleep_with_budget(1.0)
                 except TimeoutError as exc:
+                    try:
+                        self._remaining_budget()
+                    except DownloaderQueueTimeout:
+                        raise exc
                     timeout_count += 1
                     provider_details = getattr(exc, "provider_details", None)
                     provider_wait = (isinstance(provider_details, dict)
@@ -1083,7 +1171,7 @@ class QueueClient:
                         max_delay=30.0,
                         jitter_pct=0.2,
                     )
-                    time.sleep(delay)
+                    self._sleep_with_budget(delay)
         finally:
             # Release semaphore when done (success or failure)
             with self._in_flight_lock:

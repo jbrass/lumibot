@@ -16,6 +16,15 @@ def _reset_ibkr_history_health_state():
     yield
     reset_ibkr_history_health_for_testing()
 
+@pytest.fixture(autouse=True)
+def _frozen_equity_actions(monkeypatch):
+    from lumibot.tools.ibkr_equity_basis import EquityBasisSnapshot
+    from lumibot.tools import ibkr_helper
+    ledger = pd.DataFrame(columns=["Dividends", "Stock Splits"])
+    basis = EquityBasisSnapshot.from_verified_actions(ledger, as_of=pd.Timestamp("2026-10-10T17:00Z"), coverage_through="2026-10-09")
+    monkeypatch.setattr(ibkr_helper, "_get_current_equity_basis", lambda _: basis)
+
+
 
 def test_ibkr_helper_caches_history_and_reuses_cache(monkeypatch, tmp_path):
     import lumibot.tools.ibkr_helper as ibkr_helper
@@ -108,7 +117,7 @@ def test_ibkr_helper_persists_fetched_bars_even_when_requested_window_has_no_ove
         if url.endswith("/ibkr/iserver/marketdata/history"):
             calls["history"] += 1
             # two 1-min bars at an earlier time range (ms timestamps)
-            return {
+            return {"volumeFactor": 1, 
                 "data": [
                     {"t": 1700000000000, "o": 1, "h": 2, "l": 1, "c": 2, "v": 10},
                     {"t": 1700000060000, "o": 2, "h": 3, "l": 2, "c": 3, "v": 11},
@@ -138,7 +147,7 @@ def test_ibkr_helper_persists_fetched_bars_even_when_requested_window_has_no_ove
 
     # Multiple parquet files may be produced when `ibkr_helper` fetches/derives bid/ask.
     # We require that the Trades series was persisted even if it doesn't overlap the request.
-    trades_files = list(tmp_path.rglob("*_TRADES_AHR.parquet"))
+    trades_files = list(tmp_path.rglob("*_TRADES_AHR_VOL_V1.parquet"))
     assert len(trades_files) == 1
     cached = pd.read_parquet(trades_files[0])
     assert len(cached) == 2
@@ -167,7 +176,7 @@ def test_ibkr_fetch_history_between_dates_keeps_chunks_on_later_empty_page(monke
     end = datetime(2026, 3, 2, tzinfo=timezone.utc)
 
     monkeypatch.setattr(ibkr_helper, "_resolve_conid", lambda **kwargs: 76792991)
-    page_one = {
+    page_one = {"volumeFactor": 1, 
         "data": [
             {
                 "t": int(ts.value // 1_000_000),
@@ -186,7 +195,7 @@ def test_ibkr_fetch_history_between_dates_keeps_chunks_on_later_empty_page(monke
         calls["count"] += 1
         if calls["count"] == 1:
             return page_one
-        return {"data": []}
+        return {"volumeFactor": 1, "data": []}
 
     monkeypatch.setattr(ibkr_helper, "_ibkr_history_request", _fake_history_request)
 
@@ -210,6 +219,44 @@ def test_ibkr_fetch_history_between_dates_keeps_chunks_on_later_empty_page(monke
     assert calls["count"] == 2
 
 
+@pytest.mark.parametrize("timestep,bar_seconds", [("60minute", 3600), ("day", 86400)])
+def test_ibkr_repeated_history_page_stops_without_losing_real_bars(monkeypatch, timestep, bar_seconds):
+    import lumibot.tools.ibkr_helper as helper
+
+    asset = Asset("GC", asset_type="future", expiration=datetime(2026, 2, 25).date(), multiplier=100)
+    quote = Asset("USD", asset_type="forex")
+    end = datetime(2026, 1, 19, 23, tzinfo=timezone.utc)
+    start = end - timedelta(seconds=4 * bar_seconds)
+    monkeypatch.setattr(helper, "_resolve_conid", lambda **_kwargs: 123)
+    calls = []
+    health = []
+
+    def repeated_page(**kwargs):
+        calls.append(kwargs["start_time"])
+        # Keep the pre-fix failure bounded: the fourth repeated page would
+        # otherwise make the unchanged cursor loop forever.
+        if len(calls) > 3:
+            raise RuntimeError("test request ceiling after repeated page")
+        return {"data": [{"t": int(pd.Timestamp(end).value // 1_000_000),
+                          "o": 100, "h": 101, "l": 99, "c": 100, "v": 1000}]}
+
+    monkeypatch.setattr(helper, "_ibkr_history_request", repeated_page)
+    monkeypatch.setattr(helper, "record_history_health", lambda **event: health.append(event))
+    result = helper._fetch_history_between_dates(
+        asset=asset, quote=quote, timestep=timestep, start_dt=start, end_dt=end,
+        exchange="COMEX", include_after_hours=True, source="Trades", source_was_explicit=True,
+    )
+
+    assert len(calls) == 2
+    assert calls[1] < calls[0]
+    assert len(result) == 1
+    assert result.index[0] == pd.Timestamp(end)
+    assert result["close"].iloc[0] == 100
+    assert not result["missing"].any()
+    assert health[-1]["outcome"] is helper.HistoryOutcome.PARTIAL
+    assert health[-1]["reason"] == "non_advancing_history_page"
+
+
 def test_ibkr_bounded_repair_preserves_pages_before_a_later_error(monkeypatch):
     import lumibot.tools.ibkr_helper as ibkr_helper
 
@@ -221,7 +268,7 @@ def test_ibkr_bounded_repair_preserves_pages_before_a_later_error(monkeypatch):
     def _history_request(**_kwargs):
         calls["count"] += 1
         if calls["count"] == 1:
-            return {
+            return {"volumeFactor": 1, 
                 "data": [
                     {
                         "t": 1760000000000 + offset * 3_600_000,
@@ -437,6 +484,45 @@ def test_cache_placeholder_metadata_never_reaches_strategy_frames():
     assert returned.columns.tolist() == ["close"]
 
 
+@pytest.mark.parametrize("source_reader", [False, True])
+def test_older_positive_history_does_not_confirm_missing_tail(monkeypatch, tmp_path, source_reader):
+    """An available older bar says nothing conclusive about a missing newer session."""
+    from types import SimpleNamespace
+    import lumibot.tools.ibkr_helper as helper
+
+    monkeypatch.setattr(helper, "LUMIBOT_CACHE_FOLDER", str(tmp_path))
+    monkeypatch.setattr(helper, "get_backtest_cache", lambda: SimpleNamespace(
+        ensure_local_file=lambda *args, **kwargs: None,
+        on_local_update=lambda *args, **kwargs: None,
+    ))
+    helper._RUNTIME_ATTEMPTED_HISTORY_SEGMENTS.clear()
+    helper._RUNTIME_HISTORY_NO_DATA_WINDOWS.clear()
+    asset = Asset("EUR", asset_type="forex")
+    quote = Asset("USD", asset_type="forex")
+    start = pd.Timestamp("2026-10-06 10:00", tz="America/New_York")
+    end = start + pd.Timedelta(hours=2)
+    frame = pd.DataFrame({"open": [1.1], "high": [1.1], "low": [1.1], "close": [1.1],
+                          "volume": [0], "missing": [False]}, index=pd.DatetimeIndex([start]))
+    path = helper._cache_file_for(asset=asset, quote=quote, timestep="minute", exchange="IDEALPRO",
+                                  source="Trades", include_after_hours=True)
+    helper._write_cache_frame(path, frame)
+    requests = []
+    negatives = []
+    monkeypatch.setattr(helper, "_fetch_history_between_dates", lambda **kwargs: (
+        requests.append(kwargs) or frame.copy()
+    ))
+    monkeypatch.setattr(helper, "_record_missing_window", lambda **kwargs: negatives.append(kwargs))
+    reader = helper._get_cached_bars_for_source if source_reader else helper.get_price_data
+    kwargs = dict(asset=asset, quote=quote, timestep="minute", start_dt=start.to_pydatetime(),
+                  end_dt=end.to_pydatetime(), exchange="IDEALPRO", include_after_hours=True, source="Trades")
+    result = reader(**kwargs)
+    assert len(result) == 1
+    assert len(requests) == 1
+    assert negatives == []
+    reader(**kwargs)
+    assert len(requests) == (2 if source_reader else 1)
+
+
 def test_ibkr_get_price_data_returns_real_cached_bars_when_window_stays_underfilled_after_refresh_error(monkeypatch, tmp_path):
     import lumibot.tools.ibkr_helper as ibkr_helper
 
@@ -549,7 +635,7 @@ def test_daily_fetch_sizes_full_required_window_and_preserves_long_cap(monkeypat
         # Two pages for the long request; changing the cap to tiny windows must
         # fail the asserted request contract even with deterministic provider data.
         first = start + timedelta(days=1000) if days > 365 and len(calls) == 1 else start
-        return {"data": [{"t": int(first.timestamp() * 1000), "o": len(calls), "h": len(calls),
+        return {"volumeFactor": 1, "data": [{"t": int(first.timestamp() * 1000), "o": len(calls), "h": len(calls),
                           "l": len(calls), "c": len(calls), "v": 100}]}
 
     monkeypatch.setattr(helper, "_ibkr_history_request", history)
@@ -679,7 +765,7 @@ def test_stock_history_identity_failure_refreshes_conid_once(monkeypatch):
         history_conids.append(kwargs["conid"])
         if kwargs["conid"] == 54927692:
             raise RuntimeError("Chart data unavailable")
-        return {
+        return {"volumeFactor": 1, 
             "data": [
                 {
                     "t": int(datetime(2026, 7, 29, tzinfo=timezone.utc).timestamp() * 1000),
@@ -737,7 +823,7 @@ def test_stale_stock_conid_contract_details_error_refreshes_conid(monkeypatch):
                 'Request x permanently failed: IBKR rest server error 500: '
                 '{"error":"Contract details are not available"}'
             )
-        return {"data": [{"t": int(datetime(2026, 9, 30, tzinfo=timezone.utc).timestamp() * 1000),
+        return {"volumeFactor": 1, "data": [{"t": int(datetime(2026, 9, 30, tzinfo=timezone.utc).timestamp() * 1000),
                           "o": 110.0, "h": 111.0, "l": 109.0, "c": 110.5, "v": 1000}]}
 
     monkeypatch.setattr(ibkr_helper, "_resolve_conid", fake_resolve_conid)
@@ -1047,9 +1133,11 @@ def test_stock_intraday_get_price_data_does_not_fetch_closed_market_edges(monkey
     asset = Asset(symbol="SPY", asset_type=Asset.AssetType.STOCK)
     quote = Asset(symbol="USD", asset_type=Asset.AssetType.FOREX)
     cache_file = ibkr_helper._cache_file_for(
-        asset=asset, quote=quote, timestep="5minute", exchange=None, source="Trades", include_after_hours=True
+        asset=asset, quote=quote, timestep="5minute", exchange=None, source="Trades", include_after_hours=True, equity_basis=ibkr_helper._get_current_equity_basis("SPY").split_fingerprint
     )
     cached = _extended_hours_5min_bars(_SEP_2026_WEEK)
+    from lumibot.tools.ibkr_equity_basis import decorate_adjusted_frame
+    cached = decorate_adjusted_frame(cached, ibkr_helper._get_current_equity_basis("SPY"), provider_prices_verified=True)
     cached["missing"] = False
     ibkr_helper._write_cache_frame(cache_file, cached)
 
@@ -1089,10 +1177,12 @@ def test_stock_intraday_get_price_data_does_not_repeat_an_underfilled_segment(mo
     asset = Asset(symbol="SPY", asset_type=Asset.AssetType.STOCK)
     quote = Asset(symbol="USD", asset_type=Asset.AssetType.FOREX)
     cache_file = ibkr_helper._cache_file_for(
-        asset=asset, quote=quote, timestep="5minute", exchange=None, source="Trades", include_after_hours=True
+        asset=asset, quote=quote, timestep="5minute", exchange=None, source="Trades", include_after_hours=True, equity_basis=ibkr_helper._get_current_equity_basis("SPY").split_fingerprint
     )
     # A real hole inside the Sep 9 session: nothing between 09:30 and 12:00 ET.
     cached = _extended_hours_5min_bars(["2026-09-09"], first="12:00", last="15:55")
+    from lumibot.tools.ibkr_equity_basis import decorate_adjusted_frame
+    cached = decorate_adjusted_frame(cached, ibkr_helper._get_current_equity_basis("SPY"), provider_prices_verified=True)
     cached["missing"] = False
     ibkr_helper._write_cache_frame(cache_file, cached)
 
@@ -1104,7 +1194,7 @@ def test_stock_intraday_get_price_data_does_not_repeat_an_underfilled_segment(mo
 
     def _answer_with_earlier_bars(**kwargs):
         fetches.append((kwargs["start_dt"], kwargs["end_dt"]))
-        return earlier.copy()
+        return decorate_adjusted_frame(earlier, ibkr_helper._get_current_equity_basis("SPY"), provider_prices_verified=True)
 
     monkeypatch.setattr(ibkr_helper, "_fetch_history_between_dates", _answer_with_earlier_bars)
 
@@ -1153,9 +1243,11 @@ def test_stock_intraday_get_price_data_still_fetches_edges_that_contain_sessions
     asset = Asset(symbol="SPY", asset_type=Asset.AssetType.STOCK)
     quote = Asset(symbol="USD", asset_type=Asset.AssetType.FOREX)
     cache_file = ibkr_helper._cache_file_for(
-        asset=asset, quote=quote, timestep="5minute", exchange=None, source="Trades", include_after_hours=True
+        asset=asset, quote=quote, timestep="5minute", exchange=None, source="Trades", include_after_hours=True, equity_basis=ibkr_helper._get_current_equity_basis("SPY").split_fingerprint
     )
     cached = _extended_hours_5min_bars(["2026-09-09", "2026-09-10"])
+    from lumibot.tools.ibkr_equity_basis import decorate_adjusted_frame
+    cached = decorate_adjusted_frame(cached, ibkr_helper._get_current_equity_basis("SPY"), provider_prices_verified=True)
     cached["missing"] = False
     ibkr_helper._write_cache_frame(cache_file, cached)
 
@@ -1277,7 +1369,7 @@ def _chart_unavailable_history_fake(vendor: pd.DataFrame, calls: list):
                 'Request r1 permanently failed: IBKR rest server error 500: {"error":"Chart data unavailable"}'
             )
         rows = vendor.loc[(vendor.index > window_start) & (vendor.index <= window_end)].tail(1000)
-        return {
+        return {"volumeFactor": 1, 
             "data": [
                 {"t": int(ts.timestamp() * 1000), "o": r["open"], "h": r["high"], "l": r["low"],
                  "c": r["close"], "v": r["volume"]}
@@ -1347,7 +1439,7 @@ def test_ibkr_later_page_failure_keeps_the_real_pages_already_collected(monkeypa
     def fake_history_request(**_kwargs):
         calls["count"] += 1
         if calls["count"] == 1:
-            return {"data": first_page}
+            return {"volumeFactor": 1, "data": first_page}
         raise RuntimeError(
             "Request r2 permanently failed: IBKR history remained invalid after rebuild "
             "(conid=95346641 period=1000min bar=1min reason=tail:missing_overlap_timestamp:1789602420000)"
@@ -1415,7 +1507,7 @@ def test_daily_fetch_sizes_windows_up_to_1000_days_exactly(monkeypatch, days, ex
 
     def history(**kwargs):
         calls.append(kwargs)
-        return {"data": [{"t": int(start.timestamp() * 1000), "o": 1, "h": 1, "l": 1, "c": 1, "v": 100}]}
+        return {"volumeFactor": 1, "data": [{"t": int(start.timestamp() * 1000), "o": 1, "h": 1, "l": 1, "c": 1, "v": 100}]}
 
     monkeypatch.setattr(helper, "_ibkr_history_request", history)
     helper._fetch_history_between_dates(asset=Asset("XLK"), quote=Asset("USD", "forex"), timestep="day",
@@ -1451,7 +1543,7 @@ def _ibkr_page_end_feed(vendor: pd.DataFrame, bar: pd.Timedelta):
         else:
             span = pd.Timedelta(days=int(period.removesuffix("d")))
         rows = vendor.loc[(vendor.index > end - span) & (vendor.index <= end - 2 * bar)].tail(1000)
-        return {"data": [{"t": int(ts.timestamp() * 1000), "o": float(r["open"]), "h": float(r["high"]),
+        return {"volumeFactor": 1, "data": [{"t": int(ts.timestamp() * 1000), "o": float(r["open"]), "h": float(r["high"]),
                           "l": float(r["low"]), "c": float(r["close"]), "v": float(r["volume"])}
                          for ts, r in rows.iterrows()]}
 
@@ -1480,6 +1572,26 @@ def _session_minute_bars(days, *, first, last, freq="1min"):
         px = 600.0 + i + pd.Series(range(len(idx)), index=idx, dtype="float64") * 0.001
         frames.append(pd.DataFrame({"open": px, "high": px + 0.05, "low": px - 0.05, "close": px + 0.01, "volume": 1000.0}, index=idx))
     return pd.concat(frames).sort_index()
+
+
+def test_backtest_asof_keeps_delayed_tail_fixed_as_wall_clock_advances(monkeypatch, tmp_path):
+    helper = _page_end_setup(monkeypatch, tmp_path, 123)
+    now = datetime(2026, 9, 25, 15, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(helper, "_ibkr_history_now_utc", lambda: now)
+    vendor = _session_minute_bars(["2026-09-25"], first="09:30", last="10:38")
+    feed, requests = _ibkr_page_end_feed(vendor, pd.Timedelta(minutes=1))
+    monkeypatch.setattr(helper, "queue_request", feed)
+    kwargs = dict(asset=Asset("SPY"), quote=Asset("USD", asset_type="forex"), timestep="minute",
+                  start_dt=datetime(2026, 9, 25, 13, 30, tzinfo=timezone.utc), end_dt=now,
+                  history_as_of=now, include_after_hours=True, source="Trades")
+    first = helper.get_price_data(**kwargs)
+    assert not first.empty
+    count = len(requests)
+    assert count > 0
+    now += timedelta(minutes=10)
+    second = helper.get_price_data(**kwargs)
+    assert len(requests) == count
+    pd.testing.assert_frame_equal(first, second)
 
 
 def test_ibkr_index_minute_history_keeps_every_sessions_closing_bar(monkeypatch, tmp_path):
@@ -1579,11 +1691,80 @@ def test_ibkr_page_request_end_keeps_the_one_bar_shift_for_futures_and_old_windo
     old_cursor = datetime(2026, 9, 18, 20, 0, tzinfo=timezone.utc)
     assert ibkr_helper._ibkr_page_request_end(old_cursor, 60, "stock") == old_cursor + timedelta(minutes=1)
     assert ibkr_helper._ibkr_page_request_end(old_cursor, 86400, "stock") == old_cursor
-    # Futures are not on the delayed stock/index feed: the shift is never clamped.
+    # October 9 provider evidence: futures history is delayed too. Keep the
+    # older-window seam shift, but never shift a current page into unavailable data.
+    assert ibkr_helper._ibkr_page_request_end(old_cursor, 60, "future") == old_cursor + timedelta(minutes=1)
     recent = now - timedelta(minutes=20)
-    assert ibkr_helper._ibkr_page_request_end(recent, 3600, "future") == recent + timedelta(hours=1)
+    assert ibkr_helper._ibkr_page_request_end(recent, 3600, "future") == recent
+    # Crypto retains its existing one-bar shift.
+    assert ibkr_helper._ibkr_page_request_end(recent, 3600, "crypto") == recent + timedelta(hours=1)
     # Stock at the delayed-feed limit stays at the limit.
     assert ibkr_helper._ibkr_page_request_end(recent, 3600, "stock") == recent
+
+
+@pytest.mark.parametrize("asset_type", ["future", "cont_future"])
+@pytest.mark.parametrize("timestep,frequency", [
+    ("minute", "1min"), ("5minute", "5min"), ("15minute", "15min"),
+    ("30minute", "30min"), ("hour", "1h"),
+])
+def test_ibkr_current_futures_history_respects_stable_provider_boundary(
+    monkeypatch, tmp_path, asset_type, timestep, frequency
+):
+    """A current futures page must not fail solely on delayed, unfinished bars.
+
+    Live ES/MES/NQ warmer history failed on 12-minute stale tails. The same
+    feed returned every requested bar in a stabilized historical window.
+    Cover the public continuous wrapper and explicit contracts, including the
+    hourly pager's extra-bar offset, without tolerating missing stable prices.
+    """
+    helper = _page_end_setup(monkeypatch, tmp_path, 123)
+    now = datetime(2026, 9, 25, 15, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(helper, "_ibkr_history_now_utc", lambda: now)
+    monkeypatch.setattr(helper, "_maybe_apply_future_contract_metadata", lambda **_: None)
+    contract = _mes_contract()
+    monkeypatch.setattr(helper, "_resolve_cont_future_segments", lambda **kw: [
+        (contract, kw["start_dt"], kw["end_dt"])
+    ])
+    vendor = _session_minute_bars(
+        ["2026-09-24", "2026-09-25"], first="04:00", last="10:30", freq=frequency
+    )
+    feed, requests = _ibkr_page_end_feed(vendor, pd.Timedelta(frequency))
+    monkeypatch.setattr(helper, "queue_request", feed)
+    frame = helper.get_price_data(
+        asset=contract if asset_type == "future" else Asset("MES", asset_type="cont_future"),
+        quote=Asset("USD", asset_type="forex"), timestep=timestep,
+        start_dt=datetime(2026, 9, 24, 8, 0, tzinfo=timezone.utc), end_dt=now,
+        exchange="CME", include_after_hours=True,
+    )
+    assert requests and frame is not None and not frame.empty
+    latest = pd.Timestamp(now) - pd.Timedelta(minutes=20)
+    assert max(requests) <= latest, [str(value) for value in requests]
+    assert frame.index.max() <= latest
+
+
+@pytest.mark.parametrize("asset_type", ["stock", "index", "future", "cont_future"])
+def test_ibkr_wholly_unavailable_current_window_does_not_probe_or_cache_absence(
+    monkeypatch, tmp_path, asset_type
+):
+    helper = _page_end_setup(monkeypatch, tmp_path, 123)
+    now = datetime(2026, 9, 25, 15, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(helper, "_ibkr_history_now_utc", lambda: now)
+    calls = []
+    monkeypatch.setattr(helper, "queue_request", lambda *args, **kwargs: calls.append(kwargs) or {"data": []})
+    frame = helper.get_price_data(
+        asset=_mes_contract() if asset_type == "future" else Asset("MES" if asset_type == "cont_future" else "SPY", asset_type=asset_type),
+        quote=Asset("USD", asset_type="forex"), timestep="minute",
+        start_dt=now - timedelta(minutes=10), end_dt=now,
+        exchange="CME" if asset_type in {"future", "cont_future"} else None,
+        include_after_hours=True,
+    )
+    from lumibot.tools.ibkr_history_health import ibkr_history_health_snapshot
+
+    health = ibkr_history_health_snapshot()
+    assert frame.empty and not calls
+    assert health["complete"] is False
+    assert any(s["reason"] == "delayed_history_window_unavailable" for s in health["series"])
+    assert not list(tmp_path.glob("ibkr/**/*.parquet"))
 
 
 # ---------------------------------------------------------------------------
@@ -1668,3 +1849,111 @@ def test_ibkr_futures_minute_paging_continues_across_closed_weekends_and_holiday
     assert len(missing) == 0, f"{label}: {len(missing)} bars missing, first {missing[:3].tolist()}"
     # Closed pages are stepped without requests: about one request per 1000 open minutes.
     assert len(calls) <= len(vendor) // 900 + 8, f"{label}: {len(calls)} requests"
+
+
+@pytest.mark.parametrize("session_day", ["2010-06-29", "2026-01-05", "2026-11-02"])
+def test_ibkr_tws_stock_daily_preserves_provider_session_date(monkeypatch, session_day):
+    """TWS daily date labels are UTC midnight, not previous-evening US trades."""
+    from lumibot.tools import ibkr_helper as helper
+
+    session = pd.Timestamp(session_day, tz="America/New_York") + pd.Timedelta(hours=16)
+    raw_timestamp = int(pd.Timestamp(session_day, tz="UTC").timestamp() * 1000)
+    monkeypatch.setattr(helper, "_resolve_conid", lambda **_: 123)
+    monkeypatch.setattr(helper, "_ibkr_history_request", lambda **_: {"volumeFactor": 1, 
+        "data": [{"t": raw_timestamp, "o": 1, "h": 2, "l": 1, "c": 1.5, "v": 100}],
+        "_botspot_meta": {"provider": "ibkr", "backend": "tws", "classification": "complete", "cache_write_policy": "allow"},
+    })
+    frame = helper._fetch_history_between_dates(
+        asset=Asset("TSLA", asset_type="stock"), quote=Asset("USD", asset_type="forex"),
+        timestep="day", start_dt=session.to_pydatetime(), end_dt=(session + pd.Timedelta(hours=1)).to_pydatetime(),
+        exchange="SMART", include_after_hours=False, source="Trades", source_was_explicit=True,
+    )
+    aligned = helper._align_stock_index_daily_to_session_close(frame)
+    assert list(aligned.index) == [session]
+    assert aligned.iloc[0]["close"] == 1.5
+
+
+@pytest.mark.parametrize("metadata", [[], ["legacy"], "legacy metadata", {"provider": "other", "backend": "tws"}])
+def test_ibkr_daily_ignores_untrusted_backend_metadata(monkeypatch, metadata):
+    """Legacy or foreign metadata must neither crash decoding nor reinterpret dates."""
+    from lumibot.tools import ibkr_helper as helper
+
+    raw_time = pd.Timestamp("2026-07-02 01:00", tz="UTC")
+    expected = raw_time.tz_convert("America/New_York")
+    monkeypatch.setattr(helper, "_resolve_conid", lambda **_: 123)
+    monkeypatch.setattr(helper, "_ibkr_history_request", lambda **_: {"volumeFactor": 1, 
+        "data": [{"t": int(raw_time.timestamp() * 1000), "o": 1, "h": 2, "l": 1, "c": 1.5, "v": 100}],
+        "_botspot_meta": metadata,
+    })
+    frame = helper._fetch_history_between_dates(
+        asset=Asset("TSLA", asset_type="stock"), quote=Asset("USD", asset_type="forex"),
+        timestep="day", start_dt=expected.to_pydatetime(),
+        end_dt=(expected + pd.Timedelta(days=1)).to_pydatetime(),
+        exchange="SMART", include_after_hours=False, source="Trades", source_was_explicit=True,
+    )
+    assert list(frame.index) == [expected]
+    assert frame.iloc[0]["close"] == 1.5
+
+
+@pytest.mark.parametrize("asset_type,timestep,should_migrate", [
+    ("stock", "day", True), ("index", "day", True), ("stock", "minute", False),
+    ("stock", "hour", False), ("future", "day", False), ("crypto", "day", False),
+])
+def test_ibkr_daily_cache_session_date_migration_preserves_other_caches(monkeypatch, tmp_path, asset_type, timestep, should_migrate):
+    from lumibot.tools import ibkr_helper as helper
+
+    monkeypatch.setattr(helper, "LUMIBOT_CACHE_FOLDER", str(tmp_path))
+    asset = Asset("TEST", asset_type=asset_type)
+    path = helper._cache_file_for(asset=asset, quote=Asset("USD", asset_type="forex"), timestep=timestep,
+        exchange=None, source="Trades", include_after_hours=False)
+    folder = "future" if asset_type == "future" else asset_type
+    legacy = path.with_name(f"{folder}_TEST_USD_{timestep}_AUTO_TRADES_RTH.parquet")
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    legacy.write_bytes(b"preserved legacy cache")
+    assert ("_SESSION_DATE_V2" in path.name) is should_migrate
+    assert path != legacy  # traded volume semantics also migrate non-index caches
+    assert legacy.read_bytes() == b"preserved legacy cache"
+
+
+@pytest.mark.parametrize("symbol", ["ES", "MES", "NQ", "MNQ", "GC", "MGC", "RTY", "M2K", "YM", "MYM", "CL", "MCL", "SI", "NG", "HG", "ZB", "ZN", "ZF", "6E", "6J", "MBT"])
+def test_futures_hour_cache_reuses_partial_friday_start(monkeypatch, tmp_path, symbol):
+    """Actual Oct 2 20:16 warmer boundary has no further Friday hourly label."""
+    from lumibot.tools import ibkr_helper as helper
+
+    monkeypatch.setattr(helper, "LUMIBOT_CACHE_FOLDER", tmp_path.as_posix())
+    monkeypatch.setattr(helper, "_RUNTIME_HISTORY_NO_DATA_WINDOWS", {})
+    monkeypatch.setattr(helper, "_RUNTIME_ATTEMPTED_HISTORY_SEGMENTS", {})
+    monkeypatch.setattr(helper, "_maybe_apply_future_contract_metadata", lambda **kwargs: None)
+    def forbid_provider(*args, **kwargs):
+        raise AssertionError("Unit test must never contact the downloader")
+    monkeypatch.setattr(helper, "queue_request", forbid_provider)
+    asset = Asset(symbol, asset_type="future", expiration=datetime(2026, 12, 29))
+    quote = Asset("USD", asset_type="forex")
+    cache_file = helper._cache_file_for(asset=asset, quote=quote, timestep="hour", exchange="CME", source="Trades", include_after_hours=True)
+    index = pd.date_range("2026-10-04 18:00", "2026-10-09 16:00", freq="h", tz="America/New_York")
+    index = index[index.hour != 17]
+    cached = pd.DataFrame({"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1.0, "missing": False}, index=index)
+    helper._write_cache_frame(cache_file, cached)
+    fetches = []
+
+    def fetch(**kwargs):
+        fetches.append((kwargs["start_dt"], kwargs["end_dt"]))
+        return pd.DataFrame()
+
+    monkeypatch.setattr(helper, "_fetch_history_between_dates", fetch)
+    frame = helper.get_price_data(asset=asset, quote=quote, timestep="hour", start_dt=datetime(2026, 10, 2, 20, 16, 38, tzinfo=timezone.utc), end_dt=datetime(2026, 10, 9, 20, 16, 38, tzinfo=timezone.utc), exchange="CME", include_after_hours=True, source="Trades")
+    assert fetches == []
+    assert frame.index.equals(index)
+
+
+@pytest.mark.parametrize("minutes", [1, 5, 15, 30, 60])
+def test_futures_closed_edge_uses_next_requested_bar_without_hiding_available_bar(minutes):
+    from lumibot.tools import ibkr_helper as helper
+
+    end = pd.Timestamp("2026-10-04 18:00", tz="America/New_York")
+    step = timedelta(minutes=minutes)
+    partial_start = pd.Timestamp("2026-10-02 16:59:30", tz="America/New_York")
+    assert helper._us_futures_closed_interval(partial_start, end, bar_step=step)
+    valid_start = pd.Timestamp("2026-10-02 17:00", tz="America/New_York") - step
+    assert not helper._us_futures_closed_interval(valid_start, end, bar_step=step)
+    assert not helper._us_futures_closed_interval(partial_start, end + step, bar_step=step)

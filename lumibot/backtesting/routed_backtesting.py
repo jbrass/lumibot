@@ -16,6 +16,7 @@ from lumibot.entities import Asset, AssetsMapping, Data
 from lumibot.tools import ibkr_helper
 from lumibot.tools import polygon_helper
 from lumibot.tools.helpers import parse_timestep_qty_and_unit
+from lumibot.tools.ibkr_equity_basis import EquityBasisSnapshot, assert_same_basis, equity_basis_from_frame
 
 logger = logging.getLogger(__name__)
 
@@ -354,6 +355,32 @@ class _IbkrRoutingAdapter(_DataFrameRoutingAdapter):
     provider_key = "ibkr"
     _default_start_buffer = timedelta(0)
 
+    def __init__(self, router):
+        super().__init__(router)
+        # A backtest has one data availability snapshot. Letting wall time move
+        # this boundary turns every simulated minute into a fresh tail download.
+        self._history_as_of = ibkr_helper._ibkr_history_now_utc()
+        self._prefetch_start_by_series: dict[Any, datetime] = {}
+        self._equity_basis_snapshots: dict[str, EquityBasisSnapshot] = {}
+
+    def _get_price_data(self, **kwargs):
+        asset = kwargs["asset"]
+        stock_symbol = (str(asset.symbol).strip().upper()
+                        if _normalize_asset_type(asset.asset_type) == "stock" else None)
+        frozen_basis = self._equity_basis_snapshots.get(stock_symbol) if stock_symbol else None
+        basis_kwargs = {"equity_basis": frozen_basis} if frozen_basis is not None else {}
+        df = ibkr_helper.get_price_data(history_as_of=self._history_as_of, **basis_kwargs, **kwargs)
+        if stock_symbol and df is not None and not df.empty:
+            # Validate every returned ledger, including later cadences. A frozen
+            # price basis must not disguise a corrupt provider ledger.
+            returned_basis = equity_basis_from_frame(df)
+            frozen_basis = frozen_basis or returned_basis
+            if frozen_basis is not None:
+                expected = pd.DataFrame({"_ibkr_split_basis": [frozen_basis.split_fingerprint]})
+                assert_same_basis(expected, df)
+                self._equity_basis_snapshots[stock_symbol] = frozen_basis
+        return df
+
     @staticmethod
     def _normalize_timestep_key(timestep: str) -> str:
         """Normalize a user-facing timestep into a stable IBKR series key.
@@ -384,7 +411,7 @@ class _IbkrRoutingAdapter(_DataFrameRoutingAdapter):
         Key differences vs the generic DataFrame adapter:
         - Preserve the full timestep multiplier in the dataset key ("60m" -> "60minute") so it
           doesn't collide with "minute".
-        - Pass the normalized key through to `ibkr_helper.get_price_data()` so IBKR can return
+        - Pass the normalized key through to `self._get_price_data()` so IBKR can return
           native bars at that cadence (avoids per-iteration resampling).
         - Store `Data` under the normalized key and annotate `_native_timestep_*` so `Data.get_bars()`
           can fast-path slices without resampling.
@@ -419,9 +446,27 @@ class _IbkrRoutingAdapter(_DataFrameRoutingAdapter):
         qty = int(qty)
         unit = str(unit)
 
+        asset_type = _normalize_asset_type(getattr(fetch_asset, "asset_type", ""))
+        include_after_hours = _ibkr_include_after_hours(asset_type, unit)
+        if asset_type in {"stock", "index"} and unit in {"day", "minute", "hour"}:
+            session_start = ibkr_helper._equity_history_start_for_bars(
+                end_dt, length, dataset_key, include_after_hours=include_after_hours and asset_type == "stock",
+            )
+            session_start = session_start.astimezone(start_datetime.tzinfo)
+            # Daily session counting is exact. Keeping the generic calendar-day
+            # padding makes complete SMA history look incomplete and reload it.
+            start_datetime = session_start if unit == "day" else min(start_datetime, session_start)
+        elif asset_type in {"future", "cont_future"} and unit == "day":
+            start_datetime -= timedelta(days=5)
+
         canonical_key, legacy_key = self._router._build_dataset_keys(original_asset, original_quote_asset, dataset_key)
         if canonical_key in self._fully_loaded_series and canonical_key in self._router._data_store:
-            return None
+            loaded_start = self._prefetch_start_by_series.get(canonical_key)
+            if loaded_start is not None and start_datetime >= loaded_start:
+                return None
+            # Complete simulation coverage is not complete coverage of a later,
+            # longer indicator lookback. Extend once, then reuse that window.
+            self._fully_loaded_series.discard(canonical_key)
         if canonical_key in self._empty_prefetch_series:
             return None
         existing = self._router._data_store.get(canonical_key)
@@ -456,7 +501,7 @@ class _IbkrRoutingAdapter(_DataFrameRoutingAdapter):
             except Exception:
                 prefetch_start = start_datetime
             prefetch_end = self._router.datetime_end or end_dt
-            df = ibkr_helper.get_price_data(
+            df = self._get_price_data(
                 asset=fetch_asset,
                 quote=fetch_quote_asset,
                 timestep=dataset_key,
@@ -514,7 +559,7 @@ class _IbkrRoutingAdapter(_DataFrameRoutingAdapter):
                 prefetch_start = start_datetime
 
             prefetch_end = self._router.datetime_end or end_dt
-            df = ibkr_helper.get_price_data(
+            df = self._get_price_data(
                 asset=fetch_asset,
                 quote=fetch_quote_asset,
                 timestep=dataset_key,
@@ -540,7 +585,7 @@ class _IbkrRoutingAdapter(_DataFrameRoutingAdapter):
             except Exception:
                 prefetch_start = start_datetime
             prefetch_end = self._router.datetime_end or end_dt
-            df = ibkr_helper.get_price_data(
+            df = self._get_price_data(
                 asset=fetch_asset,
                 quote=fetch_quote_asset,
                 timestep=dataset_key,
@@ -567,7 +612,7 @@ class _IbkrRoutingAdapter(_DataFrameRoutingAdapter):
             # bars and shift first signals by weeks/months.
             prefetch_start = start_datetime
             prefetch_end = self._router.datetime_end or end_dt
-            df = ibkr_helper.get_price_data(
+            df = self._get_price_data(
                 asset=fetch_asset,
                 quote=fetch_quote_asset,
                 timestep=dataset_key,
@@ -594,7 +639,7 @@ class _IbkrRoutingAdapter(_DataFrameRoutingAdapter):
                 lookback_days = 7
             prefetch_start = min(start_datetime, self._router.datetime_start - timedelta(days=lookback_days))
             prefetch_end = self._router.datetime_end or end_dt
-            df = ibkr_helper.get_price_data(
+            df = self._get_price_data(
                 asset=fetch_asset,
                 quote=fetch_quote_asset,
                 timestep=dataset_key,
@@ -615,7 +660,7 @@ class _IbkrRoutingAdapter(_DataFrameRoutingAdapter):
             ):
                 self._fully_loaded_series.add(canonical_key)
         else:
-            df = ibkr_helper.get_price_data(
+            df = self._get_price_data(
                 asset=fetch_asset,
                 quote=fetch_quote_asset,
                 timestep=dataset_key,
@@ -635,6 +680,7 @@ class _IbkrRoutingAdapter(_DataFrameRoutingAdapter):
             df = df.sort_index()
 
         if existing_df is not None and isinstance(existing_df, pd.DataFrame) and not existing_df.empty:
+            assert_same_basis(existing_df, df)
             merged = pd.concat([existing_df, df], axis=0).sort_index()
             merged = merged[~merged.index.duplicated(keep="last")]
         else:
@@ -654,7 +700,16 @@ class _IbkrRoutingAdapter(_DataFrameRoutingAdapter):
         except Exception:
             pass
 
+        # Repair may recreate the DataFrame. Check rows outside its fallback,
+        # then restore the verified ledger metadata before publishing memory.
+        assert_same_basis(merged, data.df)
+        if asset_type == "stock":
+            frozen_basis = self._equity_basis_snapshots.get(str(fetch_asset.symbol).strip().upper())
+            if frozen_basis is not None:
+                data.df.attrs["ibkr_equity_basis"] = frozen_basis.to_dict()
         self._router._data_store[canonical_key] = data
+        if canonical_key in self._fully_loaded_series:
+            self._prefetch_start_by_series[canonical_key] = prefetch_start
         # Only expose the (asset, quote) legacy key for true minute data to avoid collisions with
         # multi-minute datasets (which would otherwise satisfy minute requests incorrectly).
         if dataset_key == "minute" and legacy_key not in self._router._data_store:
@@ -705,7 +760,7 @@ class _IbkrRoutingAdapter(_DataFrameRoutingAdapter):
 
             prefetch_end = self._router.datetime_end or end_dt
 
-            df = ibkr_helper.get_price_data(
+            df = self._get_price_data(
                 asset=asset,
                 quote=quote_asset,
                 timestep=ts_unit,
@@ -733,7 +788,7 @@ class _IbkrRoutingAdapter(_DataFrameRoutingAdapter):
                 prefetch_start = start_datetime
             prefetch_end = self._router.datetime_end or end_dt
 
-            df = ibkr_helper.get_price_data(
+            df = self._get_price_data(
                 asset=asset,
                 quote=quote_asset,
                 timestep=ts_unit,
@@ -762,7 +817,7 @@ class _IbkrRoutingAdapter(_DataFrameRoutingAdapter):
             prefetch_start = min(start_datetime, self._router.datetime_start - timedelta(days=lookback_days))
             prefetch_end = self._router.datetime_end or end_dt
 
-            df = ibkr_helper.get_price_data(
+            df = self._get_price_data(
                 asset=asset,
                 quote=quote_asset,
                 timestep=ts_unit,
@@ -783,7 +838,7 @@ class _IbkrRoutingAdapter(_DataFrameRoutingAdapter):
                 self._fully_loaded_series.add(canonical_key)
             return df
 
-        return ibkr_helper.get_price_data(
+        return self._get_price_data(
             asset=asset,
             quote=quote_asset,
             timestep=ts_unit,
@@ -1126,9 +1181,62 @@ class RoutedBacktestingPandas(ThetaDataBacktestingPandas):
             self._observed_data_routes = {}
         self._observed_data_routes[key] = route
 
+    def _finalize_day_frame(self, pandas_df, current_dt, requested_length, timeshift, asset=None):
+        base = asset[0] if isinstance(asset, tuple) else asset
+        if base is not None and self._provider_spec_for_asset(base).provider == "ibkr":
+            # IBKR native daily rows are already timestamped at completed session
+            # closes and sliced by Data. Theta's midnight/calendar-day reshaping
+            # drops a completed futures row at 18:00 and can substitute yesterday's
+            # equity open during the broker's current-session fill lookup.
+            return pandas_df
+        return super()._finalize_day_frame(pandas_df, current_dt, requested_length, timeshift, asset=asset)
+
     def get_data_provenance(self) -> Dict[str, Any]:
         observed = getattr(self, "_observed_data_routes", {})
         return {"observedRoutes": list(observed.values()) if isinstance(observed, dict) else []}
+
+    def record_history_requirement(self, *, asset, timestep, requested_bars, bars, timeshift=None):
+        RoutedBacktestingPandas._record_consumed_history(self, asset=asset, timestep=timestep,
+            requested_bars=requested_bars, frame=bars.pandas_df.tail(requested_bars) if bars is not None else None,
+            timeshift=timeshift)
+
+    def record_indicator_input(self, *, asset, timestep, frame):
+        """Validate the actual observed indicator inputs, not optional cache size."""
+        RoutedBacktestingPandas._record_consumed_history(self, asset=asset, timestep=timestep,
+            requested_bars=max(1, len(frame)) if frame is not None else 1, frame=frame, timeshift=None)
+
+    def _record_consumed_history(self, *, asset, timestep, requested_bars, frame, timeshift):
+        base = asset[0] if isinstance(asset, tuple) else asset
+        if self._provider_spec_for_asset(base).provider != "ibkr":
+            return
+        from lumibot.tools.ibkr_history_health import record_required_history
+
+        if not timeshift:
+            from lumibot.tools.ibkr_history_health import record_backtest_availability_requirement
+
+            record_backtest_availability_requirement(asset=asset, timestep=timestep, when=self.get_datetime(),
+                                                     history_as_of=getattr(
+                                                         getattr(getattr(self, "_registry", None), "_adapters", {}).get("ibkr"),
+                                                         "_history_as_of", None))
+        record_required_history(asset=asset, timestep=timestep, requested_bars=requested_bars,
+                                frame=frame, when=self.get_datetime())
+
+    def resolve_order_asset(self, order, positions):
+        if self._provider_spec_for_asset(order.asset).provider != "ibkr":
+            return order.asset
+        from lumibot.tools.ibkr_order_contract import resolve_order_contract
+
+        return resolve_order_contract(asset=order.asset, side=order.side, quantity=order.quantity,
+                                      positions=positions, when=self.get_datetime())
+
+    def record_missing_valuation(self, asset):
+        base = asset[0] if isinstance(asset, tuple) else asset
+        if self._provider_spec_for_asset(base).provider != "ibkr":
+            return
+        from lumibot.tools.ibkr_history_health import record_required_history
+
+        record_required_history(asset=asset, timestep="valuation", requested_bars=1, frame=None,
+                                when=self.get_datetime(), requirement="valuation")
 
     @staticmethod
     def _extract_routing_config(config: Any) -> Optional[Dict[str, str]]:
@@ -1267,8 +1375,41 @@ class RoutedBacktestingPandas(ThetaDataBacktestingPandas):
                             [asset], self._backtest_daily_corporate_action_length(), timestep="day", quote=quote
                         )
                     except Exception as exc:
-                        logger.debug("Routed dividend bars unavailable for %s: %s", getattr(asset, "symbol", asset), exc)
+                        # This daily load enriches dividend accounting, not the
+                        # strategy's requested minute-price series. Preserve the
+                        # warning and retry later; do not invent a verified zero.
+                        from lumibot.tools.ibkr_history_health import record_optional_corporate_action_issue
+                        record_optional_corporate_action_issue(
+                            symbol=asset.symbol, when=ibkr_helper._ibkr_history_now_utc())
+                        logger.warning("Optional dividend history unavailable for %s; cash dividends "
+                                       "remain unverified.", asset.symbol)
+                        result[asset] = 0.0
+                        continue
                     frame = self._get_backtest_daily_corporate_action_frame(asset, quote=quote)
+                if frame is not None and frame.attrs.get("actions_verified") is False:
+                    # Data repair may fill action NaNs numerically; its frame
+                    # marker still means unknown, never a verified zero ledger.
+                    # Try optional enrichment at most once per simulated day.
+                    attempts = getattr(self, "_routed_unverified_action_dates", None)
+                    if attempts is None:
+                        attempts = self._routed_unverified_action_dates = {}
+                    if attempts.get(asset) == current_date:
+                        result[asset] = 0.0
+                        continue
+                    attempts[asset] = current_date
+                    try:
+                        actions = ibkr_helper._get_cached_equity_actions(
+                            asset.symbol, last_needed_datetime=getattr(self, "datetime_end", self._datetime))
+                        frame, _ = ibkr_helper._append_equity_corporate_actions_daily(
+                            frame, asset, actions=actions)
+                        if frame.attrs.get("actions_verified") is False:
+                            raise ValueError("Optional action coverage remains unverified")
+                    except Exception:
+                        from lumibot.tools.ibkr_history_health import record_optional_corporate_action_issue
+                        record_optional_corporate_action_issue(
+                            symbol=asset.symbol, when=ibkr_helper._ibkr_history_now_utc())
+                        result[asset] = 0.0
+                        continue
                 by_date = {}
                 if frame is not None and "dividend" in frame.columns and len(frame.index):
                     index = pd.DatetimeIndex(frame.index)
@@ -1323,7 +1464,7 @@ class RoutedBacktestingPandas(ThetaDataBacktestingPandas):
                             if amount > 0:
                                 by_date[ts.date()] = by_date.get(ts.date(), 0.0) + float(amount)
                 except Exception as exc:
-                    logger.warning("Corporate-action dividends unavailable for %s: %s", symbol, exc)
+                    raise RuntimeError(f"corporate_actions_unavailable: {symbol}") from exc
                 cache[symbol] = by_date
             out[asset] = by_date.get(current_date, 0.0)
         return out
@@ -1364,6 +1505,43 @@ class RoutedBacktestingPandas(ThetaDataBacktestingPandas):
             provider_spec=provider_spec,
         )
 
+    def _ibkr_futures_valuation_price(self, asset, quote=None):
+        base = asset[0] if isinstance(asset, tuple) else asset
+        quote_asset = asset[1] if isinstance(asset, tuple) else (quote or _DEFAULT_QUOTE_ASSET)
+        when = min(self.get_datetime(), self.datetime_end)
+        # A daily candle describes the prior completed session, not the current
+        # futures opening price. Reuse one native minute prefetch for exact marks.
+        self._update_pandas_data(base, quote_asset, 2, "minute", start_dt=when)
+        key, _ = self._build_dataset_keys(base, quote_asset, "minute")
+        data = self._data_store.get(key)
+        if data is None:
+            return None
+        if not data.df.empty and pd.Timestamp(when) >= data.df.index.max() + pd.Timedelta(minutes=1):
+            return ibkr_helper.closed_futures_mark(data.df, timestep="minute", when=when)
+        try:
+            price = data.get_last_price(when)
+        except ValueError:
+            price = None
+        if price is not None:
+            return price
+        return ibkr_helper.closed_futures_mark(data.df, timestep="minute", when=when)
+
+    def get_price_snapshot(self, asset, quote=None, timestep="minute", **kwargs):
+        base = asset[0] if isinstance(asset, tuple) else asset
+        if (self._provider_spec_for_asset(base).provider == "ibkr"
+                and _normalize_asset_type(getattr(base, "asset_type", "")) in {"future", "cont_future"}):
+            price = self._ibkr_futures_valuation_price(asset, quote=quote)
+            return None if price is None else {"price": price, "last_trade_price": price}
+        if (self._provider_spec_for_asset(base).provider == "ibkr"
+                and _normalize_asset_type(getattr(base, "asset_type", "")) in {"stock", "equity", "index"}
+                and getattr(self, "_timestep", None) != "day"
+                and self._has_loaded_intraday_series(base, quote)):
+            # IBKR Trades snapshots carry a forming candle's final OHLC. The
+            # point-in-time last-price reader uses its open until it completes.
+            price = self.get_last_price(asset, timestep=timestep, quote=quote)
+            return None if price is None else {"close": price, "price": price, "last_trade_price": price}
+        return super().get_price_snapshot(asset, timestep=timestep, quote=quote, **kwargs)
+
     def get_last_price(self, asset, timestep="minute", quote=None, exchange=None, **kwargs):
         """Align routed daily backtests away from minute bars for performance.
 
@@ -1381,6 +1559,11 @@ class RoutedBacktestingPandas(ThetaDataBacktestingPandas):
             spec = self._provider_spec_for_asset(asset if not isinstance(asset, tuple) else asset[0])
         except Exception:
             spec = ProviderSpec(provider="thetadata")
+
+        base = asset[0] if isinstance(asset, tuple) else asset
+        if (spec.provider == "ibkr"
+                and _normalize_asset_type(getattr(base, "asset_type", "")) in {"future", "cont_future"}):
+            return self._ibkr_futures_valuation_price(asset, quote=quote)
 
         if spec.provider != "thetadata" and timestep == "minute":
             asset_obj = asset if not isinstance(asset, tuple) else asset[0]

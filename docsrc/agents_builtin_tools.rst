@@ -124,6 +124,8 @@ For stocks, a pending exit already owns that position change. A due exit
 condition or a limit away from the current market does not authorize replacing
 it. The agent changes an existing order only when the user's rules explicitly
 require that change.
+The final decision explains how the observed pending quantity already covers
+the intended position change and why another order would duplicate it.
 Lookback rules use the requested number of the latest completed bars. The
 reported indicator and date window must match the selected tool result.
 
@@ -421,6 +423,28 @@ The built-in research tools are designed around backtest/live parity:
 - SEC filings are gated by filed or accepted datetime
 - FRED backtests use vintage observations when ``FRED_API_KEY`` is available
 - news tools use the strategy datetime as the cutoff
+
+Evidence packets retain each returned dataset ID beside its source, dates and
+query window. Attribute an aggregate to a tool only after the tool returns
+that aggregate; rows of individual prices are not a calculated average. When
+selecting document links in a backtest, filter by publication date before
+sorting or limiting the rows, then inspect the date before opening each link.
+Establish this eligibility before reading the linked document; opening a document
+known to be from after the backtest time, then discarding it, has already
+crossed the time boundary.
+
+Agents prefer dated sources in backtests, but a source with no date at all is
+still usable: the agent estimates when it became public from its contents and
+context (for example a report covering data through June 30 appeared after June
+30), uses it only when that estimate is at or before the backtest time, and says
+in its answer that the date is an estimate and why. It never invents a date or
+presents an estimate as exact. Live trading applies no publication-date rules:
+any current page or file can be read.
+
+For opening option packages, verify the standard leg topology before pricing.
+A reversed spread changes the structure; recheck buy/sell sides and strikes
+when the calculated debit or credit contradicts the intended package. Closing
+sides continue to come from actual signed positions.
 
 .. image:: ../docs/assets/readme/lumibot_point_in_time_tools.png
    :alt: Lumibot point-in-time research tools

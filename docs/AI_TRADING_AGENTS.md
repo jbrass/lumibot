@@ -75,6 +75,31 @@ Macro tools additionally require `FRED_API_KEY`. They use the strategy clock and
 
 ## External Data Patterns
 
+### BotSpot managed research
+
+In BotSpot account settings, create a named API key and enable the independent
+research permissions you need. Leave trading, deployment, backtest-control and
+secret-management permissions off. The key defaults to never expiring; choose
+an expiry if needed and revoke it from the same page to end access.
+
+Set `BOTSPOT_RESEARCH_MCP_URL` to the Research MCP endpoint shown by BotSpot and
+`BOTSPOT_RESEARCH_MCP_TOKEN` to that key. Agents attach the connection automatically;
+no custom `MCPServer` or supplier key is required. A static external key does not
+need `BOTSPOT_RESEARCH_MCP_RENEW_URL`. Keep credentials in the token environment
+variable, never in a URL or committed strategy. HTTPS is required outside loopback.
+
+Hosted direct, scheduled and backtest workloads receive restricted connection
+credentials from BotSpot. Their account-wide hosted research settings are separate
+from API-key creation; changing or revoking a selected key changes the hosted
+permission ceiling too. Community publication requires its own explicit grants.
+The research connection does not authorize running backtests, deployments or trades.
+
+LumiBot bounds historical data requests to the strategy clock. Server authorization
+must also verify a hosted backtest's simulation clock; if that binding or a source's
+historical version is unavailable, an explicit unsupported-capability response is
+the result. Do not retry a historical request with a live clock or an unbounded key.
+BotSpot owns supplier credentials, normalization, storage and source qualification.
+
 ### Pattern 1: @agent_tool wrapping a REST API (recommended)
 
 This is the primary and recommended approach. It works reliably in both backtests and live trading because you control the HTTP call directly.
@@ -365,6 +390,8 @@ The agent runs inside `on_trading_iteration()` on every bar (e.g., every trading
 **How does the agent avoid looking into the future during backtests?**
 
 LumiBot injects the simulated datetime into the agent's context and the base prompt includes explicit rules about look-ahead bias. The observability system also flags future-dated data warnings if a tool result references data published after the simulated backtest time. Your `@agent_tool` functions should respect date parameters to avoid requesting future data.
+
+Capability first (Rob, 2026-10-22): agents prefer dated sources in backtests and never use anything known to be from after the simulated time, but a source with no date is still allowed when the agent estimates when it became public and discloses that estimate. Live runs have no publication-date rules. See `tests/test_agent_undated_sources_capability.py` and the `web_documents_*undated*` evals.
 
 **What is the replay cache?**
 

@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 import json
+import sys
 from threading import Lock
 from typing import Any, Iterable, Optional, Sequence
 
@@ -203,6 +204,149 @@ def padded_repair_window(
 _HEALTH_LOCK = Lock()
 _HEALTH_BY_SERIES: dict[str, dict[str, Any]] = {}
 _HEALTH_EVENT_IDS: set[tuple[str, str]] = set()
+_REQUIRED_FAILURES: dict[tuple, dict[str, Any]] = {}
+_OPTIONAL_ISSUES: dict[tuple, dict[str, Any]] = {}
+
+
+def record_optional_corporate_action_issue(*, symbol, when):
+    """Record unavailable enrichment separately from required price-data failures."""
+    key = (str(symbol).strip().upper(), "corporate_actions_unavailable")
+    with _HEALTH_LOCK:
+        if key in _OPTIONAL_ISSUES:
+            _OPTIONAL_ISSUES[key]["occurrences"] += 1
+        elif len(_OPTIONAL_ISSUES) < 500:
+            _OPTIONAL_ISSUES[key] = {
+                "symbol": key[0], "reason": key[1], "required": False,
+                "price_provider": "ibkr", "corporate_actions_status": "unavailable",
+                "cash_dividends_verified": False, "observed_at": when.isoformat(), "occurrences": 1,
+            }
+
+
+def record_backtest_availability_requirement(*, asset, timestep, when, history_as_of):
+    """Keep a frozen delayed-feed cutoff visible when a decision needs newer bars."""
+    if history_as_of is None:
+        return
+    from lumibot.tools import ibkr_helper as helper
+
+    base = asset[0] if isinstance(asset, tuple) else asset
+    kind = helper._normalize_asset_type(getattr(base, "asset_type", ""))
+    if kind not in {"stock", "index", "future", "cont_future"}:
+        return
+    _, seconds, component = helper._timestep_to_ibkr_bar(str(timestep))
+    if component.endswith("day"):
+        return
+    cutoff = helper._to_utc(history_as_of) - helper.IBKR_INTRADAY_HISTORY_DELAY
+    required = helper._to_utc(when) - timedelta(seconds=seconds)
+    if required <= cutoff:
+        return
+    closed = (helper._us_equity_closed_interval(cutoff, required, include_after_hours=True)
+              if kind in {"stock", "index"} else helper._us_futures_closed_interval(cutoff, required))
+    if not closed:
+        record_required_history(asset=asset, timestep=timestep, requested_bars=1, frame=None,
+                                when=when, requirement="availability")
+
+
+
+def record_required_data_issue(*, asset, timestep, when, reason, recovery_cause="unknown", retryable=False):
+    """Persist a bounded typed failure without leaking provider payloads."""
+    allowed = {"temporary_download_failure", "history_unavailable", "corporate_actions_unverified",
+               "data_not_yet_available", "unknown"}
+    if recovery_cause not in allowed:
+        raise ValueError("unknown recovery cause")
+    symbol = str(getattr(asset, "symbol", asset)).upper()
+    kind = getattr(asset, "asset_type", "")
+    kind = str(getattr(kind, "value", kind))
+    key = (symbol, kind, str(getattr(asset, "expiration", "")), str(timestep), reason)
+    with _HEALTH_LOCK:
+        previous = _REQUIRED_FAILURES.get(key)
+        if previous:
+            previous["occurrences"] += 1
+            previous["last_observed_at"] = when.isoformat()
+            previous["retryable"] = previous.get("retryable", False) and retryable is True
+        elif len(_REQUIRED_FAILURES) < 500:
+            _REQUIRED_FAILURES[key] = {"symbol": symbol, "asset_type": kind, "timestep": str(timestep),
+                "reason": str(reason)[:200], "recovery_cause": recovery_cause, "retryable": retryable is True,
+                "first_observed_at": when.isoformat(), "last_observed_at": when.isoformat(), "occurrences": 1}
+
+def record_required_history(*, asset, timestep, requested_bars, frame, when, requirement="history") -> None:
+    """Record history actually consumed by a strategy, separately from prefetch.
+
+    An incomplete decision remains incomplete even if a later decision has enough
+    bars. Bound evidence by series rather than storing every iteration.
+    """
+    base = asset[0] if isinstance(asset, tuple) else asset
+    symbol = str(getattr(base, "symbol", base)).upper()
+    asset_type = getattr(base, "asset_type", "")
+    asset_type = str(getattr(asset_type, "value", asset_type))
+    requested = int(requested_bars)
+    if requested <= 0:
+        return
+    usable = frame if isinstance(frame, pd.DataFrame) else pd.DataFrame()
+    if "missing" in usable:
+        usable = usable.loc[~usable["missing"].fillna(False).astype(bool)]
+    usable = usable.dropna(subset=[name for name in ("open", "high", "low", "close") if name in usable])
+    returned = len(usable) if "close" in usable else 0
+    missing = []
+    unresolved_contract = False
+    with _HEALTH_LOCK:
+        if returned and isinstance(usable.index, pd.DatetimeIndex):
+            first, last = usable.index.min().date().isoformat(), usable.index.max().date().isoformat()
+            from lumibot.tools.helpers import parse_canonical_timestep
+
+            # Prefetch telemetry may describe a route that failed before another
+            # route/cache repair supplied the missing daily row. Validate the
+            # prices this decision actually received, without erasing the failed
+            # route's evidence. One intraday row does not prove a whole session.
+            daily_dates = ({stamp.date().isoformat() for stamp in usable.index}
+                           if parse_canonical_timestep(timestep) == (1, "day") else None)
+            for health in _HEALTH_BY_SERIES.values():
+                if (health["symbol"] == symbol and health["asset_type"] == asset_type
+                        and health["timestep"] == str(timestep) and health["outcome"] != "complete"):
+                    missing.extend(day for day in health["missing_sessions"]
+                                   if first <= day <= last and (daily_dates is None or day not in daily_dates))
+                    if health["reason"] == "unresolved_roll_contract":
+                        # This interval is an explicitly absent contract segment,
+                        # not the broader optional prefetch window. Older bars can
+                        # satisfy the row count while hiding this interior hole.
+                        gap_start = pd.Timestamp(health["requested_start"]).date().isoformat()
+                        gap_end = pd.Timestamp(health["requested_end"]).date().isoformat()
+                        unresolved_contract |= gap_start <= last and gap_end >= first
+        reason = "insufficient_required_history" if returned < requested else (
+            "missing_required_sessions" if missing else (
+                "unresolved_required_contract" if unresolved_contract else None))
+        if reason and requirement == "valuation":
+            reason = "missing_valuation_price"
+        if reason and requirement == "availability":
+            reason = "required_history_after_feed_cutoff"
+        if reason is None:
+            return
+        correlated = [h for h in _HEALTH_BY_SERIES.values()
+                      if h["symbol"] == symbol and h["asset_type"] == asset_type
+                      and h["timestep"] == str(timestep) and h["outcome"] != "complete"
+                      and pd.Timestamp(h["requested_start"]) <= pd.Timestamp(when)
+                      and pd.Timestamp(h["requested_end"]) >= pd.Timestamp(when)]
+        transient = bool(correlated) and all(
+            h["outcome"] == HistoryOutcome.TRANSIENT_FAILURE.value
+            and h["reason"] in {"rate_limited", "transient_history_failure"}
+            for h in correlated)
+        recovery_cause = ("data_not_yet_available" if requirement == "availability" else
+                          "temporary_download_failure" if transient else "unknown")
+        key = (symbol, asset_type, str(getattr(base, "expiration", "")), str(timestep), reason)
+        previous = _REQUIRED_FAILURES.get(key)
+        if previous:
+            previous["occurrences"] += 1
+            previous["last_observed_at"] = when.isoformat()
+            previous["retryable"] = previous.get("retryable", False) and transient
+            if previous.get("recovery_cause") != recovery_cause:
+                previous["recovery_cause"] = "unknown"
+        elif len(_REQUIRED_FAILURES) < 500:
+            _REQUIRED_FAILURES[key] = {
+                "symbol": symbol, "asset_type": asset_type, "timestep": str(timestep),
+                "reason": reason, "recovery_cause": recovery_cause, "retryable": transient,
+                "requested_bars": requested, "returned_bars": returned,
+                "first_observed_at": when.isoformat(), "last_observed_at": when.isoformat(),
+                "missing_sessions": sorted(set(missing))[:100], "occurrences": 1,
+            }
 
 
 def record_history_health(
@@ -266,6 +410,8 @@ def record_history_health(
 def ibkr_history_health_snapshot() -> dict[str, Any]:
     with _HEALTH_LOCK:
         series = [dict(value) for _, value in sorted(_HEALTH_BY_SERIES.items())]
+        required_failures = [dict(value) for value in _REQUIRED_FAILURES.values()]
+        warnings = [dict(value) for value in _OPTIONAL_ISSUES.values()]
     incomplete = sum(1 for value in series if value.get("outcome") != HistoryOutcome.COMPLETE.value)
     return {
         "provider": "ibkr",
@@ -273,6 +419,9 @@ def ibkr_history_health_snapshot() -> dict[str, Any]:
         "incomplete_series_count": incomplete,
         "complete": incomplete == 0,
         "series": series,
+        "required_complete": not required_failures,
+        "required_failures": required_failures,
+        "warnings": warnings,
     }
 
 
@@ -280,6 +429,15 @@ def reset_ibkr_history_health() -> None:
     with _HEALTH_LOCK:
         _HEALTH_BY_SERIES.clear()
         _HEALTH_EVENT_IDS.clear()
+        _REQUIRED_FAILURES.clear()
+        _OPTIONAL_ISSUES.clear()
+    # A Strategy backtest startup already resets this provider's run telemetry.
+    # Reset the price-basis memo at the same boundary, without importing a data
+    # adapter into runs that never use IBKR. Within one run it remains frozen.
+    helper = sys.modules.get("lumibot.tools.ibkr_helper")
+    basis_cache = getattr(helper, "_IBKR_EQUITY_BASIS_CACHE", None)
+    if basis_cache is not None:
+        basis_cache.clear()
 
 
 def reset_ibkr_history_health_for_testing() -> None:

@@ -1,3 +1,27 @@
+# Capability first: agents may use undated sources; live trading has no date rules (Rob, 2026-10-22)
+
+- Never make LumiBot agents less capable to look safer. Do not add an instruction, tool filter or gate that blocks ordinary research without a concrete failure behind it.
+- Backtests: prefer sources that say when each document became public, and never use anything known to be from after the simulated time (the `document_after_cutoff` refusal and price-data clamping stay). A source with no date at all is still allowed: the agent estimates when it became public, uses it only if that estimate is at or before the simulated time, and says in its answer that the date is an estimate and why. Never invent a date or present an estimate as exact.
+- Live trading has no publication-date restrictions. Backtest-only date rules must stay inside the backtest branch of the prompt and tool results.
+- Enforced by `tests/test_agent_undated_sources_capability.py` and the evals `web_documents_undated_source_estimated_date`, `web_documents_known_future_document_not_opened` and `web_documents_live_undated_source_used_freely`. Do not loosen them.
+
+# Generic platform behavior and evidence-bound selection (Rob, 2026-10-18, ABSOLUTE)
+
+- LumiBot, BotSpot, BotSpot Agent, Node, Bot Manager and their infrastructure serve every supported strategy, broker, account and customer. Fix generic capabilities at their existing owner. Never add strategy/customer names, IDs, ticker-specific intent branches, private network routes, resource exceptions or hidden defaults to shared runtime, prompts, skills, tools or infrastructure to solve one incident.
+- Strategy-specific investment rules and research instructions belong in that strategy's own saved files/prompts. Clearly labeled example strategies may demonstrate generic capabilities; they must never become production defaults or special cases in core.
+- Evals reproduce reusable failure modes with neutral, varied synthetic identities and configurations, including multiple live accounts and unrelated strategies. Do not teach a remembered customer strategy as the expected identity. Keep exact incident evidence as provenance, separate from fixtures and behavior rules. A pass tied to one name or configuration does not establish generic correctness.
+- Saved memory, prior conversations, sidebar order and example names are clues, not authority to select the current strategy/account. For an unbound new chat saying "this strategy", inspect current owned inventory without silently filtering to a remembered name. If multiple candidates remain, ask the user to select a safe name/account label. Honor an explicitly selected current-chat target and explicit switches; never borrow another account's metrics.
+- Before shipping a shared fix, state the generic contract, affected configuration classes, negative controls and source-to-served proof. Do not introduce tool filters, regex intent routing, response rewriting or strategy-specific infrastructure as enforcement shortcuts. Do not alter running customer workloads without their normal exact authorization.
+
+# LumiBot is the platform: never put strategy-specific code in it (Rob, 2026-10-17, ABSOLUTE)
+
+- LumiBot is one generic platform for every strategy. Never add strategy-, person-, company- or website-specific logic, text, tools, skills, prompts, eval fixtures or branches to LumiBot core (for example "House Clerk", "Pelosi", or one site's filing format). Strategy-specific knowledge lives only in that strategy's own prompts.
+- Improve LumiBot only with generic capabilities that help every strategy: browser use, file downloads, ZIP, PDF and CSV reading, API calls, and look-ahead safety that works for any source. While fixing a strategy, explain exactly what a proposed LumiBot change does and get Rob's explicit approval before touching LumiBot core. Never release, tag or deploy LumiBot without Rob's explicit approval.
+- AI strategy examples (LumiBot `example_strategies` and BotSpot AI strategies) use AI and AI only: exactly one agent dedicated to trading, plus any number of research or planning agents, all called every iteration. The Ray Dalio and Citadel examples are the reference pattern; do not change them. Agents hand work to each other only through their answers, and `self.vars` may carry an agent's last answer forward so it does not redo old work. No Python in between that fetches or parses data, filters filings, computes weights, or skips agents with if statements. The whole point is to show how simple LumiBot makes it: agents research, one agent trades.
+- Let the agent find its own way: browse, download, read. A short hint about where to look may go in the prompt. Parsing or availability code may not.
+- If a platform behavior blocks a simple example, report the evidence to Rob and propose a generic platform fix. Never work around it with strategy Python or a strategy-specific platform change.
+- Why: on 2026-10-17 an agent "fixed" the Pelosi bot with Python that downloaded and filtered House filings and skipped the AI on most days. It then edited LumiBot's shared web-documents skill and evals with House Clerk text on a `pelosi-house-filings` branch. Rob: "LumiBot is not a strategy. LumiBot is the platform. The platform needs to work for all strategies."
+
 # CLAUDE.md - AI Assistant Instructions for LumiBot
 
 ## Public Repo Secret Hygiene (CRITICAL)

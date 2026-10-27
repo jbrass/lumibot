@@ -250,8 +250,18 @@ class Indicators:
             self._asset_key(quote) if quote is not None else None,
             exchange,
         )
-        df = self._full_history(asset, timestep, quote=quote, exchange=exchange)
+        # SMA is a finite rolling calculation. Recursive/custom indicators
+        # retain their existing full-history seeding contract; a period alone
+        # is not sufficient to bound those calculations safely.
+        history_length = None
+        length = kwargs.get("length", 10)
+        if (name == "sma" and custom_fn is None and window is None
+                and isinstance(length, int) and not isinstance(length, bool) and length > 0):
+            history_length = length + int(kwargs.get("offset") or 0)
+        df = self._full_history(asset, timestep, quote=quote, exchange=exchange,
+                                required_length=history_length)
         if df is None or df.empty:
+            self._record_consumed_input(asset, timestep, None, quote=quote)
             return None
         if not isinstance(df.index, pd.DatetimeIndex) or not df.index.is_monotonic_increasing or not df.index.is_unique:
             raise ValueError("Indicator history requires a unique, increasing DatetimeIndex.")
@@ -265,6 +275,9 @@ class Indicators:
             if df.index.tz is None:
                 raise ValueError("Indicator window history requires timezone-aware timestamps.")
             df = df.loc[(df.index >= window[0]) & (df.index <= window[1])]
+        elif history_length is not None:
+            df = df.iloc[-history_length:]
+        self._record_consumed_input(asset, timestep, df, quote=quote)
         if df.empty:
             return None
         digest = hashlib.sha256(pd.util.hash_pandas_object(df, index=True).values.tobytes()).hexdigest()
@@ -274,6 +287,26 @@ class Indicators:
             result = self._compute(df, name, kwargs, custom_fn)
             self._cache[key] = (data_tag, result)
         return self._at_current_bar(self._cache[key][1])
+
+    def _record_consumed_input(self, asset, timestep, frame, *, quote=None):
+        normalize = getattr(self._strategy, "_sanitize_user_asset", None)
+        asset = normalize(asset) if callable(normalize) else asset
+        broker = getattr(self._strategy, "broker", None)
+        source = getattr(broker, "data_source", None)
+        if getattr(broker, "option_source", None) is not None and getattr(asset, "asset_type", None) == "option":
+            source = broker.option_source
+        pair = getattr(self._strategy, "crypto_assets_to_tuple", None)
+        if callable(pair):
+            asset = pair(asset, quote if quote is not None else getattr(self._strategy, "quote_asset", None))
+        record = getattr(source, "record_indicator_input", None)
+        if getattr(self._strategy, "is_backtesting", False):
+            from lumibot.backtesting.market_input_evidence import record_market_input
+
+            effective_quote = quote if quote is not None else getattr(self._strategy, "quote_asset", None)
+            record_market_input(source=source, asset=asset, quote=effective_quote,
+                timestep=timestep, when=self._strategy.get_datetime(), frame=frame, purpose="indicator")
+        if callable(record):
+            record(asset=asset, timestep=timestep, frame=frame)
 
     @staticmethod
     def _validate_causal_parameters(kwargs):
@@ -303,30 +336,41 @@ class Indicators:
                 kw_items.append((k, repr(v)))
         return (self._asset_key(asset), timestep, name, tuple(kw_items))
 
-    def _full_history(self, asset, timestep, *, quote=None, exchange=None) -> pd.DataFrame | None:
+    def _full_history(self, asset, timestep, *, quote=None, exchange=None,
+                      required_length=None) -> pd.DataFrame | None:
         """Return the full known bar series DataFrame for ``asset``.
 
         In backtest mode this may contain the entire simulated dataset.
         ``_dispatch`` restricts the INPUT before computing, never just output.
 
         In routed/live modes ``_data_store`` is populated lazily. If it is
-        empty we call ``get_historical_prices`` with a large length to force
-        the adapter to prefetch, then re-read the resulting full series.
+        empty we prefetch, then re-read the resulting full series. Known finite
+        calculations request their required bars; arbitrary calculations retain
+        the generous optional-history fallback. Future rows do not satisfy a
+        required current window.
         """
         broker = getattr(self._strategy, "broker", None)
         data_source = getattr(broker, "data_source", None) if broker is not None else None
 
         df = self._read_store_df(data_source, asset, timestep, quote=quote)
         if df is not None:
-            return df
+            if required_length is None or not isinstance(df.index, pd.DatetimeIndex):
+                return df
+            if self._position_at(df.index, self._strategy.get_datetime()) + 1 >= required_length:
+                return df
 
         try:
-            history_kwargs = {"length": self._fallback_length, "timestep": timestep}
+            history_kwargs = {"length": required_length or self._fallback_length, "timestep": timestep}
             if quote is not None:
                 history_kwargs["quote"] = quote
             if exchange is not None:
                 history_kwargs["exchange"] = exchange
-            bars = self._strategy.get_historical_prices(asset, **history_kwargs)
+            # Keep the Strategy owner's asset identity and resampling behavior.
+            # Lightweight strategy-like clients without the private cache API
+            # retain their existing public getter contract.
+            prefetch = (self._strategy.get_historical_prices if required_length is not None
+                        else getattr(self._strategy, "_prefetch_indicator_history", self._strategy.get_historical_prices))
+            bars = prefetch(asset, **history_kwargs)
         except Exception as exc:
             logger.debug("indicators: get_historical_prices fallback failed for %s: %s", asset, exc)
             bars = None

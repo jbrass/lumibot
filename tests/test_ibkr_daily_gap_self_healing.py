@@ -8,6 +8,15 @@ import pytest
 from lumibot.entities import Asset
 from lumibot.tools import ibkr_helper
 
+@pytest.fixture(autouse=True)
+def _frozen_equity_actions(monkeypatch):
+    from lumibot.tools.ibkr_equity_basis import EquityBasisSnapshot
+    from lumibot.tools import ibkr_helper
+    ledger = pd.DataFrame(columns=["Dividends", "Stock Splits"])
+    basis = EquityBasisSnapshot.from_verified_actions(ledger, as_of=pd.Timestamp("2026-10-10T17:00Z"), coverage_through="2026-10-09")
+    monkeypatch.setattr(ibkr_helper, "_get_current_equity_basis", lambda _: basis)
+
+
 
 def _daily_frame(dates: list[str], *, missing: bool = False) -> pd.DataFrame:
     index = pd.DatetimeIndex(
@@ -63,6 +72,9 @@ def test_retryable_daily_gaps_include_unmarked_and_legacy_markers_but_not_fresh_
     markers.loc[pd.Timestamp("2026-07-29 16:00", tz="America/New_York"), "missing_retry_after"] = (
         now + timedelta(hours=12)
     ).isoformat()
+    markers.loc[pd.Timestamp("2026-07-29 16:00", tz="America/New_York"), "missing_outcome"] = (
+        "confirmed_no_data"
+    )
     frame = pd.concat([frame, markers]).sort_index()
 
     gaps = ibkr_helper._retryable_us_daily_sessions(
@@ -73,6 +85,86 @@ def test_retryable_daily_gaps_include_unmarked_and_legacy_markers_but_not_fresh_
     )
 
     assert [ts.date().isoformat() for ts in gaps] == ["2026-07-28", "2026-07-30"]
+
+
+@pytest.mark.parametrize("outcome", [None, "partial", "transient_failure", "confirmed_no_data"])
+def test_legacy_daily_marker_cannot_suppress_a_healthy_provider_retry(outcome) -> None:
+    """Old daily repair markers suppressed available bars without confirmed NO_DATA."""
+    now = datetime(2026, 10, 8, 18, 6, tzinfo=timezone.utc)
+    frame = _daily_frame(["2026-10-01", "2026-10-02", "2026-10-05", "2026-10-06"])
+    marker = _daily_frame(["2026-10-07"], missing=True)
+    marker["missing_retry_after"] = (now + timedelta(hours=12)).isoformat()
+    if outcome is not None:
+        marker["missing_outcome"] = outcome
+    if outcome == "confirmed_no_data":
+        marker["missing_reason"] = "successful_history_response_confirmed_no_newer_bars"
+    frame = pd.concat([frame, marker]).sort_index()
+
+    gaps = ibkr_helper._retryable_us_daily_sessions(
+        frame,
+        start_dt=datetime(2026, 10, 1, 18, 6, tzinfo=timezone.utc),
+        end_dt=now,
+        now=now,
+    )
+
+    assert [ts.date().isoformat() for ts in gaps] == ["2026-10-07"]
+
+
+def test_daily_gap_repair_replaces_legacy_marker_with_actual_completed_bar(monkeypatch, tmp_path):
+    ibkr_helper._RUNTIME_DAILY_GAP_CHECKED_WINDOWS.clear()
+    frame = _daily_frame(["2026-10-01", "2026-10-02", "2026-10-05", "2026-10-06"])
+    marker = _daily_frame(["2026-10-07"], missing=True)
+    marker["missing_retry_after"] = (datetime.now(timezone.utc) + timedelta(hours=12)).isoformat()
+    marker["missing_outcome"] = "confirmed_no_data"
+    marker["missing_reason"] = "successful_history_response_confirmed_no_newer_bars"
+    frame = pd.concat([frame, marker]).sort_index()
+    calls = []
+    writes = []
+
+    def fetch(**kwargs):
+        calls.append(kwargs)
+        return _daily_frame(["2026-10-07"])
+
+    monkeypatch.setattr(ibkr_helper, "_fetch_history_between_dates", fetch)
+    monkeypatch.setattr(ibkr_helper, "_write_cache_frame", lambda path, updated: writes.append(updated.copy()))
+    result = ibkr_helper._repair_us_stock_index_daily_gaps(
+        frame,
+        cache_file=tmp_path / "APP.parquet",
+        asset=Asset("APP", asset_type=Asset.AssetType.STOCK),
+        quote=Asset("USD", asset_type=Asset.AssetType.FOREX),
+        timestep="day",
+        start_dt=datetime(2026, 10, 1, 18, 6, tzinfo=timezone.utc),
+        end_dt=datetime(2026, 10, 8, 18, 6, tzinfo=timezone.utc),
+        exchange=None,
+        include_after_hours=True,
+        source="Trades",
+        source_was_explicit=False,
+    )
+
+    assert len(calls) == 1
+    assert len(writes) == 1
+    assert result.index.is_unique
+    assert len(result) == 5
+    assert result["missing"].fillna(False).astype(bool).sum() == 0
+    pd.testing.assert_frame_equal(result.iloc[:4], frame.iloc[:4])
+
+
+@pytest.mark.parametrize("reason,covered", [
+    ("successful_history_response_confirmed_no_newer_bars", False),
+    ("explicit_no_data", True),
+])
+def test_inferred_tail_absence_is_not_a_confirmed_missing_window(reason, covered):
+    now = datetime(2026, 10, 8, 18, 6, tzinfo=timezone.utc)
+    frame = _daily_frame(["2026-10-06", "2026-10-08"], missing=True)
+    frame["missing_retry_after"] = (now + timedelta(hours=12)).isoformat()
+    frame["missing_outcome"] = "confirmed_no_data"
+    frame["missing_reason"] = reason
+    assert ibkr_helper._window_is_placeholder_covered(
+        frame,
+        start_local=pd.Timestamp("2026-10-07 09:30", tz="America/New_York"),
+        end_local=pd.Timestamp("2026-10-07 16:00", tz="America/New_York"),
+        now=now,
+    ) is covered
 
 
 def test_retryable_daily_gap_scan_is_fast_for_three_year_warm_cache() -> None:
@@ -566,7 +658,9 @@ def test_daily_gap_repair_budget_is_per_series_not_global(
         )
         assert pd.Timestamp("2026-07-28 16:00", tz="America/New_York") in result.index
 
-    assert len(calls) == 2
+    assert len(calls) == 4  # one normal plus one bounded alternate attempt per series
+    for symbol in ("QQQ", "SQQQ"):
+        assert [c.get("_backend") for c in calls if c["asset"].symbol == symbol] == [None, "tws"]
 
 
 # ---------------------------------------------------------------------------
@@ -617,7 +711,7 @@ def _minute_feed(vendor: pd.DataFrame, *, fail_after=None, exc=_StopRun):
         else:
             start = end - pd.Timedelta(days=int(period.removesuffix("d")))
         rows = vendor.loc[(vendor.index > start) & (vendor.index <= end)].tail(1000)
-        return {"data": [{"t": int(ts.timestamp() * 1000), "o": float(r["open"]), "h": float(r["high"]),
+        return {"volumeFactor": 1, "data": [{"t": int(ts.timestamp() * 1000), "o": float(r["open"]), "h": float(r["high"]),
                           "l": float(r["low"]), "c": float(r["close"]), "v": float(r["volume"])}
                          for ts, r in rows.iterrows()]}
 
@@ -1002,6 +1096,8 @@ def test_public_minute_repair_accepts_timestamp_units(monkeypatch, tmp_path, ind
     _minute_setup(monkeypatch, tmp_path)
     _new_minute_process(monkeypatch, lambda **_: None)
     vendor = _minute_vendor(["2026-08-06", "2026-08-07", "2026-08-10"])
+    from lumibot.tools.ibkr_equity_basis import decorate_adjusted_frame
+    vendor = decorate_adjusted_frame(vendor, ibkr_helper._get_current_equity_basis("SPY"), provider_prices_verified=True)
     vendor.index = vendor.index.as_unit(index_unit)
     holey = vendor.loc[vendor.index.strftime("%Y-%m-%d") != "2026-08-07"]
     path = tmp_path / "minute-cache.parquet"
@@ -1053,3 +1149,43 @@ def test_session_calendar_resolution_preserves_open_intervals(monkeypatch, index
         pd.Timestamp("2026-08-07 11:00", tz=_NY),
         include_after_hours=extended,
     )
+
+
+def test_index_daily_gap_uses_qualified_alternate_route(monkeypatch, tmp_path):
+    full = _daily_frame(['2026-10-05', '2026-10-06', '2026-10-07', '2026-10-08', '2026-10-09'])
+    cached = full.iloc[:-1].copy()
+    calls = []
+    def fetch(**kwargs):
+        calls.append(kwargs)
+        return full.copy() if kwargs.get('_backend') == 'tws' else cached.copy()
+    monkeypatch.setattr(ibkr_helper, '_RUNTIME_DAILY_GAP_CHECKED_WINDOWS', set())
+    monkeypatch.setattr(ibkr_helper, '_fetch_history_between_dates', fetch)
+    monkeypatch.setattr(ibkr_helper, '_write_cache_frame', lambda *a: None)
+    result = ibkr_helper._repair_us_stock_index_daily_gaps(
+        cached, cache_file=tmp_path / 'spx.parquet', asset=Asset('SPX', asset_type='index'),
+        quote=Asset('USD', asset_type='forex'), timestep='day',
+        start_dt=datetime(2026, 10, 5, tzinfo=timezone.utc), end_dt=datetime(2026, 10, 10, tzinfo=timezone.utc),
+        exchange='CBOE', include_after_hours=False, source='Midpoint', source_was_explicit=False)
+    pd.testing.assert_frame_equal(result, full)
+    assert [c.get('_backend') for c in calls] == [None, 'tws']
+
+
+def test_index_alternate_route_cannot_merge_incompatible_prices(monkeypatch, tmp_path):
+    full = _daily_frame(['2026-10-05', '2026-10-06', '2026-10-07', '2026-10-08', '2026-10-09'])
+    cached = full.iloc[:-1].copy()
+    incompatible = full.copy()
+    incompatible[['open', 'high', 'low', 'close']] *= 2
+    calls = []
+    def fetch(**kwargs):
+        calls.append(kwargs)
+        return incompatible.copy() if kwargs.get('_backend') == 'tws' else cached.copy()
+    monkeypatch.setattr(ibkr_helper, '_RUNTIME_DAILY_GAP_CHECKED_WINDOWS', set())
+    monkeypatch.setattr(ibkr_helper, '_fetch_history_between_dates', fetch)
+    monkeypatch.setattr(ibkr_helper, '_write_cache_frame', lambda *a: None)
+    result = ibkr_helper._repair_us_stock_index_daily_gaps(
+        cached, cache_file=tmp_path / 'spx.parquet', asset=Asset('SPX', asset_type='index'),
+        quote=Asset('USD', asset_type='forex'), timestep='day',
+        start_dt=datetime(2026, 10, 5, tzinfo=timezone.utc), end_dt=datetime(2026, 10, 10, tzinfo=timezone.utc),
+        exchange='CBOE', include_after_hours=False, source='Midpoint', source_was_explicit=False)
+    pd.testing.assert_frame_equal(result, cached)
+    assert any(c.get('_backend') == 'tws' for c in calls)

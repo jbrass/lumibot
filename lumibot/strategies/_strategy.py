@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import math
 import os
+import threading
 import time
 from collections import deque
 from importlib import import_module
@@ -205,6 +207,7 @@ def __getattr__(name):
 STATS_TABLE_NAME = "strategy_tracker"
 
 _BACKTESTING_CLASS_MODULES = {
+    "KalshiBacktesting": "lumibot.backtesting.kalshi_backtesting",
     "AlpacaBacktesting": "lumibot.backtesting.alpaca_backtesting",
     "BacktestingBroker": "lumibot.backtesting.backtesting_broker",
     "CcxtBacktesting": "lumibot.backtesting.ccxt_backtesting",
@@ -1163,7 +1166,7 @@ class _Strategy:
         # Check if cash is in the list of positions yet
         for x in range(len(self.broker._filled_positions.get_list())):
             position = self.broker._filled_positions[x]
-            if position is not None and position.asset == self._quote_asset:
+            if position is not None and position.asset == self._quote_asset and position.strategy == self._name:
                 position.quantity = cash
                 self.broker._filled_positions[x] = position
                 self._cash_position = position
@@ -1675,6 +1678,13 @@ class _Strategy:
                     self._last_known_prices[asset] = price
 
                 if self.is_backtesting and price is None:
+                    # A last-known mark may keep the ledger inspectable, but cannot
+                    # qualify an unknown current-price gap as complete IBKR data.
+                    # Provider adapters already handle verified market closures.
+                    position_source = option_source if is_option_asset and option_source is not None else data_source
+                    record_missing = getattr(position_source, "record_missing_valuation", None)
+                    if quantity != 0 and callable(record_missing) and not (is_option_asset and not option_marking_allowed):
+                        record_missing(asset)
                     # Forward-fill fallback: use last known price when current price is unavailable.
                     # This is critical for illiquid options (LEAPS) that may not trade for days.
                     if asset in self._last_known_prices:
@@ -1743,6 +1753,9 @@ class _Strategy:
                     entry_price = position.avg_fill_price if (hasattr(position, 'avg_fill_price') and position.avg_fill_price) else price
                     unrealized_pnl = (float(price) - float(entry_price)) * float(quantity) * multiplier
                     portfolio_value += unrealized_pnl
+                elif self.is_backtesting and position_asset_type == "crypto_future":
+                    portfolio_value += float(self.broker._perpetuals.unrealized(
+                        self, position, price, currency=quote_asset.symbol))
                 else:
                     # All other cases (stocks, options, crypto, live trading)
                     position_value = float(quantity) * float(price) * multiplier
@@ -2229,6 +2242,16 @@ class _Strategy:
             return cash
 
     def _update_positions_with_splits(self):
+        """Apply raw-price splits and cancel carried orders in backtests only.
+
+        Conservative backtest policy: cancel rather than guess a broker's price,
+        quantity or rounding adjustments. This matches IBKR's GTC cancellation
+        on forward/reverse splits (interactivebrokers.com/en/trading/ordertypes.php).
+        FINRA 5330(b) also requires cancellation for reverse splits; forward-split
+        adjustment rules vary by order and venue. Split-adjusted feeds need neither
+        position changes nor order cancellation. Fractional holdings remain intact;
+        no cash-in-lieu payment is invented without actual settlement information.
+        """
         if not self.is_backtesting:
             return 0
 
@@ -2240,7 +2263,7 @@ class _Strategy:
             current_date = current_dt.date() if hasattr(current_dt, 'date') else current_dt
             positions = self.broker.get_tracked_positions(self._name)
 
-            stock_positions = []
+            stock_positions = {}
             assets = []
             for position in positions:
                 asset = position.asset
@@ -2252,8 +2275,24 @@ class _Strategy:
                     continue
                 if not position.quantity:
                     continue
-                stock_positions.append(position)
+                stock_positions[asset] = position
                 assets.append(asset)
+
+            carried_orders = {}
+            for order in self.broker.get_active_tracked_orders(strategy=self._name):
+                asset = order.asset
+                asset_type = getattr(asset, "asset_type", "")
+                asset_type = getattr(asset_type, "value", asset_type)
+                if asset == self._quote_asset or str(asset_type).lower() != "stock":
+                    continue
+                created = getattr(order, "_date_created", None)
+                # Orders created this session already use the post-split units.
+                # An undated legacy order cannot safely retain pre-split prices.
+                if created is not None and created.date() >= current_date:
+                    continue
+                carried_orders.setdefault(asset, []).append(order)
+                if asset not in assets:
+                    assets.append(asset)
 
             if not assets:
                 return 0
@@ -2271,8 +2310,8 @@ class _Strategy:
 
             applied = 0
             should_apply_splits = getattr(data_source, "should_apply_stock_splits_to_positions", None)
-            for position in stock_positions:
-                asset = position.asset
+            for asset in assets:
+                position = stock_positions.get(asset)
                 if callable(should_apply_splits):
                     try:
                         if not should_apply_splits(asset, quote=self._quote_asset):
@@ -2297,6 +2336,15 @@ class _Strategy:
                 symbol = getattr(asset, 'symbol', str(asset))
                 tracker_key = (current_date, symbol, f"{split_ratio:.12g}")
                 if tracker_key in self._stock_splits_applied_tracker:
+                    continue
+
+                # Use the normal broker cancellation owner so state, events and
+                # protective children are updated consistently. Never reprice.
+                for order in carried_orders.get(asset, ()):
+                    if order.is_active():
+                        self.broker.cancel_order(order)
+                if position is None:
+                    self._stock_splits_applied_tracker.add(tracker_key)
                     continue
 
                 try:
@@ -2465,6 +2513,12 @@ class _Strategy:
             self._strategy_returns_df = day_deduplicate(self._stats)
 
             self._analysis = stats_summary(self._strategy_returns_df, self.risk_free_rate)
+            assumptions = getattr(self.broker, "backtest_assumptions", None)
+            if assumptions:
+                self._analysis["backtest_assumptions"] = list(assumptions)
+            perpetual_events = getattr(self.broker, "perpetual_events", None)
+            if perpetual_events:
+                self._analysis["perpetual_events"] = [row for row in perpetual_events if row["strategy"] == self._name]
 
             # Get performance for the benchmark asset
             self._dump_benchmark_stats()
@@ -3276,6 +3330,7 @@ class _Strategy:
                 "interactivebrokersrest": "InteractiveBrokersRESTBacktesting",
                 "interactive_brokers_rest": "InteractiveBrokersRESTBacktesting",
                 "polymarket": "PolymarketBacktesting",
+                "kalshi": "KalshiBacktesting",
                 "polymarket_clob": "PolymarketBacktesting",
                 "router": "RoutedBacktestingPandas",
                 "thetadata_ibkr": "RoutedBacktestingPandas",
@@ -3567,6 +3622,12 @@ class _Strategy:
                 from lumibot.backtesting.data_provenance import write_backtest_data_provenance
 
                 write_backtest_data_provenance(data_source, logdir)
+                from lumibot.backtesting.market_input_evidence import write_market_input_evidence
+
+                write_market_input_evidence(data_source, logdir)
+                option_source = getattr(self.broker, "option_source", None)
+                if option_source is not None and option_source is not data_source:
+                    write_market_input_evidence(option_source, logdir, prefix="option_")
             except Exception as exc:
                 # Provenance is diagnostic metadata and must never make an otherwise valid
                 # trading simulation fail at the artifact-writing boundary.
@@ -3661,7 +3722,7 @@ class _Strategy:
         # are disabled, in case downstream tooling reads the events-style format.
         # Note: plot_returns() now always writes the simplified trades CSV/parquet
         # regardless of show_plot, so this is a secondary export for compatibility.
-        if not show_plot:
+        if not show_plot or self._benchmark_returns_df is None or self._strategy_returns_df is None:
             backtesting_broker.export_trade_events_to_csv(trades_file)
         self.plot_returns_vs_benchmark(
             plot_file_html=plot_file_html,
@@ -3791,7 +3852,8 @@ class _Strategy:
     @staticmethod
     def _collect_cash_events_for_cloud(self) -> list[CashEvent]:
         pending_events = list(getattr(self, "_cash_event_pending_for_cloud", []) or [])
-        emit_limit = int(getattr(self, "_cash_event_cloud_emit_limit", 50) or 50)
+        emit_limit = int(getattr(self, "_cash_event_sync_emit_limit", None) or
+                         getattr(self, "_cash_event_cloud_emit_limit", 50) or 50)
         if pending_events:
             return pending_events[:emit_limit]
 
@@ -3824,9 +3886,30 @@ class _Strategy:
             )
         self._cash_event_last_poll_at = now_utc
 
+        self._cash_event_fetch_failed = False
         try:
-            fetched_events = get_cash_events(since=fetch_since, limit=fetch_limit)
+            get_sync = getattr(broker, "get_cash_event_sync", None)
+            if callable(get_sync):
+                from lumibot.entities import CashEventSync
+
+                result = get_sync(since=fetch_since, limit=fetch_limit)
+                if not isinstance(result, CashEventSync):
+                    raise ValueError("Broker returned invalid cash history evidence")
+                # A receipt describes a whole read, including previously seen
+                # events. Receiver event IDs make repeated windows idempotent.
+                self._cash_event_sync_producer_kind = getattr(
+                    self, "_cash_event_producer_kind",
+                    "managed_bot" if os.environ.get("BOTSPOT_DEPLOYMENT_ID") else "external_bot",
+                )
+                self._cash_event_sync_for_cloud = result
+                self._cash_event_sync_batch_index = 0
+                self._cash_event_sync_emit_limit = emit_limit
+                self._cash_event_sync_needs_delivery = True
+                fetched_events = list(result.events)
+            else:
+                fetched_events = get_cash_events(since=fetch_since, limit=fetch_limit)
         except Exception as exc:
+            self._cash_event_fetch_failed = True
             broker_name = getattr(broker, "name", None) or broker.__class__.__name__
             self.logger.warning(
                 f"Failed to load broker cash events from {broker_name} "
@@ -3834,7 +3917,9 @@ class _Strategy:
             )
             self.logger.debug(_format_exc())
             return []
-        self._cash_event_initial_history_loaded = True
+        result = getattr(self, "_cash_event_sync_for_cloud", None)
+        if result is None or result.state == "complete":
+            self._cash_event_initial_history_loaded = True
 
         sent_ids = getattr(self, "_cash_event_sent_ids", set())
         pending_ids = {
@@ -3846,7 +3931,7 @@ class _Strategy:
         for event in fetched_events or []:
             if not isinstance(event, _cash_event_class()):
                 continue
-            if event.event_id in sent_ids or event.event_id in pending_ids:
+            if (result is None and event.event_id in sent_ids) or event.event_id in pending_ids:
                 continue
             normalized_events.append(event)
 
@@ -3864,6 +3949,12 @@ class _Strategy:
 
     @staticmethod
     def _mark_cash_events_sent(self, emitted_events: list[CashEvent]) -> None:
+        if getattr(self, "_cash_event_sync_needs_delivery", False):
+            self._cash_event_sync_batch_index += 1
+            if len(getattr(self, "_cash_event_pending_for_cloud", ())) <= len(emitted_events):
+                self._cash_event_sync_needs_delivery = False
+                self._cash_event_sync_for_cloud = None
+                self._cash_event_sync_emit_limit = None
         if not emitted_events:
             return
 
@@ -3880,12 +3971,52 @@ class _Strategy:
 
         self._cash_event_pending_for_cloud = remaining_pending_events
 
+    def send_account_snapshot_to_cloud(self, *, max_batches=100):
+        """Deliver a bounded snapshot including every pending cash-event batch.
+
+        Failed batches stay pending for retry. Queue acceptance does not prove
+        listener persistence. No strategy iteration or order is executed.
+        """
+        if type(max_batches) is not int or not 1 <= max_batches <= 10000:
+            raise ValueError("max_batches must be an integer between 1 and 10000")
+        lock = self.__dict__.setdefault("_cloud_update_lock", threading.RLock())
+        with lock:
+            previous_kind = self.__dict__.get("_cash_event_producer_kind")
+            self._cash_event_producer_kind = "account_snapshot"
+            try:
+                for _ in range(max_batches):
+                    before = len(getattr(self, "_cash_event_pending_for_cloud", ()) or ())
+                    if not _Strategy.send_update_to_cloud(self):
+                        return False
+                    if getattr(self, "_cash_event_fetch_failed", False):
+                        return False
+                    after = len(getattr(self, "_cash_event_pending_for_cloud", ()) or ())
+                    if not after:
+                        return True
+                    if before and after >= before:
+                        self.logger.error("Snapshot cash-event delivery made no progress")
+                        return False
+                self.logger.error("Snapshot cash-event delivery exceeded its batch budget")
+                return False
+            finally:
+                if previous_kind is None:
+                    self.__dict__.pop("_cash_event_producer_kind", None)
+                else:
+                    self._cash_event_producer_kind = previous_kind
+
     def send_update_to_cloud(self):
         """
         Sends an update to the LumiWealth cloud server with the current portfolio value, cash, positions, and any outstanding orders.
         There is an API Key that is required to send the update to the cloud.
         The API Key is stored in the environment variable LUMIWEALTH_API_KEY.
         """
+        # Concurrent callers must not acknowledge the same batch twice or
+        # advance a receipt while another request is still using its identity.
+        lock = self.__dict__.setdefault("_cloud_update_lock", threading.RLock())
+        with lock:
+            return _Strategy._send_update_to_cloud(self)
+
+    def _send_update_to_cloud(self):
         # Check if we are in backtesting mode, if so, don't send the message
         if self.is_backtesting:
             self.logger.debug("Skipping cloud update - in backtesting mode")
@@ -3933,6 +4064,9 @@ class _Strategy:
         try:
             portfolio_value = _verified_number(self._portfolio_value, "portfolio_value")
             cash = _verified_number(self.get_cash(), "cash")
+            # Timestamp these balances before slower position/funding reads.
+            # Serialization time is not the time this account value was observed.
+            account_snapshot_checked_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
             self.logger.debug(f"Portfolio value: {portfolio_value}")
             self.logger.debug(f"Cash: {cash}")
         except Exception as e:
@@ -3997,10 +4131,17 @@ class _Strategy:
             "broker_name": self.broker.name,
             "account_snapshot_status": "verified",
             "account_snapshot_source": "broker_balance_refresh",
-            "account_snapshot_checked_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "account_snapshot_checked_at": account_snapshot_checked_at,
             "positions_snapshot_status": positions_snapshot_status,
             "positions_snapshot_source": positions_snapshot_source,
         }
+        if getattr(self, "_cash_event_sync_needs_delivery", False):
+            result = self._cash_event_sync_for_cloud
+            data["funding_sync"] = result.to_dict(
+                producer_kind=self._cash_event_sync_producer_kind,
+                batch_index=self._cash_event_sync_batch_index,
+                batch_size=self._cash_event_sync_emit_limit,
+            )
         if positions is not None:
             data["positions"] = [position.to_dict() for position in positions]
 
@@ -4651,11 +4792,29 @@ class _Strategy:
         )
 
     @classmethod
-    def _deserialize_variables_from_backup(cls, json_data):
+    def _deserialize_variables_from_backup(cls, json_data, initialized_variables=None):
         data = _json_loads(json_data)
         if not isinstance(data, dict):
             raise ValueError("Variables backup must contain a JSON object")
-        return {key: cls._decode_variable_from_backup(value) for key, value in data.items()}
+        decoded = {key: cls._decode_variable_from_backup(value) for key, value in data.items()}
+        return cls._restore_legacy_assets(decoded, initialized_variables)
+
+    @classmethod
+    def _restore_legacy_assets(cls, saved, initialized):
+        # The initialized type is the schema. Never guess from a ticker or from
+        # a dictionary's field names alone: user metadata can have that shape.
+        if isinstance(initialized, Asset) and isinstance(saved, dict):
+            expected_keys = set(initialized.to_dict())
+            if set(saved) not in (expected_keys, expected_keys - {"leverage"}):
+                raise ValueError("Legacy instrument state does not match the Asset schema")
+            return Asset.from_dict(saved)
+        if isinstance(saved, dict) and isinstance(initialized, dict):
+            return {key: cls._restore_legacy_assets(value, initialized.get(key)) for key, value in saved.items()}
+        if isinstance(saved, (list, tuple)) and isinstance(initialized, (list, tuple)):
+            restored = [cls._restore_legacy_assets(value, initialized[index] if index < len(initialized) else None)
+                        for index, value in enumerate(saved)]
+            return tuple(restored) if isinstance(saved, tuple) else restored
+        return saved
 
     def _load_variables_from_scheduled_state_file(self):
         state_file = os.environ.get("LUMIBOT_SCHEDULED_STATE_FILE")
@@ -4664,7 +4823,22 @@ class _Strategy:
 
         try:
             with open(state_file, "r", encoding="utf-8") as f:
-                data = self._deserialize_variables_from_backup(f.read())
+                original_json = f.read()
+            decoded = self._deserialize_variables_from_backup(original_json)
+            data = self._restore_legacy_assets(decoded, self.vars.all())
+            if self._serialize_variables_for_backup(decoded) != self._serialize_variables_for_backup(data):
+                # Preserve original bytes before any variable or state write.
+                digest = hashlib.sha256(original_json.encode("utf-8")).hexdigest()
+                backup_path = f"{state_file}.legacy-{digest}.bak"
+                try:
+                    fd = os.open(backup_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                except FileExistsError:
+                    with open(backup_path, "r", encoding="utf-8") as backup:
+                        if backup.read() != original_json:
+                            raise ValueError("Legacy state backup does not match original bytes")
+                else:
+                    with os.fdopen(fd, "w", encoding="utf-8") as backup:
+                        backup.write(original_json)
         except FileNotFoundError:
             self.logger.info("Scheduled state file does not exist yet. Not restoring variables.")
             return
@@ -4871,7 +5045,7 @@ class _Strategy:
                     return tuple(_coerce_legacy_dates(nested) for nested in value)
                 return value
 
-            data = _coerce_legacy_dates(self._deserialize_variables_from_backup(json_data))
+            data = _coerce_legacy_dates(self._deserialize_variables_from_backup(json_data, self.vars.all()))
     
             # Update self.vars dictionary
             for key, value in data.items():

@@ -62,6 +62,11 @@ else:
 # CI enforces this via workflow env; do the same for local runs.
 os.environ["BACKTESTING_DATA_SOURCE"] = "none"
 
+# The shared history cache stays off unless a test turns it on (and isolates its
+# folder and remote store). Fake broker bars must never reach a developer's real
+# cache bucket or leak between tests.
+os.environ["LUMIBOT_SHARED_BARS"] = "false"
+
 # Many tests flip `IS_BACKTESTING` on/off via direct `os.environ[...] = ...` assignment (not using
 # pytest's monkeypatch), which can leak state across the suite and create order-dependent failures.
 # Keep the environment stable by restoring `IS_BACKTESTING` after every test.
@@ -328,6 +333,7 @@ def pytest_runtest_setup(item: pytest.Item):
       - polygon: requires Polygon credentials
       - thetadata: requires ThetaData credentials
       - ibkr: downloader-only IBKR tests; does not require Polygon/ThetaData creds
+      - kalshi: Kalshi tests; credentials are checked by the provider fixture
       - polymarket: Polymarket CLOB tests; does not require Polygon/ThetaData creds
       - polymarket_credentials: requires Polymarket wallet/CLOB credentials
       - polymarket_live_trading: requires explicit live-trading enablement
@@ -349,13 +355,14 @@ def pytest_runtest_setup(item: pytest.Item):
     requires_polygon = item.get_closest_marker("polygon") is not None
     requires_theta = item.get_closest_marker("thetadata") is not None
     requires_ibkr = item.get_closest_marker("ibkr") is not None
+    requires_kalshi = item.get_closest_marker("kalshi") is not None
     requires_polymarket = item.get_closest_marker("polymarket") is not None
     requires_polymarket_credentials = item.get_closest_marker("polymarket_credentials") is not None
     requires_polymarket_live_trading = item.get_closest_marker("polymarket_live_trading") is not None
     requires_public_http = item.get_closest_marker("public_http") is not None
 
     # Determine which providers are required
-    if requires_public_http or requires_ibkr or requires_polymarket or requires_alpaca:
+    if requires_public_http or requires_ibkr or requires_polymarket or requires_kalshi or requires_alpaca:
         need_polygon = False
         need_theta = False
     elif requires_polygon or requires_theta:

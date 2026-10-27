@@ -17,15 +17,25 @@ broad mandate leads you to a stock idea, load it before submitting an order.
    `market_load_history_table` does not replace it before a stock order.
    Compute averages and indicators with a tool (`get_indicator`, `get_indicators`,
    or `duckdb_query` over loaded bars), never by mental arithmetic, and quote
-   the tool's value.
+   the tool's value. A query returning individual closes has not computed their
+   average. Request the aggregate or indicator and inspect its returned value
+   before using it in a decision or describing it as tool-calculated.
    For lookback rules, select the requested count of the latest completed bars
-   and match the reported indicator and date window to that tool result. Do not
-   discard an already-completed bar again or substitute an earlier indicator row.
+   and match the reported indicator and date window to that tool result. When
+   reporting a date span, retrieve the first and last timestamps of those same
+   selected rows alongside the aggregate. Do not infer their dates from a bar
+   count or an assumed weekday calendar. If the result does not give the window,
+   omit that extra date claim. Do not discard an already-completed bar again or
+   substitute an earlier indicator row.
 3. Use batch tools for a universe. Do not loop one symbol at a time when a batch
    price or history tool can return the same evidence.
 4. Evaluate the user's entry, exit, sizing, and frequency rules against current
    evidence. Write down the decisive condition and whether it is true before
-   submitting an order. Do not invent missing signals.
+   submitting an order. Do not invent missing signals. Keep the explanation's
+   comparisons identical to the evaluated rule: a latest price exceeding an
+   average does not establish that every constituent bar exceeded it. If a
+   claim concerns all bars, their count, or a date range, compute and inspect
+   that exact predicate from the returned data before asserting it.
 5. Size from current portfolio value, available cash, current price, volatility or
    stop distance, and the user's risk rules. For a notional cap, calculate
    the maximum notional and call `risk_calculate_stock_quantity`; use its returned
@@ -71,3 +81,20 @@ Load only the smallest relevant reference:
 
 The user's active strategy rules decide whether a trade should happen. This skill
 provides reusable stock-trading mechanics and does not invent a strategy.
+
+## Explain consequential order actions
+
+Supply an explicit `reason` before every submission, modification or cancellation.
+Use at least 200 characters; aim for 600–2,500 when the decision needs it. Explain
+the thesis, dated evidence, sizing, material risks and what would invalidate it.
+State missing evidence honestly. This is a decision summary, not hidden internal
+reasoning, and must contain no credentials or account identifiers. The order
+service commits it before execution. Report only observed order status and fills;
+reconcile an uncertain outcome before trying again.
+
+When a separate `public_reason` is requested, write a qualitative trade thesis
+and risk. Keep portfolio-relative sizing percentages, formulas, account value,
+buying power, owner context and tool purposes in the private `reason` only. Do
+not copy its sizing explanation into the public summary. Follow the order tool's
+public-summary contract before submitting; later omission of an unsafe summary
+does not make that proposed summary suitable for sharing.

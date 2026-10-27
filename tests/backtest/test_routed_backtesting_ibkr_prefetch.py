@@ -89,7 +89,7 @@ def test_router_ibkr_prefetches_full_window_once_for_cont_future_minute(monkeypa
 
     calls: list[dict] = []
 
-    def fake_get_price_data(*, asset, quote, timestep, start_dt, end_dt, exchange=None, include_after_hours=True, source=None):
+    def fake_get_price_data(*, asset, quote, timestep, start_dt, end_dt, exchange=None, include_after_hours=True, source=None, history_as_of=None):
         calls.append(
             {
                 "asset": asset,
@@ -148,7 +148,7 @@ def test_router_ibkr_prefetches_full_window_once_for_cont_future_multi_minute(mo
 
     calls: list[dict] = []
 
-    def fake_get_price_data(*, asset, quote, timestep, start_dt, end_dt, exchange=None, include_after_hours=True, source=None):
+    def fake_get_price_data(*, asset, quote, timestep, start_dt, end_dt, exchange=None, include_after_hours=True, source=None, history_as_of=None):
         calls.append({"timestep": timestep, "start_dt": start_dt, "end_dt": end_dt})
         assert timestep == "60minute"
         return _multi_minute_ohlc(start_dt, end_dt, minutes=60)
@@ -194,7 +194,7 @@ def test_router_ibkr_prefetch_slices_expected_window(monkeypatch):
     asset = Asset("NQ", asset_type=Asset.AssetType.CONT_FUTURE)
     quote = Asset("USD", asset_type=Asset.AssetType.FOREX)
 
-    def fake_get_price_data(*, asset, quote, timestep, start_dt, end_dt, exchange=None, include_after_hours=True, source=None):
+    def fake_get_price_data(*, asset, quote, timestep, start_dt, end_dt, exchange=None, include_after_hours=True, source=None, history_as_of=None):
         return _minute_ohlc(start_dt, end_dt)
 
     monkeypatch.setattr(ibkr_helper, "get_price_data", fake_get_price_data)
@@ -233,7 +233,7 @@ def test_router_ibkr_prefetches_full_window_once_for_crypto_minute(monkeypatch):
 
     calls: list[dict] = []
 
-    def fake_get_price_data(*, asset, quote, timestep, start_dt, end_dt, exchange=None, include_after_hours=True, source=None):
+    def fake_get_price_data(*, asset, quote, timestep, start_dt, end_dt, exchange=None, include_after_hours=True, source=None, history_as_of=None):
         calls.append({"timestep": timestep, "start_dt": start_dt, "end_dt": end_dt})
         return _minute_ohlc(start_dt, end_dt)
 
@@ -525,7 +525,27 @@ def _ibkr_5min_extended_hours(days: list[str]) -> pd.DataFrame:
     return pd.concat(frames).sort_index()
 
 
-def test_router_ibkr_stock_minute_clamped_pre_open_end_does_not_refetch_every_bar(monkeypatch, tmp_path):
+@pytest.fixture
+def equity_basis(monkeypatch):
+    """These synthetic share-volume bars use one verified, split-free price basis.
+
+    Provider fixtures declare volumeFactor=1 explicitly: their volume already
+    counts shares. Keep broker paging behavior independent of Yahoo/network state.
+    """
+    import lumibot.tools.ibkr_helper as ibkr_helper
+    from lumibot.tools.ibkr_equity_basis import EquityBasisSnapshot
+
+    snapshot = EquityBasisSnapshot.from_verified_actions(
+        pd.DataFrame(columns=["Dividends", "Stock Splits"],
+                     index=pd.DatetimeIndex([], tz="America/New_York")),
+        as_of=pd.Timestamp("2026-10-10T12:00:00Z"),
+        coverage_through="2026-10-09",
+    )
+    monkeypatch.setattr(ibkr_helper, "_get_current_equity_basis", lambda _symbol: snapshot)
+    return snapshot
+
+
+def test_router_ibkr_stock_minute_clamped_pre_open_end_does_not_refetch_every_bar(monkeypatch, tmp_path, equity_basis):
     import lumibot.tools.ibkr_helper as ibkr_helper
 
     monkeypatch.setenv("DATADOWNLOADER_BASE_URL", "http://localhost:8080")
@@ -544,8 +564,11 @@ def test_router_ibkr_stock_minute_clamped_pre_open_end_does_not_refetch_every_ba
     cached = _ibkr_5min_extended_hours(["2026-09-08", "2026-09-09", "2026-09-10", "2026-09-11", "2026-09-14"])
     cached["missing"] = False
     cache_file = ibkr_helper._cache_file_for(
-        asset=asset, quote=quote, timestep="5minute", exchange=None, source="Trades", include_after_hours=True
+        asset=asset, quote=quote, timestep="5minute", exchange=None, source="Trades", include_after_hours=True,
+        equity_basis=equity_basis.split_fingerprint
     )
+    from lumibot.tools.ibkr_equity_basis import decorate_adjusted_frame
+    cached = decorate_adjusted_frame(cached, equity_basis, provider_prices_verified=True)
     ibkr_helper._write_cache_frame(cache_file, cached)
 
     # What IBKR holds. `startTime` is the END of the returned window (see _fetch_history_between_dates).
@@ -562,6 +585,7 @@ def test_router_ibkr_stock_minute_clamped_pre_open_end_does_not_refetch_every_ba
         window_start = window_end - pd.Timedelta(minutes=int(str(querystring["period"]).removesuffix("min")))
         rows = vendor.loc[(vendor.index >= window_start) & (vendor.index <= window_end)]
         return {
+            "volumeFactor": 1,
             "data": [
                 {
                     "t": int(ts.timestamp() * 1000),
@@ -582,15 +606,23 @@ def test_router_ibkr_stock_minute_clamped_pre_open_end_does_not_refetch_every_ba
     router = _make_router(start, clamped_end, {"default": "ibkr", "stock": "ibkr"})
 
     seen_last_bars = []
+    first_call_requests = None
     for step in range(12):
         router._datetime = LUMIBOT_DEFAULT_PYTZ.localize(datetime(2026, 9, 8, 9, 30)) + timedelta(minutes=5 * step)
         bars = router.get_historical_prices(asset, length=250, timestep="5minute", quote=quote)
         assert bars is not None and not bars.df.empty
+        assert len(bars.df) == 250, "Calendar closures must not underfill the requested lookback"
+        if first_call_requests is None:
+            first_call_requests = len(requests)
+        else:
+            assert len(requests) == first_call_requests, "Warm steps must add zero broker requests"
         seen_last_bars.append(bars.df.index[-1])
 
     request_keys = [tuple(sorted(r.items())) for r in requests]
     assert len(request_keys) == len(set(request_keys)), f"identical IBKR requests repeated: {requests}"
-    assert len(requests) <= 2, f"expected at most the first-call edge probes, got {len(requests)}: {requests}"
+    # The old two-probe budget accepted an underfilled 250-bar request. Filling
+    # the full pre-holiday history needs one additional bounded first-call page.
+    assert len(requests) <= 3, f"expected only first-call history/edge probes, got {len(requests)}: {requests}"
     # The strategy sees the real session bars, including the 09:30 open.
     assert pd.Timestamp("2026-09-08 09:30", tz="America/New_York") in set(seen_last_bars)
 
@@ -627,7 +659,7 @@ def _ibkr_1min_extended_hours(days: list[str]) -> pd.DataFrame:
     return pd.concat(frames).sort_index()
 
 
-def test_router_ibkr_stock_minute_prefetch_pages_across_weekends(monkeypatch, tmp_path):
+def test_router_ibkr_stock_minute_prefetch_pages_across_weekends(monkeypatch, tmp_path, equity_basis):
     import lumibot.tools.ibkr_helper as ibkr_helper
 
     monkeypatch.setenv("DATADOWNLOADER_BASE_URL", "http://localhost:8080")
@@ -657,6 +689,7 @@ def test_router_ibkr_stock_minute_prefetch_pages_across_weekends(monkeypatch, tm
         window_start = window_end - pd.Timedelta(minutes=int(str(querystring["period"]).removesuffix("min")))
         rows = vendor.loc[(vendor.index > window_start) & (vendor.index <= window_end)].tail(1000)
         return {
+            "volumeFactor": 1,
             "data": [
                 {"t": int(ts.timestamp() * 1000), "o": float(r["open"]), "h": float(r["high"]),
                  "l": float(r["low"]), "c": float(r["close"]), "v": float(r["volume"])}
@@ -682,7 +715,8 @@ def test_router_ibkr_stock_minute_prefetch_pages_across_weekends(monkeypatch, tm
     # The prefetch reached every session of the backtest window, across two weekends and
     # the Labor Day holiday, with no identical request repeated.
     cache_file = ibkr_helper._cache_file_for(
-        asset=asset, quote=quote, timestep="minute", exchange=None, source="Trades", include_after_hours=True
+        asset=asset, quote=quote, timestep="minute", exchange=None, source="Trades", include_after_hours=True,
+        equity_basis=equity_basis.split_fingerprint
     )
     cached = pd.read_parquet(cache_file)
     real = cached[~cached.get("missing", pd.Series(False, index=cached.index)).fillna(False).astype(bool)]
@@ -704,7 +738,7 @@ def test_router_ibkr_stock_minute_prefetch_pages_across_weekends(monkeypatch, tm
 # ---------------------------------------------------------------------------
 
 
-def test_ibkr_stock_minute_request_ending_now_stays_behind_the_delayed_feed(monkeypatch, tmp_path):
+def test_ibkr_stock_minute_request_ending_now_stays_behind_the_delayed_feed(monkeypatch, tmp_path, equity_basis):
     import lumibot.tools.ibkr_helper as ibkr_helper
 
     monkeypatch.setenv("DATADOWNLOADER_BASE_URL", "http://localhost:8080")
@@ -734,7 +768,7 @@ def test_ibkr_stock_minute_request_ending_now_stays_behind_the_delayed_feed(monk
             )
         window_start = window_end - pd.Timedelta(minutes=int(str(querystring["period"]).removesuffix("min")))
         rows = rows.loc[rows.index > window_start].tail(1000)
-        return {"data": [{"t": int(ts.timestamp() * 1000), "o": float(r["open"]), "h": float(r["high"]),
+        return {"volumeFactor": 1, "data": [{"t": int(ts.timestamp() * 1000), "o": float(r["open"]), "h": float(r["high"]),
                           "l": float(r["low"]), "c": float(r["close"]), "v": float(r["volume"])}
                          for ts, r in rows.iterrows()]}
 
@@ -807,7 +841,7 @@ def test_ibkr_index_minute_history_pages_across_overnight_and_weekend_gaps(monke
     assert len(request_keys) == len(set(request_keys))
 
 
-def test_ibkr_stock_minute_paging_uses_one_request_per_session(monkeypatch, tmp_path):
+def test_ibkr_stock_minute_paging_uses_one_request_per_session(monkeypatch, tmp_path, equity_basis):
     """Speed: a 1000-minute page anchored at the oldest bar just received straddles the closed
     overnight gap, so production paging made ~1.8 downloader requests per session (90 SPY
     requests for 50 sessions, ~20 minutes of wall time per calendar month on the shared
@@ -833,7 +867,7 @@ def test_ibkr_stock_minute_paging_uses_one_request_per_session(monkeypatch, tmp_
         window_end = pd.Timestamp(datetime.strptime(querystring["startTime"], "%Y%m%d-%H:%M:%S"), tz="UTC")
         window_start = window_end - pd.Timedelta(minutes=int(str(querystring["period"]).removesuffix("min")))
         rows = vendor.loc[(vendor.index > window_start) & (vendor.index <= window_end)].tail(1000)
-        return {"data": [{"t": int(ts.timestamp() * 1000), "o": float(r["open"]), "h": float(r["high"]),
+        return {"volumeFactor": 1, "data": [{"t": int(ts.timestamp() * 1000), "o": float(r["open"]), "h": float(r["high"]),
                           "l": float(r["low"]), "c": float(r["close"]), "v": float(r["volume"])}
                          for ts, r in rows.iterrows()]}
 
@@ -856,7 +890,7 @@ class _SimulatedStop(BaseException):
     """Stands in for a force-stopped or timed-out backtest process."""
 
 
-def test_ibkr_minute_paging_checkpoints_pages_so_a_stopped_run_keeps_its_progress(monkeypatch, tmp_path):
+def test_ibkr_minute_paging_checkpoints_pages_so_a_stopped_run_keeps_its_progress(monkeypatch, tmp_path, equity_basis):
     """2026-09-24: a cold 8-month 1-minute series takes hours on the shared downloader. The cache
     was written only after the whole backward walk finished, so a customer who force-stopped
     after an hour (or a run that hit its time limit) kept nothing and every retry started over.
@@ -883,7 +917,7 @@ def test_ibkr_minute_paging_checkpoints_pages_so_a_stopped_run_keeps_its_progres
         window_end = pd.Timestamp(datetime.strptime(querystring["startTime"], "%Y%m%d-%H:%M:%S"), tz="UTC")
         window_start = window_end - pd.Timedelta(minutes=int(str(querystring["period"]).removesuffix("min")))
         rows = vendor.loc[(vendor.index > window_start) & (vendor.index <= window_end)].tail(1000)
-        return {"data": [{"t": int(ts.timestamp() * 1000), "o": float(r["open"]), "h": float(r["high"]),
+        return {"volumeFactor": 1, "data": [{"t": int(ts.timestamp() * 1000), "o": float(r["open"]), "h": float(r["high"]),
                           "l": float(r["low"]), "c": float(r["close"]), "v": float(r["volume"])}
                          for ts, r in rows.iterrows()]}
 
@@ -897,7 +931,7 @@ def test_ibkr_minute_paging_checkpoints_pages_so_a_stopped_run_keeps_its_progres
             end_dt=datetime(2026, 9, 19, 0, 0, tzinfo=timezone.utc), include_after_hours=True)
 
     cache_file = ibkr_helper._cache_file_for(asset=asset, quote=quote, timestep="minute", exchange=None,
-                                             source="Trades", include_after_hours=True)
+                                             source="Trades", include_after_hours=True, equity_basis=equity_basis.split_fingerprint)
     assert cache_file.exists(), "nothing reached the cache before the run stopped"
     cached = pd.read_parquet(cache_file)
     cached_days = set(cached.index.tz_convert("America/New_York").strftime("%Y-%m-%d"))
@@ -1169,7 +1203,7 @@ def test_loaded_intraday_series_check_uses_binary_search_not_a_full_index_scan(m
     assert router._has_loaded_intraday_series(asset, quote) is True
 
 
-def test_ibkr_thin_stock_minute_paging_still_uses_one_request_per_session(monkeypatch, tmp_path):
+def test_ibkr_thin_stock_minute_paging_still_uses_one_request_per_session(monkeypatch, tmp_path, equity_basis):
     """Live 2026-09-24: XLK's first pre-market print is often 04:01 or later, so "only closed time
     before the oldest bar" never held and its pages kept stepping at 08:01 and 15:21 UTC (about
     1.8 requests per session). A page whose window already covered the session start has every
@@ -1199,7 +1233,7 @@ def test_ibkr_thin_stock_minute_paging_still_uses_one_request_per_session(monkey
         window_end = pd.Timestamp(datetime.strptime(querystring["startTime"], "%Y%m%d-%H:%M:%S"), tz="UTC")
         window_start = window_end - pd.Timedelta(minutes=int(str(querystring["period"]).removesuffix("min")))
         rows = vendor.loc[(vendor.index > window_start) & (vendor.index <= window_end)].tail(1000)
-        return {"data": [{"t": int(ts.timestamp() * 1000), "o": float(r["open"]), "h": float(r["high"]),
+        return {"volumeFactor": 1, "data": [{"t": int(ts.timestamp() * 1000), "o": float(r["open"]), "h": float(r["high"]),
                           "l": float(r["low"]), "c": float(r["close"]), "v": float(r["volume"])}
                          for ts, r in rows.iterrows()]}
 
@@ -1218,7 +1252,7 @@ def test_ibkr_thin_stock_minute_paging_still_uses_one_request_per_session(monkey
     assert len(requests) <= len(sessions) + 1, f"{len(requests)} requests for {len(sessions)} sessions: {[r['startTime'] for r in requests]}"
 
 
-def test_ibkr_thin_stock_resume_from_a_quiet_monday_open_backfills_older_sessions(monkeypatch, tmp_path):
+def test_ibkr_thin_stock_resume_from_a_quiet_monday_open_backfills_older_sessions(monkeypatch, tmp_path, equity_basis):
     """Live 2026-09-24: a thin ETF's cache started at Monday 04:19 ET (no prints before 04:19). The
     resume request for older bars ended there; its 1000-minute window held Sunday plus Monday
     04:00 to 04:19, open minutes without trades, so IBKR answered empty, the window was not
@@ -1245,7 +1279,9 @@ def test_ibkr_thin_stock_resume_from_a_quiet_monday_open_backfills_older_session
     cached = vendor.loc[vendor.index >= pd.Timestamp("2026-08-03 04:19", tz="America/New_York")].copy()
     cached["missing"] = False
     cache_file = ibkr_helper._cache_file_for(asset=asset, quote=quote, timestep="minute", exchange=None,
-                                             source="Trades", include_after_hours=True)
+                                             source="Trades", include_after_hours=True, equity_basis=equity_basis.split_fingerprint)
+    from lumibot.tools.ibkr_equity_basis import decorate_adjusted_frame
+    cached = decorate_adjusted_frame(cached, equity_basis, provider_prices_verified=True)
     ibkr_helper._write_cache_frame(cache_file, cached)
     requests: list[dict] = []
 
@@ -1256,7 +1292,7 @@ def test_ibkr_thin_stock_resume_from_a_quiet_monday_open_backfills_older_session
         # Live IBKR leaves out the bar stamped at the page end (a page ending 00:00 UTC returned 23:58
         # as its last bar), so the resume page ending at the cached 04:19 bar comes back empty.
         rows = vendor.loc[(vendor.index > window_start) & (vendor.index < window_end)].tail(1000)
-        return {"data": [{"t": int(ts.timestamp() * 1000), "o": float(r["open"]), "h": float(r["high"]),
+        return {"volumeFactor": 1, "data": [{"t": int(ts.timestamp() * 1000), "o": float(r["open"]), "h": float(r["high"]),
                           "l": float(r["low"]), "c": float(r["close"]), "v": float(r["volume"])}
                          for ts, r in rows.iterrows()]}
 
@@ -1642,3 +1678,67 @@ def test_market_order_decided_at_t_fills_at_the_price_the_strategy_saw(monkeypat
     assert seen["fill"] == ("10:00", 1000.00)
     assert seen["last_price"] == 1000.00
     assert seen["quote"] == (1000.00, 1000.00)
+
+
+def test_intraday_stock_valuation_snapshot_uses_loaded_minute_bars_not_yesterdays_daily_close(monkeypatch):
+    """2026-10-07, routed IBKR (BotSpot's botspot_auto) on Dev: a 30-minute strategy holding
+    10 SPY that loads minute bars every iteration showed a portfolio value flat on the previous
+    daily close all session (stats.parquet 9:30-15:30 unchanged) while its own bars moved.
+    Portfolio valuation asks get_price_snapshot() first, and the snapshot switched every
+    lookup to daily bars as soon as any daily series existed (the SPY benchmark, indicator
+    history). get_quote/get_last_price were fixed for this on 2026-09-24; the snapshot was not."""
+    import lumibot.tools.ibkr_helper as ibkr_helper
+
+    monkeypatch.setenv("DATADOWNLOADER_BASE_URL", "http://localhost:8080")
+    monkeypatch.setenv("DATADOWNLOADER_API_KEY", "<redacted>")
+
+    start = LUMIBOT_DEFAULT_PYTZ.localize(datetime(2026, 1, 2, 0, 0))
+    end = LUMIBOT_DEFAULT_PYTZ.localize(datetime(2026, 1, 9, 0, 0))
+    router = _make_router(start, end, {"default": "ibkr", "stock": "ibkr", "index": "ibkr"})
+    asset = Asset("SLV", asset_type=Asset.AssetType.STOCK)
+    quote = Asset("USD", asset_type=Asset.AssetType.FOREX)
+
+    def fake_get_price_data(*, asset, quote, timestep, start_dt, end_dt, **_):
+        if timestep == "day":
+            daily = _daily_ohlc(start_dt, end_dt)
+            daily[["open", "high", "low", "close", "bid", "ask"]] = 73.71
+            return daily
+        return _flat_minute_ohlc(start_dt, end_dt, 69.67)
+
+    monkeypatch.setattr(ibkr_helper, "get_price_data", fake_get_price_data)
+
+    router._datetime = LUMIBOT_DEFAULT_PYTZ.localize(datetime(2026, 1, 7, 10, 30))
+    router.get_historical_prices(asset, 75, "day", quote=quote)
+    minute = router.get_historical_prices(asset, 8, "minute", quote=quote)
+    assert minute is not None and not minute.df.empty
+
+    snapshot = router.get_price_snapshot(asset, quote=quote)
+    assert snapshot is not None
+    prices = {k: snapshot.get(k) for k in ("close", "last_trade_price", "price", "open") if snapshot.get(k) is not None}
+    assert prices, snapshot
+    assert all(round(float(v), 2) == 69.67 for v in prices.values()), prices
+
+
+def test_daily_strategy_valuation_snapshot_still_uses_daily_bars(monkeypatch):
+    """No intraday bars loaded: the snapshot keeps the daily shortcut and downloads no minutes."""
+    import lumibot.tools.ibkr_helper as ibkr_helper
+
+    monkeypatch.setenv("DATADOWNLOADER_BASE_URL", "http://localhost:8080")
+    monkeypatch.setenv("DATADOWNLOADER_API_KEY", "<redacted>")
+
+    start = LUMIBOT_DEFAULT_PYTZ.localize(datetime(2026, 1, 2, 0, 0))
+    end = LUMIBOT_DEFAULT_PYTZ.localize(datetime(2026, 1, 9, 0, 0))
+    router = _make_router(start, end, {"default": "ibkr", "stock": "ibkr", "index": "ibkr"})
+    asset = Asset("SLV", asset_type=Asset.AssetType.STOCK)
+    quote = Asset("USD", asset_type=Asset.AssetType.FOREX)
+    requested: list[str] = []
+
+    def fake_get_price_data(*, asset, quote, timestep, start_dt, end_dt, **_):
+        requested.append(timestep)
+        return _daily_ohlc(start_dt, end_dt)
+
+    monkeypatch.setattr(ibkr_helper, "get_price_data", fake_get_price_data)
+    router._datetime = LUMIBOT_DEFAULT_PYTZ.localize(datetime(2026, 1, 7, 10, 30))
+    router.get_historical_prices(asset, 75, "day", quote=quote)
+    assert router.get_price_snapshot(asset, quote=quote) is not None
+    assert "minute" not in requested, requested

@@ -6,13 +6,51 @@ Interactive Brokers (REST) Backtesting
 
 LumiBot supports backtesting with **Interactive Brokers data providers**.
 
+.. include:: _snippets/botspot_mcp_callout.rst
+
 The primary data path uses Client Portal (REST) via the LumiBot Data Downloader.
+
+Corporate-action metadata availability
+-------------------------------------
+
+IBKR ``TRADES`` stock and ETF prices are already split-adjusted. A missing or
+stale auxiliary split/dividend ledger does not prevent those prices from being
+used in a backtest. LumiBot keeps an explicitly unverified, dated price snapshot
+separate from caches with verified corporate-action coverage. It does not infer
+splits from market moves or mix incompatible adjustment bases.
+
+When the optional metadata is unavailable, ``settings.json`` data-health warnings
+record ``corporate_actions_status="unavailable"`` and
+``cash_dividends_verified=false``. The backtest can continue, but it must not be
+described as having complete cash-dividend accounting. Unknown action columns
+are missing values, rather than proof that no dividends or splits occurred.
+Available verified action metadata continues to support cash-dividend accounting.
 
 Note: second-level and tick-level history are not yet a fully-supported end-to-end workflow in the open-source
 distribution. (Some internal deployments may have additional adapters behind the same external ``/ibkr/*`` contract.)
 
-For **expired futures** contract discovery (conids), IBKR Client Portal cannot reliably discover old contracts. In that
-case, LumiBot relies on an **offline conid registry** (populated via a one-time TWS backfill in internal deployments).
+For **expired futures** contract discovery (conids), LumiBot checks its mirrored contract registry first.
+When REST does not list the requested expired month, a downloader with the read-only
+``/ibkr/tws/secdef/contracts`` endpoint can resolve it through its existing TWS gateway.
+The root, venue, currency and expiration month must match one unambiguous futures contract.
+Discovery cannot extend IBKR's historical-data retention limits.
+
+NG, CL and MCL discovery uses the exact last-trade date because it precedes
+the delivery month. A completed TWS lookup without a matching identity has a
+15-minute retry cooldown; a newly recovered positive registry entry takes
+precedence. Timeouts and disconnects do not establish identity absence, and
+unresolved identities never establish that historical prices did not exist.
+
+Missing continuous-futures roll contracts are reported as partial history, even when later contracts supply bars.
+Check the actual number of completed bars at the simulated decision time before applying a lookback indicator.
+Shared registry writes preserve unrelated current identities and retry concurrent publication conflicts.
+Futures weekend closure runs from Friday 17:00 through Sunday 18:00 New York time, across daylight-saving changes.
+
+Downloader queue deadlines cover submission, polling, retry backoff and local concurrency waits together.
+Normal requests allow three configured timeout windows. Requests with a finite attempt cap use that many windows;
+resubmission does not restart the total deadline. If a replacement downloader explicitly reports
+that an accepted read request no longer exists, the client resubmits the same logical read
+after a bounded pause. Transient status errors keep waiting on the existing request. Already downloaded valid bars remain available for a later retry.
 
 Status
 ------
@@ -39,6 +77,13 @@ Supported Data
 - **Spot crypto**: IBKR crypto bars (availability depends on region and IBKR product support).
 - **Stocks / Indexes (day bars)**: supported in routed backtests (for example mixed Theta+IBKR routing).
 
+Stock, index and futures intraday historical requests stop 20 minutes before
+the backtest's captured start-of-run clock. Explicit and continuous futures use the same stable boundary,
+including the pager's overlap offset. A window wholly inside that unavailable
+interval returns empty bars with partial history health; unavailable prices
+are never cached as confirmed absence. Daily bars, older historical windows
+and real-time snapshot APIs retain their separate behavior.
+
 Portfolio Valuation (Stocks/Indexes)
 ------------------------------------
 
@@ -49,8 +94,24 @@ marks at its open. If the strategy's minute history ends before the current time
 is fetched first, the same request the strategy itself makes. Strategies that only use daily bars never fetch
 minute history for valuation.
 
+Daily futures candles aggregate intraday bars whose start time is inside the session,
+including the opening boundary and excluding the closing boundary. A bar starting at
+the close belongs to the next session and cannot change the completed candle's prices
+or volume. This applies to both hourly aggregation and the minute fallback.
+
+During known daily maintenance and weekend closures, futures valuation can
+retain the last completed trade close. This fallback cannot bridge a missing
+open-market interval or supply an executable bar.
+
 Daily Stocks/Indexes: Warmup + Corporate Actions
 ------------------------------------------------
+
+TWS daily bars use calendar-date labels encoded at UTC midnight. LumiBot preserves that session date
+before converting to New York and exposes the candle at the existing daily close. New stock/index
+daily cache filenames use ``_SESSION_DATE_V2.parquet`` to rebuild mixed legacy daily files from real
+provider data. Old files remain available to older package versions; intraday and futures cache keys
+are unchanged. Provider gaps still report partial history and are never filled with invented prices.
+
 
 For routed daily stock/index backtests, LumiBot prefetches the full computed lookback window so long
 lookbacks (for example 200-day SMA signals) are not under-warmed near the backtest start.
@@ -72,9 +133,9 @@ IBKR returns at most about 1,000 bars per request, so LumiBot walks backwards pa
   fund listed last year still gets its full daily history.
 - **A failed older page** keeps the newer real bars already downloaded; the missing older part is not faked and is
   retried by a later run.
-- **Delayed feed.** IBKR stock and index history can run about 15 minutes behind real time, so intraday requests
-  stop 20 minutes before the current time. A backtest that ends today during market hours simply ends a little
-  earlier.
+- **Delayed feed.** IBKR stock, index and futures history can lag real time, so intraday requests
+  stop 20 minutes before the captured start-of-run clock. A strategy decision requiring newer
+  unavailable prices makes the run incomplete; it does not silently qualify a shortened result.
 - **Daily windows** up to 993 days are one request sized to the window; longer windows use 5-year pages.
 - **Dividends.** IBKR history has no corporate actions, so LumiBot adds dividends and splits to IBKR daily stock bars
   from a free corporate-actions source. BotSpot Auto backtests credit a held stock's dividend on its ex-date from
@@ -84,6 +145,19 @@ IBKR returns at most about 1,000 bars per request, so LumiBot walks backwards pa
   A session with no trades at all is remembered for a day so it is not requested again by every backtest.
   Gap checks handle nanosecond, microsecond, millisecond and second cache timestamps consistently;
   existing Parquet caches do not need to be deleted or rewritten.
+
+Continuous Futures: History and Held Contracts
+---------------------------------------------
+
+A continuous series supplies signal history. In IBKR backtests, an order submitted
+for that series binds to the selected physical expiry. The position and its protective
+orders retain that expiry after the continuous chart moves to the next contract.
+There is no automatic roll trade and no profit from merely switching chart series.
+
+To roll a position, close its ``position.asset`` and open the next contract explicitly.
+A root-symbol closing order targets the single matching held contract. Multiple matching
+expiries, or a reversal spanning different expiries, require explicit contracts.
+Normal fills, fees and price availability apply to both legs.
 
 Futures Exchange Routing (auto + override)
 ------------------------------------------
@@ -141,8 +215,14 @@ bar always wins.
 
 Backtest ``settings.json`` artifacts include a credential-free ``data_health``
 summary with up to 100 missing-session dates, the full missing-session count,
-and repair outcomes. Free-form provider errors remain in logs. The summary is
-diagnostic evidence and does not add a new backtest failure condition.
+and repair outcomes. Free-form provider errors remain in logs.
+
+The summary distinguishes optional prefetch gaps from history actually required
+by a strategy. ``required_complete=false`` means a decision lacked its requested
+completed bars, a consumed contract segment was unresolved, a held position had
+no valuation price, or a decision required an unavailable delayed-feed tail.
+Consumers must not present such a run as a valid completed result. A fully
+supplied strategy that legitimately chooses no trades remains valid.
 
 Conid lookups also maintain cache files under ``LUMIBOT_CACHE_FOLDER/ibkr``:
 
@@ -198,3 +278,67 @@ Common environment variables for IBKR REST backtesting:
 - ``LUMIBOT_IBKR_ENABLE_FUTURES_BID_ASK`` (default: disabled; opt-in quote derivation for futures)
 
 See :ref:`environment_variables` for details.
+
+
+Continuous history and tradable positions
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Continuous-futures history switches contracts on the configured roll schedule.
+An IBKR backtest order resolves to a physical expiry when submitted. Its fills,
+protective children and held position keep that expiry; a change in the history
+series does not itself trade or change position value. Close the held contract
+and submit the replacement explicitly when the strategy intends to roll. Both
+fills use their own observed contract prices and configured fees.
+
+A root-symbol closing order targets a single matching held expiry. If several
+opposite positions exist, or a reversal would span different expiries, use
+explicit ``position.asset`` contracts and separate orders. The simulator rejects
+ambiguous operations rather than silently choosing a different financial result.
+
+Frequently asked questions
+--------------------------
+
+Can I backtest with Interactive Brokers data in LumiBot?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Yes, with limits. Set ``BACKTESTING_DATA_SOURCE=ibkr``. LumiBot reads IBKR history through Client Portal (REST) using the LumiBot Data Downloader. IBKR REST backtesting is still under active development and is not yet a fully supported public workflow in the open source release.
+
+What IBKR data can I backtest?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+US futures on CME, CBOT, COMEX and NYMEX with minute, hour and day bars, plus spot crypto bars where IBKR offers them. Daily stock and index bars work in routed backtests, for example ThetaData plus IBKR. Second and tick level history is not yet a fully supported workflow.
+
+Do I need IBKR market data subscriptions?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Yes. IBKR requires market data entitlements to return data through its API. IBKR says historical bars are part of Level 1 entitlements and that crypto needs no extra subscription. See IBKR's `market data subscriptions page <https://www.interactivebrokers.com/campus/ibkr-api-page/market-data-subscriptions/>`__ and `pricing table <https://www.interactivebrokers.com/en/pricing/market-data-pricing.php>`__ to confirm your costs.
+
+What is a conid, and why do expired futures need one?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A conid is IBKR's contract ID. IBKR needs it to return futures history, but Client Portal cannot reliably find conids for expired contracts. LumiBot keeps a registry at ``LUMIBOT_CACHE_FOLDER/ibkr/conids.json`` that grows as backtests run, so known expired contracts can still be tested.
+
+How do I use ThetaData and IBKR in the same backtest?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Set ``BACKTESTING_DATA_SOURCE`` to a JSON map that names a source per asset type, as shown in Multi-provider routing above. For example, route stocks, options and indexes to ``thetadata`` and futures and crypto to ``ibkr``.
+
+Does IBKR history include dividends and splits?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+IBKR ``TRADES`` stock and ETF prices are already split adjusted, but IBKR day bars have no dividend columns. LumiBot adds dividend and split values to cached IBKR daily stock bars from Yahoo actions as a best effort source. If that data is unavailable, the backtest still runs and ``settings.json`` notes that cash dividends were not verified.
+
+Why do my intraday IBKR bars stop 20 minutes before the run started?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+IBKR stock, index and futures history can lag real time. LumiBot stops intraday requests 20 minutes before the clock captured when the run started, so it never caches prices that were not yet available.
+
+Does LumiBot roll my continuous futures position for me?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+No. The continuous series only supplies history. An order binds to one real expiry, and the position keeps that expiry. To roll, close ``position.asset`` and open the next contract with your own orders.
+
+How do I choose the futures exchange?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+LumiBot tries to find it automatically, preferring USD and US venues. If the result is unclear, pass ``exchange=...`` to ``get_historical_prices()``, ``get_last_price()`` or ``get_quote()``. ``IBKR_FUTURES_EXCHANGE`` (default ``CME``) is used when automatic routing fails.

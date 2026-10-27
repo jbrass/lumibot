@@ -1075,7 +1075,7 @@ class Broker(ABC):
                 position_lumi = [
                     pos_lumi
                     for pos_lumi in self._filled_positions.get_list()
-                    if pos_lumi.asset == position.asset
+                    if self._same_position(pos_lumi, position)
                 ]
                 position_lumi = position_lumi[0] if len(position_lumi) > 0 else None
 
@@ -1093,7 +1093,9 @@ class Broker(ABC):
                     # strategy with subsequent updates.
                     if strategy:
                         strategy_name = strategy.name if not isinstance(strategy, str) else strategy
-                        if position_lumi.strategy != strategy_name:
+                        if position_lumi.strategy != strategy_name and (
+                            not position_lumi.strategy or getattr(position_lumi, "position_side", None) is None
+                        ):
                             position_lumi.strategy = strategy_name
                             self._filled_positions.revision += 1
                 else:
@@ -1109,7 +1111,7 @@ class Broker(ABC):
             for position in list(self._filled_positions.get_list()):
                 found = False
                 for position_broker in positions_broker:
-                    if position_broker.asset == position.asset:
+                    if self._same_position(position_broker, position):
                         found = True
                         break
                 if (
@@ -1265,6 +1267,16 @@ class Broker(ABC):
             broker_order,
         )
 
+        changed = self._apply_direct_order_observation(order_lumi, matched_order)
+        log.info(
+            f"Refreshed local order {order_lumi} (id={order_lumi.identifier}) with direct broker lookup "
+            f"after broad order-list miss. Broker status is {matched_order.status}."
+        )
+        return changed
+
+    def _apply_direct_order_observation(self, order_lumi, matched_order):
+        """Apply a lookup observation; adapters with lifecycle reducers override this."""
+
         changed = False
         if not order_lumi.equivalent_status(matched_order.status):
             order_lumi.status = matched_order.status
@@ -1281,10 +1293,6 @@ class Broker(ABC):
                 setattr(order_lumi, order_attr, broker_value)
                 changed = True
 
-        log.info(
-            f"Refreshed local order {order_lumi} (id={order_lumi.identifier}) with direct broker lookup "
-            f"after broad order-list miss. Broker status is {matched_order.status}."
-        )
         return changed
 
     def sync_orders(self, strategy):
@@ -1316,20 +1324,10 @@ class Broker(ABC):
                 order_lumi = matches[0] if len(matches) > 0 else None
 
             if order_lumi:
-                if not order_lumi.equivalent_status(order.status):
-                    order_lumi.status = order.status
-                    changed = True
-
-                if order_lumi.quantity != order.quantity:
-                    order_lumi.quantity = order.quantity
-                    changed = True
-
-                for order_attr in ("limit_price", "stop_price"):
-                    olumi = getattr(order_lumi, order_attr)
-                    obroker = getattr(order, order_attr)
-                    if olumi != obroker:
-                        setattr(order_lumi, order_attr, obroker)
-                        changed = True
+                # Both broad history and direct lookup must use the adapter's
+                # lifecycle owner. Copying status here first can suppress fills,
+                # rejection details and callbacks in adapters with a reducer.
+                changed = self._apply_direct_order_observation(order_lumi, order) or changed
             elif self._first_iteration or order.is_active():
                 self._process_broker_synced_order(order)
                 changed = True
@@ -1416,6 +1414,8 @@ class Broker(ABC):
             "exchange",
             "currency",
             "multiplier",
+            "position_side",
+            "position_id",
         )
 
         for field in broker_fields:
@@ -1432,6 +1432,28 @@ class Broker(ABC):
             self._filled_positions.revision += 1
 
     # =========Market functions=======================
+
+    def get_contract_spec(self, asset, quote=None):
+        """Return explicit instrument terms from the asset or selected data source."""
+        spec = getattr(asset, "contract_spec", None)
+        if spec is not None:
+            return spec
+        getter = getattr(self.data_source, "get_contract_spec", None)
+        if callable(getter):
+            return getter(asset, quote)
+        raise ValueError("Derivative contract terms are unavailable; supply Asset.contract_spec or provider metadata")
+
+    def get_contract_exposure(self, asset, quantity, price, quote=None):
+        """Base and quote exposure for an adapter-native derivative quantity."""
+        return self.get_contract_spec(asset, quote).exposure(quantity, price)
+
+    def get_quantity_for_notional(self, asset, notional, price=None, quote=None):
+        """Size a derivative in its quote currency, preserving native order units."""
+        if price is None:
+            price = self.get_last_price(asset, quote=quote)
+        if price is None:
+            raise ValueError(f"Last price is unavailable for {asset}")
+        return self.get_contract_spec(asset, quote).quantity_for_notional(notional, price)
 
     def get_last_price(self, asset: Asset, quote=None, exchange=None) -> Union[float, Decimal, None]:
         """
@@ -2046,7 +2068,7 @@ class Broker(ABC):
             if order not in self._partially_filled_orders:
                 self._partially_filled_orders.append(order)
 
-        position = self.get_tracked_position(order.strategy, order.asset)
+        position = self._position_for_order(order)
         if position is None:
             # Create new position for this given strategy and asset
             position = order.to_position(quantity)
@@ -2069,7 +2091,7 @@ class Broker(ABC):
             order.set_filled()
             self._filled_orders.append(order)
 
-        position = self.get_tracked_position(order.strategy, order.asset)
+        position = self._position_for_order(order)
         if position is None:
             # Create new position for this given strategy and asset
             position = order.to_position(quantity)
@@ -2116,7 +2138,7 @@ class Broker(ABC):
             order.set_filled()
             self._filled_orders.append(order)
 
-        position = self.get_tracked_position(order.strategy, order.asset)
+        position = self._position_for_order(order)
         if position is not None:
             # Live brokers will update positions via polling, but in backtesting there is no broker-side
             # reconciliation. Cash settlement must therefore adjust the position quantity immediately so
@@ -2518,21 +2540,40 @@ class Broker(ABC):
             self.sleep(sleeptime)
 
     # =========Positions functions==================
-    def get_tracked_position(self, strategy, asset):
-        """get a tracked position given an asset and
-        a strategy"""
-        strategy_name = self._strategy_name_from_input(strategy)
-        cache_key = (getattr(self._filled_positions, "revision", 0), strategy_name, asset)
-        cached = self._tracked_position_cache.get(cache_key)
-        if cached is not None or cache_key in self._tracked_position_cache:
-            return cached
+    @staticmethod
+    def _same_position(left, right):
+        # A missing side or id is unknown, not a different leg: a position tracked
+        # before its broker reported a side (an earlier fill or snapshot) must be
+        # updated in place, keeping its strategy owner, rather than replaced.
+        if left.asset != right.asset:
+            return False
+        left_side, right_side = getattr(left, "position_side", None), getattr(right, "position_side", None)
+        if left_side is not None and right_side is not None and left_side != right_side:
+            return False
+        left_id, right_id = getattr(left, "position_id", None), getattr(right, "position_id", None)
+        return left_id is None or right_id is None or left_id == right_id
 
-        for position in self._filled_positions:
-            if position.asset == asset and (strategy_name is None or position.strategy == strategy_name):
-                self._cache_result(self._tracked_position_cache, cache_key, position)
-                return position
-        self._cache_result(self._tracked_position_cache, cache_key, None)
-        return None
+    def _position_for_order(self, order):
+        selectors = {key: getattr(order, key, None) for key in ("position_side", "position_id")
+                     if getattr(order, key, None) is not None}
+        return self.get_tracked_position(order.strategy, order.asset, **selectors)
+
+    def get_tracked_position(self, strategy, asset, position_side=None, position_id=None):
+        """Return an exact position; select a side when an asset has two hedge legs."""
+        strategy_name = self._strategy_name_from_input(strategy)
+        position_side = str(position_side).lower() if position_side is not None else None
+        cache_key = (getattr(self._filled_positions, "revision", 0), strategy_name, asset, position_side, position_id)
+        if cache_key in self._tracked_position_cache:
+            return self._tracked_position_cache[cache_key]
+        matches = [position for position in self._filled_positions
+                   if position.asset == asset and (strategy_name is None or position.strategy == strategy_name)
+                   and (position_side is None or getattr(position, "position_side", None) == position_side)
+                   and (position_id is None or getattr(position, "position_id", None) == position_id)]
+        if len(matches) > 1:
+            raise ValueError(f"Multiple positions for {asset}; select position_side or position_id, or use get_positions()")
+        position = matches[0] if matches else None
+        self._cache_result(self._tracked_position_cache, cache_key, position)
+        return position
 
     def get_tracked_positions(self, strategy=None):
         """get all tracked positions for a given strategy"""
@@ -2766,7 +2807,7 @@ class Broker(ABC):
         }:
             raise ValueError(f"Unsupported option order side: {side}")
 
-        position = self.get_tracked_position(order.strategy, order.asset)
+        position = self._position_for_order(order)
         position_quantity = float(position.quantity) if position is not None else 0.0
         close_side = None
         open_side = None
@@ -2983,8 +3024,12 @@ class Broker(ABC):
     def _create_position_closing_order(self, position, quote_asset=None):
         """Build a close order, including reduce-only crypto-futures fallback."""
         order = position.get_selling_order(quote_asset=quote_asset)
-        if order is not None or position.quantity == 0:
+        if order is not None:
+            order.position_side = getattr(position, "position_side", None)
+            order.position_id = getattr(position, "position_id", None)
             return order
+        if position.quantity == 0:
+            return None
 
         order = Order(
             position.strategy,
@@ -2992,11 +3037,13 @@ class Broker(ABC):
             abs(position.quantity),
             side=Order.OrderSide.SELL if position.quantity > 0 else Order.OrderSide.BUY,
             quote=quote_asset,
+            position_side=getattr(position, "position_side", None),
+            position_id=getattr(position, "position_id", None),
         )
         order.reduce_only = True
         return order
 
-    def close_position(self, strategy_name: str, asset: Asset, fraction: float = 1.00):
+    def close_position(self, strategy_name: str, asset: Asset, fraction: float = 1.00, position_side=None, position_id=None):
         """
         Close a position for a given strategy and asset by submitting a sell order.
 
@@ -3019,7 +3066,14 @@ class Broker(ABC):
         if not 0 < fraction_value <= 1:
             raise ValueError("fraction must be greater than 0 and no more than 1")
 
-        pos = self.get_tracked_position(strategy_name, asset)
+        selectors = {key: value for key, value in (("position_side", position_side), ("position_id", position_id))
+                     if value is not None}
+        if not selectors:
+            legs = [pos for pos in self.get_tracked_positions(strategy_name) if pos.asset == asset and pos.quantity != 0]
+            if len(legs) > 1:
+                return [self.close_position(strategy_name, asset, fraction, position_side=pos.position_side,
+                                            position_id=pos.position_id) for pos in legs]
+        pos = self.get_tracked_position(strategy_name, asset, **selectors)
         if pos and pos.quantity != 0:
             self.logger.info(
                 "close_position(strategy=%s, asset=%s, fraction=%s) -> qty=%s",
@@ -3251,7 +3305,7 @@ class Broker(ABC):
         if subscriber:
             subscriber.add_event(subscriber.PARTIALLY_FILLED_ORDER, payload)
         else:
-            self.logger.error(f"Subscriber {order.strategy} not found", color="red")
+            self.logger.error(colored(f"Subscriber {order.strategy} not found", color="red"))
 
     def _on_filled_order(self, position, order, price, quantity, multiplier):
         """notify relevant subscriber/strategy about
@@ -3308,8 +3362,9 @@ class Broker(ABC):
                 cache = pd.DataFrame()
             else:
                 first = next(iter(rows), None)
-                if isinstance(first, dict):
-                    cache = pd.DataFrame(list(rows))
+                if isinstance(first, dict) or getattr(self, "_trade_event_log_has_dict_rows", False):
+                    columns = getattr(self, "_trade_event_log_columns", None) or TRADE_EVENT_LOG_COLUMNS
+                    cache = pd.DataFrame([row if isinstance(row, dict) else dict(zip(columns, row)) for row in rows])
                 else:
                     cols = getattr(self, "_trade_event_log_columns", None) or None
                     cache = pd.DataFrame(list(rows), columns=list(cols) if cols else None)
@@ -3343,6 +3398,7 @@ class Broker(ABC):
             price = th[2]
             filled_quantity = th[3]
             multiplier = th[4]
+            error = th[5] if len(th) > 5 else None
 
             if self.logger.isEnabledFor(20):
                 self.logger.info(
@@ -3358,6 +3414,7 @@ class Broker(ABC):
                 price=price,
                 filled_quantity=filled_quantity,
                 multiplier=multiplier,
+                error=error,
             )
 
     def _process_trade_event(self, stored_order, type_event, price=None, filled_quantity=None, multiplier=1, error=None): # Add error parameter
@@ -3396,6 +3453,7 @@ class Broker(ABC):
                     price,
                     filled_quantity,
                     multiplier,
+                    error,
                 )
             )
             return
@@ -3608,6 +3666,14 @@ class Broker(ABC):
                 None,
                 None,
             )
+
+        journal = getattr(stored_order, "decision_journal", None)
+        if isinstance(journal, dict) and journal.get("action_id"):
+            if not isinstance(new_row, dict):
+                new_row = dict(zip(TRADE_EVENT_LOG_COLUMNS, new_row))
+            for key in ("decision_id", "action_id", "previous_action_id", "model_call_id", "reason_sha256", "strategy_revision_id"):
+                new_row[f"decision.{key}"] = journal.get(key)
+            self._trade_event_log_has_dict_rows = True
 
         # Backtest-only trade audit telemetry.
         #
