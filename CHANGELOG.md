@@ -1,5 +1,133 @@
 # Changelog
 
+## 4.6.44 - 2026-11-02
+
+### Fixed
+- Keep individual stock and listed-unit purchases, exercises and new issuers in the example researcher's complete numeric portfolio ledger. Both agents still run each iteration and all investment logic stays in their prompts.
+- Preserve generic real-model fixture proof when only literal policy text in unexecuted reference examples changes. Actual example behavior still requires separate execution evidence.
+- Preserve complete test names in release shards, isolate installed-wheel validation from test-only dependencies, and include the canonical immutable-tag recovery and unit-worker cleanup repairs.
+
+## 4.6.42 - 2026-11-01
+
+### Added
+- ProjectX historical backtesting through the existing PandasData and BacktestingBroker engine, with paginated provider bars, normal strategy entry points and preserved bar-completion semantics. Historical trade bars do not invent bid/ask quotes.
+- AI agents can use native single and batch quotes, including exact option contracts, supplied source timestamps and multipliers. Shared trading guidance uses executable quote sides for immediate orders and current last prices when usable quote fields are unavailable.
+- AI agents can submit explicit independent baskets through the existing `Strategy.submit_orders` method. Each row retains its explanation and actual broker result; partial or uncertain results require reconciliation before retrying. Atomic option packages keep their existing multi-leg tool.
+- Release-gated portfolio behavior covers complete large and small baskets, funding sells before dependent buys, current-quote sizing, exact dated-row selection, and completing supported holdings when one is unavailable. Assertions reconcile native positions, fills, quantities and cash alongside a real-model judge.
+
+### Changed
+- Reconcile live MetaMask partial fills from current open-order remainders, retain late terminal execution deltas without reopening orders, and fence new spending while fill evidence disagrees. Share wallet observation reads, avoid unchanged historical status queries, and use a 10-second default polling interval.
+- Harden native MetaMask signing-domain/network binding, final authority handoff, uncertain cancellation and leverage recovery, cumulative accessor fills, exact token arithmetic, reverted-gas budgets, and OP Stack L1/operator fee accounting. Preserve actual overrun charges pending explicit owner review. Native funded qualification remains in progress.
+- Replace the retired Polygon SDK dependency with maintained Massive while retaining Polygon keys and endpoint behavior; require patched MetaMask HTTP and CA-store dependencies and reject unsafe session lock files.
+- MetaMask now runs in Python through the normal LumiBot broker and data source. The optional Python extra replaces the required Node service, npm install and localhost transport. Browser sign-in and durable OAuth refresh use native Python.
+- Breaking configuration change: replace MetaMask BROKER_URL/BROKER_TOKEN with an explicit native session, durable journal, agent and wallet identity. Preserve old journals and pending receipts; local limits and expiry never reset at startup. Native cancellation, signing checkpoints and fill recovery retain separate operation identities.
+- Native same-chain ERC20-output swap code verifies bounded approvals and actual receipts. HIP3 writes, native-output swaps and unsupported fee/delegation variants remain explicit holds. Native funded swap qualification remains pending; previous JavaScript receipts do not qualify this replacement.
+
+### Fixed
+- Preserve source clock times and UTC offsets when agents report document availability. Requalified all 30 actor/judge cases, including five current trials of the repaired reporting case, and the complete 141-slot judge calibration. Established-case regression proof retains original source and usage identities.
+- Preserve caller-supplied Community request identifiers across explicit post or reply retries, so a compatible server can return the original publication after an uncertain response without creating a duplicate. The client does not retry automatically.
+- Restore accepted ProjectX protection through normal strategy startup and synchronization, cancel unused exits after offline fills without replaying executions, and retain cancellation intent after provider rejection. Partial protective fills reduce remaining exit sizes and later entry fills preserve the actual remaining exposure.
+- Retry empty research windows against available older observations without relaxing the historical cutoff or claiming stale evidence is current.
+- Live market-open and market-close waits wake when their strategy is stopped, including the Alpaca close override. Direct callers retain their normal wait interval.
+- ProjectX acknowledgement and stream duplicates notify the strategy of a new order once.
+- Preserve complete strategy ownership in unique ProjectX order tags and use the broker's ownership checks at both fill-delivery layers. Polling, partial fills and fills received before acknowledgement create protection through the same fill owner.
+- Generated ProjectX entry and protective-order tags fit the provider's 64-character limit, including long or non-ASCII strategy names, while preserving exact strategy ownership.
+- Restore ProjectX bracket metadata with LumiBot order identifiers and report accepted protective children accurately.
+- Preserve protective-child links when a stream update wins the REST acknowledgement race, and cancel unused siblings when a child fills before those links finish registering.
+- Honor declared custom trading-tool mutations when preventing whole-agent retries, including aliased tool names.
+- Reconcile reported purchase cost from actual fills and fees while keeping current marked equity distinct from execution cost.
+- Preserve observed agent tool events and usage when inference fails after order actions. Report attempted or unknown broker effects honestly and require reconciliation without replaying the attempt; retain deterministic broker grading for every failed evaluation.
+- Classify typed retryable inference failures wrapped by LiteLLM as infrastructure errors when no actor decision completed. Preserve ordinary grading for completed decisions and tool failures, along with every prior attempt and usage reservation.
+- Keep clean agent installations on the compatible LiteLLM 1.105 and MCP 1 SDK generations; LiteLLM 1.106 requires MCP 2 catalog types on its Responses path.
+- Exercise usable, explicitly unqualified historical research in recorded agent tests while retaining known-future exclusions and visible provider failures.
+- Grade historical research by its meaning and returned fields, with a retained real-answer control and a separate fabricated-answer control.
+- ProjectX uses actual streamed bid/ask prices and source times, exact configured account selection, expiration-aware contract lookup, provider contract multipliers and the documented single-contract response. Reject fractional/invalid contract sizes instead of truncating or defaulting them.
+- ProjectX reconciles partial executions and duplicate/reordered events through the shared cumulative-fill owner, preserves cancellation after partial fills, and restores accepted protective-order links after restart. Account read failures remain visible; older working orders are retained.
+- ProjectX verifies stream connection/subscription success, renews rejected/expiring sessions, updates reconnect credentials and redacts SDK authentication diagnostics. Its SignalR dependency is installed with the package.
+- Preserve parametrized test IDs containing spaces when CI launches collected test shards.
+- Refresh exchange documentation from CCXT 4.5.91, including current market capabilities, contract examples and WEEX futures-only simulation. Retire the removed Aftermath, BitMart, BitMEX and CoinEx setup guides while preserving their URLs, historical guides and older installed-adapter behavior.
+- Preserve numeric fields across wrapped document rows and filtered inventory audits. Real-model coverage distinguishes complete asset-value ranges from continuation lines, unrelated income fields and truly unavailable data.
+- Simulated stock market orders use the execution bar at the simulated time when intraday data is already loaded, including strategies with daily cadence. Daily-only sources and limit/stop behavior retain their existing data path; this change does not force minute-data downloads.
+- Keep Polygon daily research history and minute execution data in independent interval-aware entries. Repeated history/price reads reuse loaded data without replacing daily bars or downloading minute history for a daily request. Memory limits count each dataset once and retire every alias when it is evicted.
+
+- Keep empty IBKR history-health reports scoped to IBKR data sources; preserve actual IBKR series, warnings and failures when another source is also used.
+- Value CCXT wallets and settlement PnL through available exchange cross rates when the reporting currency has no direct pair. Prefer spot routes, keep contract reference prices distinct from option premiums, and retain direct/inverse conversion behavior.
+- Preserve decimal units across fractional position creation, synchronization and fills, so matched closing quantities leave no artificial residual while genuine tiny positions remain intact.
+
+## 4.6.39 - 2026-11-01
+
+Deploy marker: `9a7df5f32220c56524446efe62f276f200e4364e`.
+
+### Fixed
+- Alpaca daily stock and option valuations use the session open until the actual close is available, including shortened sessions and premarket lookbacks. Daily crypto close availability remains aligned with its completed bar.
+- Alpaca daily benchmarks cover the requested first-open through final-close window, retain dividends, and use the benchmark asset's calendar. Stock benchmarks omit synthetic weekend rows even when the strategy trades continuously.
+- Preserve source-compatible native agent qualifications for the exact provider-only changes; changes to shared trading or research behavior still require fresh qualification.
+
+## 4.6.37 - 2026-11-01
+
+Deploy marker: `5eea4abaf6b659b2d9931c9189f3c1c8ece5170d`.
+
+### Fixed
+- Reconcile multi-leg package orders using finite signed net prices while preserving positive individual execution prices. Package containers retain cumulative callbacks without creating fictitious positions or charging cash independently of their legs.
+- Read and normalize nested Alpaca option legs with complete contract metadata and parent links. Repeated and warm order synchronization retains each leg's execution receipt and enriches legacy package identities without replaying historical cash.
+
+## 4.6.36 - 2026-11-01
+
+### Fixed
+- Isolate invalid cumulative order observations so healthy sibling orders and missing-order lookups still reconcile; report incomplete reads and always release held lifecycle notifications after failed synchronization.
+- Preserve runtime-applied temporal bounds in public failed-tool evidence without exposing private provider diagnostics.
+- Route executor restoration through the shared broker lifecycle owner; retain cumulative executions and replacement metadata on warm reads and same-status Alpaca partial/cancel polling without replaying startup cash. Delayed working observations cannot reopen terminal orders; newly confirmed executions remain recorded and complete fills win cancellation races.
+- Verify each evidence-packet date window against its own request, including failed requests.
+- Keep baseline ownership evidence and later updates distinct when describing a reconstructed result.
+- Normalize typed SQL timestamp results to UTC instants while retaining source strings, naive market wall clocks, and configured SQL timezone semantics.
+- Clarify final protective-leg evidence before option package pricing and keep missing provider retrieval timestamps distinct from the agent runtime clock.
+- Put the per-document backtest eligibility check at the document-tool decision point, keeping diagnostic excluded rows out of linked reads while preserving live reads and disclosed undated-source approximations.
+- Preserve decimal broker order quantities and validate fractional cumulative executions using consistent decimal units. Repeated high-precision snapshots retain their exact execution receipt without replaying rounding dust; real overfills remain invalid.
+
+- Apply configured taker fees to trailing-stop executions, including the executed quantity of partial fills, consistently with ordinary market and stop orders.
+
+## 4.6.35 - 2026-10-31
+
+### Fixed
+- Forward release of account reconciliation and lifecycle repairs with refreshed, source-bound real-model qualification. Version 4.6.34 package publication was blocked by its stale model receipt; its immutable tag is preserved.
+
+## 4.6.34 - 2026-10-28
+
+Deploy marker: `d326af579d52b2869152e4ee7ff775e0ec1685a3`.
+
+### Fixed
+- Reconcile broker-synchronized partial fills using observed cumulative execution deltas instead of full order size; share the reducer across Alpaca, Bitunix, IBKR REST and Tradier polling. Preserve partial executions on terminal transitions, pending cancellation/replacement, expiration reasons and provider sides; an incomplete order list does not prove cancellation.
+
+### Added
+- Update the scoped MetaMask vendor JSON-RPC client to Jayson 5, removing vulnerable stream-json while retaining the SDK's HTTP and browser request contracts. Default to script-free companion installs and refuse the unpatched optional bigint-buffer native addon at provider startup.
+- MetaMask owner setup retains native testnet gas-funding intents and verifies exact transaction details, mined receipt status and two block confirmations. Funding history survives reloads, supports linking a missing hash and explicitly reviewing the same nonce with buffered fees, and distinguishes wallet rejection, chain reversion, mined replacement and unknown outcomes without automatically resending.
+- MetaMask companion CI checks the supported Node 22.18 minimum and Node 24 with a clean install, formatting, tests, and browser bundling, without wallet credentials.
+- MetaMask owner setup displays testnet spot/perps collateral and supports durable same-wallet spot-to-perps funding. Session reconnect preserves sign-in-method context and reports failed refresh or missing agent wallets.
+- Optional MetaMask Agent Wallet broker beta: dedicated server-wallet bindings, scoped runtime tokens, Guard policy checks, durable order reservations and reconciliation, Hyperliquid perpetuals, exact-input onchain swap operations, and local MetaMask Connect setup. Crypto assets retain EVM chain and contract identity.
+- MetaMask qualification supports persisted policy approvals, signature-boundary authority checks, IOC market quotes, explicit unsupported testnet swap routes, and connected broker checks. Funded open/close, multi-fill aggregation, restart recovery and cancellation have been exercised on Hyperliquid testnet; broader qualification remains in progress.
+
+### Fixed
+- MetaMask values USDC unified accounts from HyperCore's pooled spot collateral and holds, without reporting zero equity or adding PnL twice. Standard accounts retain their separate perps accounting; unsupported portfolio-margin modes fail explicitly.
+- MetaMask owner setup can recover an uncertain perpetual submission by linking its exact venue order ID after validating wallet, request and submission time. Recovery reads real status and fills without signing or replaying an order; bot tokens cannot invoke it.
+- MetaMask clean installs on Node 22/npm 10 include the legacy WebSocket optional UTF-8 validation peer that npm 11 omitted from its lockfile.
+- MetaMask honors canonical reduce-only intent from shared close-position/sell-all actions and restores it from venue snapshots; custom parameters cannot turn a closing order into an opening order.
+- MetaMask startup restores cumulative filled and partially filled order snapshots without adding total order quantity again; the adapter registers restored snapshots through its broker hook before shared executor synchronization.
+- MetaMask vendor UUID 8/9 paths use patched CommonJS-compatible UUID 11.1.1. Real managed-wallet signing, browser bundling and vendor JSON-RPC request IDs were verified; unresolved upstream dependency advisories remain documented.
+- MetaMask strategy startup restores terminal order history without duplicating tracked orders. Account synchronization no longer consumes fill deltas before the polling stream can deliver strategy callbacks.
+- Backtest market-input capture streams deduplicated observations to a temporary disk spool instead of stopping at 4,096 reads or 50,000 unique rows. A bounded serialization cache limits memory independently of run length; exports stream their CSV and hashes, disclose actual capture failures, and remove the owned spool on completion or export failure. Optional explicit capture ceilings remain available without limiting trading. Input export also remains independent of unrelated provenance-export failures.
+- The README and documentation homepage put the full coding-assistant connection section directly after the framework benefits. The AI-native example explains its separate BotSpot research connection, with project setup, automatic attachment and prompt instructions. All eight localized summaries follow the same structure and retain the existing superpowers illustration.
+- Incomplete optional agent history, indicator and quote research returns visible, recoverable limitations without invalidating unrelated healthy execution. Direct strategy and portfolio-valuation data remain required.
+- Timezone-aware FRED overrides use their Chicago calendar date. Historical requests use the previous completed Chicago calendar vintage and disclose date-only timing limits, preventing morning decisions from using the same day's closing values.
+- Daily ranges preserve midnight source-calendar labels across timezone conversion, routed cache refresh and aggregation, retain the final available bar and exclude observations before the requested start. Routed daily benchmarks include the first open-to-close move and final close; incomplete coverage is reported instead of filled with invented flat returns.
+- Invalid routed benchmark prices and missing open sessions use the existing benchmark fallback without aborting strategy completion. Daily requests include the start session even when a strategy starts intraday, and coverage checks both requested boundaries. Coverage distinguishes missing sessions from closures using the applicable calendar, preserving configured equity markets and continuous crypto sessions.
+- News research can recover through available alternative sources and read article bodies. Shared document guidance preserves supported approximations, matched retained originals and unchanged baseline holdings. Index discovery includes eligible updates before selecting a baseline, and supplementary indexes add to the original source's updates.
+- Real-model release cases cover news recovery and macro timing, with positive and negative judge calibration for original-version and approximate-source evidence.
+- Research handoffs retain separate source-request windows and complete timestamp offsets. Option selection distinguishes listed contracts from the subset already inspected before reporting missing protective legs.
+- Batch history discloses short-but-usable coverage through per-symbol counts and completeness metadata. Known invalid interior gaps remain visible recoverable limitations.
+- Release checkout verification rejects changed source under an existing immutable version tag while permitting exact-source rechecks.
+- Live Tradier sandbox reads are classified as API integrations, preserving their original assertions and keeping constructor/normalization/default checks in the portable gate.
+- Documentation explains the optional BotSpot research connection before setup steps, with synchronized translated entry pages.
+
 ## 4.6.33 - 2026-10-27
 
 ### Added

@@ -2,7 +2,7 @@
 
 > Release/deployment workflow for LumiBot (version branches, changelog, tags, and GitHub releases).
 
-**Last Updated:** 2026-06-03
+**Last Updated:** 2026-11-02
 **Status:** Active
 **Audience:** Developers + AI Agents
 
@@ -26,7 +26,7 @@ production deployment each retain their own explicit authorization boundary.
 
 1) **Run the release preflight first.** If branch, `setup.py`, `CHANGELOG.md`, tag, or `dev` state is inconsistent, stop. Do not tag. Do not deploy BotManager. Fix the branch first.
 2) **Make the release branch contain everything safe to ship.** Dirty files, untracked files, and local-only commits are not excuses to skip work. Review them, commit them, test them, push them, and include them in the `version/X.Y.Z` PR unless they are unsafe, secret-bearing, broken, generated junk, or explicitly out of scope.
-3) Get the `version/X.Y.Z` PR **green** after that full inclusion sweep.
+3) Get the `version/X.Y.Z` PR **green** after that full inclusion sweep. Verify the complete real-model receipt locally in the pinned SDK environment with `python scripts/qualify_agent_evals.py verify` before merging and again before tagging. The branch/version preflight alone does not qualify model evidence.
 4) Merge latest `dev` into `version/X.Y.Z` and re-check CI (prevents drift / missing commits from other engineers).
 5) Merge the PR into `dev` (no direct pushes to `dev`).
 6) Tag the **merge commit on `dev`** as `vX.Y.Z` (this triggers GitHub Actions to publish to PyPI + create a GitHub Release).
@@ -66,6 +66,40 @@ Release order for tearsheet metric changes:
 3. Validate the released QuantStats package against the local LumiBot source in a clean environment.
 4. Only then release LumiBot and roll downstream consumers.
 
+## Dependency security and compatibility
+
+This source candidate requires `PyJWT[crypto]>=2.15.1`,
+`setuptools>=84.1.0` and `pandas-ta-classic>=0.6.52`. The evaluation tuple pins
+PyJWT to 2.15.1. The old `setuptools<81` cap supported an older pandas-ta release
+that imported `pkg_resources`; the modern indicator minimum removes that reason
+to retain vulnerable packaging tools. These versions support Python 3.10.
+See the primary release metadata for [PyJWT](https://pypi.org/pypi/PyJWT/2.15.1/json),
+[setuptools](https://pypi.org/pypi/setuptools/84.1.0/json) and
+[pandas-ta-classic](https://pypi.org/pypi/pandas-ta-classic/0.6.52/json).
+
+Validate dependency changes through ordinary resolution in clean Python 3.10
+and 3.12 environments, installed wheel tests, `pip check`, and an unsuppressed
+dependency audit. Exercise real signed-token rejection as well as successful
+login/refresh and indicator calculations. A dependency change also invalidates
+affected real-model qualification fingerprints; offline compatibility checks
+do not renew those receipts.
+
+As of 2026-11-02, three upstream constraints still prevent a fully patched
+resolved environment: SignalRCore 1.0.2 pins msgpack 1.1.2; the supported LiteLLM
+line requires filelock below 4 (the patched filelock 4 line also drops Python
+3.10); and the qualified ADK/telemetry tuple caps OpenTelemetry API/SDK below
+the patched API release. Keep these audit findings visible. Do not force
+incompatible versions, remove broker capabilities, suppress advisories, or
+describe these three minimum-version changes as resolving all dependency risk.
+An upstream-compatible release or a separately reviewed migration is required
+for those remaining dependencies.
+
+Python 3.10 additionally resolves Pillow 12.3.0, whose audit fixes require
+Pillow 13.0.0 and Python 3.11 or later. Python 3.12 can resolve the patched
+release. Keep the Python 3.10 finding visible while preserving the supported
+Python floor; do not install an incompatible wheel or silently drop Python
+3.10. See [Pillow's supported Python versions](https://pillow.readthedocs.io/en/stable/installation/python-support.html).
+
 ## Goals
 
 - Make deployments traceable (what code was deployed, when, and why).
@@ -74,6 +108,10 @@ Release order for tearsheet metric changes:
 - Make “what changed” readable (changelog + PR description quality).
 
 ---
+
+## CI shard arguments
+
+Pass collected test paths and node IDs as quoted Bash array elements. Parametrized IDs can contain spaces; unquoted command substitution splits those IDs and prevents the selected tests from running.
 
 ## Branch + Version Rules (STRICT)
 
@@ -94,6 +132,7 @@ Run this before changing versions, tagging, creating a release, or triggering Bo
 
 ```bash
 set -e
+git fetch origin dev --tags --prune
 
 branch="$(git branch --show-current)"
 setup_version="$(python3 - <<'PY'
@@ -113,7 +152,6 @@ echo "branch=${branch}"
 echo "setup.py=${setup_version}"
 echo "expected_branch=${expected_branch}"
 echo "latest_tag=${latest_tag}"
-git fetch origin dev --tags --prune
 git status --porcelain=v1
 
 test "${branch}" = "${expected_branch}" || {
@@ -132,9 +170,16 @@ git merge-base --is-ancestor origin/dev HEAD || {
 }
 
 git log --oneline "origin/${branch}..HEAD"
+python3 scripts/verify_release_checkout_state.py
 ```
 
 If this preflight fails, the release is blocked. Do not "just bump setup.py" on the old branch. Do not tag from the old branch. Do not deploy BotManager while this is failing.
+
+A canonical checkout can be clean and still be stale. Inspect fetched `dev` and
+tags before trusting its version branch. The checkout verifier rejects changed
+source under an existing package tag; prepare a forward version from current
+`dev`. Reverification of the exact tagged source remains supported for an
+interrupted publication. Never move or replace the old tag.
 
 Known bad state example:
 
@@ -313,7 +358,14 @@ Publishing is **tag-driven** via `.github/workflows/release.yml`.
    - Rationale: other people may have merged changes to `dev` while the version branch was in flight; this step ensures the release includes those changes.
 
 1) **Verify tests**
-   - Native inference may retain its actual original source/time through `ci/agent-evals/source-compatibility.json` only when `scripts/qualify_agent_evals.py verify` proves the complete source comparison. This applies to the maintained Pandas fixtures and unused external IBKR modules; actor/judge/fixture/shared-code changes still require normal native qualification. Never rewrite historical fingerprints or timestamps to a candidate.
+   - Web-enabled native cases can choose the normal optional keyless search tool.
+     Prepare its backend in the owned qualification environment before model calls
+     (`pip install ddgs==9.16.1 primp==2.0.1` for this qualification tuple), then
+     verify `from lumibot.components.agents.builtins import _web_search_backend;
+     _web_search_backend()` imports successfully. Missing optional dependencies
+     are setup failures. Record added versions and preserve compatible passes;
+     never mutate the shared SDK environment while model workers are active.
+   - Native inference may retain its actual original source/time through `ci/agent-evals/source-compatibility.json` only when `scripts/qualify_agent_evals.py verify` proves the complete source comparison. This applies to the maintained Pandas fixtures, unused external IBKR modules, and comment-only edits in unexecuted examples when the complete Python syntax tree (including prompts and docstrings) is identical. Actor/judge/fixture/shared-code changes still require normal native qualification. Never rewrite historical fingerprints or timestamps to a candidate.
    - Ensure required CI checks are green (unit + backtest + acceptance gates as applicable).
    - The standard gate is portable: no paid historical-data subscription or shared remote cache is required.
      `tests/backtest/test_alpaca_release_backtest.py` runs the real Alpaca adapter and backtest engine with
@@ -599,3 +651,8 @@ Publishing is **tag-driven** via `.github/workflows/release.yml`.
 
 - Avoid destructive git operations (`git checkout`, `git reset --hard`, `git stash`).
 - Keep release bookkeeping changes small and explicit (version bump + changelog + tag/release).
+
+
+### Recover publication of an immutable tag
+
+If the tagged package has passed its source checks but the publication workflow itself fails, repair the workflow on the next version branch and merge that repair through the ordinary green release PR. Never move or replace the existing tag. Dispatch `release.yml` on the repaired `dev` workflow with `recover_tag=vX.Y.Z`. An empty input still qualifies without publishing. Recovery checks out the exact existing tag for every package/test job, validates the tag against package metadata, runs all normal unit, backtest and SDK receipt gates, then publishes that tag’s wheel and creates its GitHub release. No account secrets or test cases are bypassed.

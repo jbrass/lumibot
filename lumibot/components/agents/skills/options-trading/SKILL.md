@@ -65,6 +65,12 @@ broker, approval, liquidity and risk limits.
    A contract previously considered as a wing can become a short when its verified
    delta is the appropriate match; rebuild both outer wings for the selected short pair.
    Unchecked outer strikes do not establish that protective wings are absent.
+   Keep the complete listed-strike evidence separate from the subset whose
+   Greeks or quotes you have inspected. If an exact wing is listed but has not
+   been inspected yet, query that contract next. Before reporting a missing
+   wing, reconcile its exact symbol, expiration, right and strike against the
+   returned list; absence from your evaluated-candidate subset is not absence
+   from the market.
    Verify every selected contract individually. Candidate-selection helpers narrow
    the search but do not prove the exact contract's Greeks or quote quality.
    Changing any leg's symbol, expiration, right or strike invalidates that leg's
@@ -119,6 +125,12 @@ each closing side from the current signed position (long becomes
 `sell_to_close`, short becomes `buy_to_close`) and defaults the quantity to the
 full held amount. Never write closing sides yourself. Pass `quantity` only for
 a per-unit price check or an intended partial close.
+
+Keep that contract-only shape for the final submission too. Do not copy
+`side` or `closing_side` fields from position reads, pricing results, or an
+opening-order payload into closing `legs_json`. For example, a closing leg is
+`{"symbol":"XYZ","expiration":"2027-01-15","strike":100,"right":"put"}`;
+the position determines its closing action.
 
 - Never multiply a cleanup quantity or repeat a close without rereading positions.
 - Do not report flatness until every relevant signed quantity is zero.

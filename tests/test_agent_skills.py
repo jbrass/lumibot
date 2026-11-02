@@ -143,9 +143,12 @@ def test_packaged_research_skill_distinguishes_live_queries_from_historical_repl
 def test_research_skill_reports_the_successful_response_bound_without_inheriting_failed_requests():
     skill = next(skill for skill in load_builtin_skills() if skill.name == "research-data")
     instructions = " ".join(skill.instructions.split())
-    assert "requested bound from the successful response's effective bound" in instructions
-    assert "If the successful response returns `asOf: null`" in instructions
-    assert "do not describe it as cutoff-bounded" in instructions
+    # Compact per-source entries preserve requested arguments separately from
+    # the response's applied bound; real-model cases assess factual handoffs.
+    assert "Copy each window from that request's arguments and each effective bound from" in instructions
+    assert "its successful response" in instructions
+    assert "With `asOf: null`, describe an unbounded live read" in instructions
+    assert "never retrieval against or bounded by the runtime clock" in instructions
 
 
 def test_options_skill_requires_atomic_multileg_or_no_trade():
@@ -274,7 +277,9 @@ def test_stock_skill_prices_limits_from_current_price_and_loads_rule_bars_with_h
     instructions = " ".join(stock_skill.instructions.split())
     intraday = " ".join(stock_skill.resources.references["intraday-setups.md"].split())
 
-    assert "Price a limit order from the current `market_last_price` result" in instructions
+    # The authorized quote-first workflow supersedes last-price-only sizing;
+    # retain the original protection against using a historical signal close.
+    assert "Price a limit order from the current quote or current last-price fallback" in instructions
     assert "never from a historical bar's close" in instructions
     # The limit-price rule is for a new order. It made agents reprice an
     # already-pending exit (release eval stock_pending_exit_no_duplicate).

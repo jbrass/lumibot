@@ -1,10 +1,65 @@
 """Native inference keeps its original source; unrelated provider edits may reuse it."""
-import hashlib
+import ast
 import json
 
 import pytest
 
 from scripts import agent_eval_source_compatibility as scope
+
+
+LIVE_METHODS = [
+    ('lumibot/brokers/broker.py', 'Broker', 'sync_orders', 'self.IS_BACKTESTING_BROKER'),
+    ('lumibot/strategies/strategy_executor.py', 'StrategyExecutor', 'sync_broker', 'self.broker.IS_BACKTESTING_BROKER'),
+    ('lumibot/brokers/alpaca.py', 'Alpaca', 'do_polling', None),
+]
+
+
+def test_alpaca_only_benchmark_branch_preserves_pandas_inference():
+    path = 'lumibot/strategies/_strategy.py'
+    source = (scope.ROOT / path).read_bytes()
+    branch = b'elif type(self.broker.data_source) == AlpacaBacktesting:'
+    modified = source.replace(branch, branch + b'\n                pass  # report-only change')
+    scope.check_change(path, source, modified)
+    # An altered dispatch condition, another source, or shared accounting must
+    # still invalidate inference. Only the unreachable branch BODY is exempt.
+    for before, after in [
+        (branch, b'elif True:'),
+        (b'def _update_portfolio_value(self):', b'def _update_portfolio_value(self, changed=False):'),
+    ]:
+        with pytest.raises(ValueError, match='affects model qualification'):
+            scope.check_change(path, source, source.replace(before, after))
+    with pytest.raises(ValueError, match='affects model qualification'):
+        scope.check_change(path, source, source + b'\nraise RuntimeError("changed")\n')
+
+
+def test_alpaca_provider_is_outside_the_native_pandas_fixture():
+    scope.check_change('lumibot/backtesting/alpaca_backtesting.py', b'before', b'after')
+
+
+@pytest.mark.parametrize('path,owner,method,guard', LIVE_METHODS)
+def test_unused_live_method_body_changes_preserve_native_inference(path, owner, method, guard):
+    source = (scope.ROOT / path).read_bytes()
+    cls = next(n for n in ast.parse(source).body if isinstance(n, ast.ClassDef) and n.name == owner)
+    fn = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == method)
+    lines = source.splitlines(keepends=True)
+    lines.insert(fn.end_lineno, b'        pass  # native live-path regression proof\n')
+    scope.check_change(path, source, b''.join(lines))
+
+
+@pytest.mark.parametrize('path,owner,method,guard', LIVE_METHODS)
+def test_live_body_scope_preserves_every_other_byte_and_signature(path, owner, method, guard):
+    source = (scope.ROOT / path).read_bytes()
+    for modified in [source + b'\nraise RuntimeError("shared change")\n',
+                     source.replace(('def ' + method + '(').encode(), ('def changed_' + method + '(').encode(), 1),
+                     b'import unqualified_dependency\n' + source]:
+        with pytest.raises(ValueError, match='affects model qualification'):
+            scope.check_change(path, source, modified)
+    if guard:
+        for replacement in ('not ' + guard, 'True'):
+            modified = source.replace(('if ' + guard + ':').encode(), ('if ' + replacement + ':').encode(), 1)
+            assert modified != source
+            with pytest.raises(ValueError, match='affects model qualification'):
+                scope.check_change(path, source, modified)
 
 
 def test_scope_rejects_an_agent_or_fixture_change():
@@ -39,6 +94,10 @@ def test_native_catalog_bindings_use_pandas_backtesting_not_live_provider_adapte
             fixture = ProductionFixture(evals.build_fixture(name))
             try:
                 assert isinstance(fixture.broker, BacktestingBroker), name
+                assert not any(
+                    owner.__module__.startswith('lumibot.example_strategies')
+                    for owner in type(fixture.strategy).__mro__
+                ), name
                 assert fixture.broker.IS_BACKTESTING_BROKER is True, name
                 assert isinstance(fixture.broker.data_source, PandasDataBacktesting), name
                 fixture.create_agent(case, None)._ensure_bound_tools()
@@ -54,10 +113,10 @@ def test_source_files_cover_the_existing_runtime_fingerprint(monkeypatch):
     assert set(scope.runtime_paths()) == {path.relative_to(evals.REPO_ROOT).as_posix() for path in paths}
 
 
-def test_live_executor_reuse_is_pinned_and_rejects_any_unreviewed_shared_change():
+def test_refreshed_anchor_requires_fresh_inference_for_shared_executor_changes():
     path = 'lumibot/strategies/strategy_executor.py'
     current = (scope.ROOT / path).read_bytes()
-    assert hashlib.sha256(current).hexdigest() == scope.LIVE_EXECUTOR_COMPATIBILITY[1]
+    scope.check_change(path, current, current)
     with pytest.raises(ValueError, match='affects model qualification'):
         scope.check_change(path, b'unreviewed prior executor', current)
     with pytest.raises(ValueError, match='affects model qualification'):
@@ -78,11 +137,12 @@ def test_validator_reuse_never_accepts_changed_native_validation():
         scope.check_change('scripts/qualify_agent_evals.py', before, before.replace(b'return True', b'return False'))
 
 
-def test_validator_entry_migration_is_bound_to_the_exact_checked_main():
+def test_refreshed_anchor_rejects_validator_entry_changes():
     import ast
     source = (scope.ROOT / 'scripts/qualify_agent_evals.py').read_bytes()
     main = next(node for node in ast.parse(source).body if isinstance(node, ast.FunctionDef) and node.name == 'main')
-    assert scope.entry_digest(main) == scope.VALIDATOR_ENTRY_COMPATIBILITY[1]
+    assert scope.entry_digest(main)
+    scope.check_change('scripts/qualify_agent_evals.py', source, source)
     early_success = source.replace(b'    cases, runtime_hash, versions =', b'    return 0\n    cases, runtime_hash, versions =')
     with pytest.raises(ValueError):
         scope.check_change('scripts/qualify_agent_evals.py', source, early_success)
@@ -104,3 +164,66 @@ def test_entry_digest_ignores_new_empty_ast_fields_only():
     assert scope.entry_digest(node) == baseline
     node.body[0].value = ast.Constant(value=False)
     assert scope.entry_digest(node) != baseline
+
+
+def test_example_comment_only_documentation_preserves_native_source():
+    source = b'"""Reference example."""\nPROMPT = "Observe the account."\ndef run():\n    return 3\n'
+    documented = b'# Run this example: https://example.test/strategy\n' + source
+    scope.check_change('lumibot/example_strategies/reference.py', source, documented)
+
+
+def test_unexecuted_reference_agent_literal_policy_keeps_shared_runtime_proof():
+    source = b'class Reference:\n    def initialize(self):\n        self.agents.create(name="reader", allow_trading=False, system_prompt="Read the source inventory.")\n'
+    revised = source.replace(b'Read the source inventory.', b'Account for each source transaction in the inventory.')
+    scope.check_change('lumibot/example_strategies/reference.py', source, revised)
+
+
+@pytest.mark.parametrize('before,after', [
+    (b'allow_trading=False', b'allow_trading=True'),
+    (b'name="reader"', b'name="executor"'),
+    (b'system_prompt="Read the source inventory."', b'system_prompt=fetch_policy()'),
+    (b'system_prompt="Read the source inventory."', b'system_prompt=f"{fetch_policy()}"'),
+    (b'def initialize(self):', b'def initialize(self):\n        fetch_data()'),
+])
+def test_reference_policy_compatibility_keeps_executable_connections_bound(before, after):
+    source = b'class Reference:\n    def initialize(self):\n        self.agents.create(name="reader", allow_trading=False, system_prompt="Read the source inventory.")\n'
+    with pytest.raises(ValueError, match='affects model qualification'):
+        scope.check_change('lumibot/example_strategies/reference.py', source, source.replace(before, after))
+
+
+@pytest.mark.parametrize('before,after', [
+    (b'Reference example.', b'Changed documentation string.'),
+    (b'Observe the account.', b'Buy an asset.'),
+    (b'return 3', b'return 4'),
+])
+def test_example_compatibility_keeps_docstrings_prompts_and_code_bound(before, after):
+    source = b'"""Reference example."""\nPROMPT = "Observe the account."\ndef run():\n    return 3\n'
+    with pytest.raises(ValueError, match='affects model qualification'):
+        scope.check_change('lumibot/example_strategies/reference.py', source, source.replace(before, after))
+    with pytest.raises(ValueError, match='affects model qualification'):
+        scope.check_change('lumibot/example_strategies/reference.py', source, b'import unqualified_dependency\n' + source)
+
+
+def test_example_comment_compatibility_does_not_exempt_shared_runtime():
+    source = b'def run():\n    return 3\n'
+    with pytest.raises(ValueError, match='affects model qualification'):
+        scope.check_change('lumibot/components/agents/runtime.py', source, b'# documentation\n' + source)
+
+
+def test_development_worker_declaration_preserves_direct_native_inference():
+    before = b"-r requirements.txt\npytest\ncoverage\n"
+    after = b"-r requirements.txt\npytest\npytest-xdist==3.8.0\ncoverage\n"
+    scope.check_change('requirements_dev.txt', before, after)
+
+
+@pytest.mark.parametrize('extra', [
+    b'litellm==9.0.0\n',
+    b'pytest-xdist @ https://example.test/unqualified.whl\n',
+    b'pytest-xdist==3.8.0; python_version >= "3.10"\n',
+    b'pytest-xdist[unqualified]==3.8.0\n',
+    b'-r unqualified.txt\n',
+])
+def test_development_worker_scope_rejects_other_dependency_changes(extra):
+    before = b"-r requirements.txt\npytest\n"
+    with pytest.raises(ValueError, match='affects model qualification'):
+        scope.check_change('requirements_dev.txt', before, before + extra)

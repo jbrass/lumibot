@@ -4,6 +4,7 @@ import hashlib
 import re
 import time
 from collections import defaultdict
+from datetime import datetime, timezone
 from importlib import import_module
 from typing import Any
 
@@ -62,6 +63,17 @@ class DuckDBQueryLayer:
             "query_calls": 0.0,
             "query_ms": 0.0,
         }
+
+    def close(self) -> None:
+        """Release this owner's database and registered frames after its last run."""
+        # A strategy and its agent manager reference each other. Native workers
+        # must not depend on garbage collection of that cycle to be released.
+        self.connection.close()
+        self._frames.clear()
+        self._table_meta.clear()
+        self._source_tables.clear()
+        self._history_cache.clear()
+        self._name_counters.clear()
 
     @staticmethod
     def _slugify(value: str) -> str:
@@ -468,6 +480,12 @@ class DuckDBQueryLayer:
             limited = frame
             truncated = False
         rows = limited.to_dict(orient="records")
+        # Render absolute instants consistently for tool consumers. Keep SQL's
+        # configured timezone, source strings and naive market wall clocks intact.
+        for row in rows:
+            for column, value in row.items():
+                if isinstance(value, datetime) and value.tzinfo is not None and value.utcoffset() is not None:
+                    row[column] = value.astimezone(timezone.utc)
         return {
             "row_count": int(len(frame.index)),
             "columns": [str(col) for col in frame.columns],

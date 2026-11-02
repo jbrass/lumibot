@@ -207,6 +207,7 @@ def __getattr__(name):
 STATS_TABLE_NAME = "strategy_tracker"
 
 _BACKTESTING_CLASS_MODULES = {
+    "ProjectXBacktesting": "lumibot.backtesting.projectx_backtesting",
     "KalshiBacktesting": "lumibot.backtesting.kalshi_backtesting",
     "AlpacaBacktesting": "lumibot.backtesting.alpaca_backtesting",
     "BacktestingBroker": "lumibot.backtesting.backtesting_broker",
@@ -2727,12 +2728,13 @@ class _Strategy:
 
                 # Use daily bars for benchmark across intraday strategies to keep tearsheet cost bounded.
                 timestep = "day"
+                benchmark_start = pd.Timestamp(self._backtesting_start).normalize()
 
                 try:
                     bars = self.broker.data_source.get_historical_prices_between_dates(
                         benchmark_asset,
                         timestep,
-                        start_date=self._backtesting_start,
+                        start_date=benchmark_start,
                         end_date=backtesting_end_adjusted,
                         quote=self._quote_asset,
                     )
@@ -2748,20 +2750,67 @@ class _Strategy:
                     self.logger.error(f"Router benchmark bars empty/invalid: {benchmark_asset}")
                     _fallback_benchmark(benchmark_asset)
                     return
-                df = df.copy()
-                df["return"] = df["close"].pct_change(fill_method=None)
-                df["symbol_cumprod"] = (1 + df["return"]).cumprod()
-                self._benchmark_returns_df = df
+                from lumibot.tools.indicators import benchmark_returns_from_bars
+
+                base_asset = benchmark_asset[0] if isinstance(benchmark_asset, tuple) else benchmark_asset
+                asset_type = str(getattr(base_asset, "asset_type", "stock")).lower()
+                market = {
+                    "crypto": "24/7", "forex": "CME_FX",
+                    "future": "us_futures", "cont_future": "us_futures",
+                }.get(asset_type, getattr(self.broker, "market", "NYSE"))
+                if asset_type in {"stock", "index"} and market in {"24/7", "CME_FX", "us_futures"}:
+                    # A non-equity strategy calendar does not change the cash
+                    # benchmark's sessions. Preserve configured equity markets.
+                    market = "NYSE"
+                try:
+                    self._benchmark_returns_df = benchmark_returns_from_bars(
+                        df, market=market, start_date=self._backtesting_start,
+                        end_date=self._backtesting_end,
+                    )
+                except (TypeError, ValueError, RuntimeError):
+                    _fallback_benchmark(benchmark_asset)
 
             elif type(self.broker.data_source) == AlpacaBacktesting:
                 benchmark_asset = self._benchmark_asset
-
+                source_timestep, _ = self.broker.data_source._normalize_timestep_for_source(
+                    self.broker.data_source.get_timestep()
+                )
+                asset_type = str(getattr(benchmark_asset, "asset_type", "stock")).lower()
+                market = "24/7" if asset_type == "crypto" else self.broker.data_source.market
+                if asset_type != "crypto" and market in ("24/7", "24/5"):
+                    market = "NYSE"
                 df = self.broker.data_source.get_historical_prices_between_dates(
-                    base_asset=benchmark_asset
+                    base_asset=benchmark_asset,
+                    **({"market": market} if source_timestep == "day" else {}),
                 )
 
                 if df is None or df.empty:
                     self.logger.error(f"Couldn't get_historical_prices_between_dates: {benchmark_asset}")
+                    return
+                if source_timestep == "day":
+                    from lumibot.tools.helpers import get_trading_days
+                    from lumibot.tools.indicators import benchmark_returns_from_bars
+
+                    if asset_type != "crypto":
+                        df = df.copy()
+                        index = pd.DatetimeIndex(df.index)
+                        if index.tz is not None:
+                            df.index = index.tz_convert("America/New_York")
+                        sessions = get_trading_days(
+                            market=market, start_date=pd.Timestamp(df.index.min()).normalize(),
+                            end_date=pd.Timestamp(df.index.max()).normalize() + pd.Timedelta(days=1),
+                        )
+                        df = df.loc[pd.Index(pd.DatetimeIndex(df.index).date).isin(sessions.index.date)]
+                    try:
+                        self._benchmark_returns_df = benchmark_returns_from_bars(
+                            df, market=market, start_date=self._backtesting_start,
+                            end_date=self._backtesting_end,
+                        )
+                    except (TypeError, ValueError, RuntimeError):
+                        self.logger.warning(
+                            "Alpaca daily benchmark has incomplete or invalid observations; leaving it unavailable."
+                        )
+                        self._benchmark_returns_df = None
                     return
                 df = df.loc[self._backtesting_start:self._backtesting_end].copy()
                 if hasattr(df, 'select'):  # Polars DataFrame
@@ -3320,6 +3369,8 @@ class _Strategy:
 
         if env_override_name is not None:
             datasource_map = {
+                "projectx": "ProjectXBacktesting",
+                "topstepx": "ProjectXBacktesting",
                 "polygon": "PolygonDataBacktesting",
                 "thetadata": "ThetaDataBacktesting",
                 "yahoo": "YahooDataBacktesting",
@@ -3622,16 +3673,21 @@ class _Strategy:
                 from lumibot.backtesting.data_provenance import write_backtest_data_provenance
 
                 write_backtest_data_provenance(data_source, logdir)
-                from lumibot.backtesting.market_input_evidence import write_market_input_evidence
-
-                write_market_input_evidence(data_source, logdir)
-                option_source = getattr(self.broker, "option_source", None)
-                if option_source is not None and option_source is not data_source:
-                    write_market_input_evidence(option_source, logdir, prefix="option_")
             except Exception as exc:
-                # Provenance is diagnostic metadata and must never make an otherwise valid
-                # trading simulation fail at the artifact-writing boundary.
+                # Diagnostics must not make an otherwise valid simulation fail.
                 self.logger.warning("Backtest data provenance artifact could not be written: %s", exc)
+
+            capture_sources = [(data_source, "")]
+            option_source = getattr(strategy.broker, "option_source", None)
+            if option_source is not None and option_source is not data_source:
+                capture_sources.append((option_source, "option_"))
+            for capture_source, prefix in capture_sources:
+                try:
+                    from lumibot.backtesting.market_input_evidence import write_market_input_evidence
+
+                    write_market_input_evidence(capture_source, logdir, prefix=prefix, finalize=True)
+                except Exception as exc:
+                    self.logger.warning("Backtest market-input artifact could not be written: %s", exc)
 
             end = datetime.datetime.now()
             backtesting_length = backtesting_end - backtesting_start
