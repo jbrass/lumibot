@@ -937,6 +937,13 @@ class Alpaca(Broker):
             child for leg in legs_raw or []
             if (child := self._parse_broker_order(leg, strategy_name, strategy_object=strategy_object)) is not None
         ] if isinstance(legs_raw, list) else []
+        # Alpaca labels each leg of a nested bracket/OCO/OTO order with the
+        # parent's order_class; a leg (or a parent read without nested=True)
+        # has no children of its own, so it is a simple order here.
+        if not child_orders and order_class_value in (
+            Order.OrderClass.BRACKET, Order.OrderClass.OCO, Order.OrderClass.OTO,
+        ):
+            order_class_value = Order.OrderClass.SIMPLE
         if order_class_value == Order.OrderClass.MULTILEG:
             underlying = child_orders[0].asset.symbol if child_orders else symbol
             asset = Asset(underlying, asset_type=Asset.AssetType.MULTILEG)
