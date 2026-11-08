@@ -256,30 +256,70 @@ def establishment_runtime(source_ref, cases, versions):
 
 def build_establishment(rows, call_rows, cases, *, source_ref, versions, now=None):
     now = now or evals.utc_now()
-    runtime_hash = establishment_runtime(source_ref, cases, versions)
-    _, calls = subscription_call_state(call_rows)
+    # A catalog can contain unchanged established cases beside changed/new ones.
+    # Verify the immutable original runtime first; only exact original case
+    # definitions can receive its once-per-regression shortcut.
+    runtime_hash = establishment_runtime(source_ref, [], versions)
+    unchanged = unchanged_establishment_cases(source_ref, cases)
+    if rows and not call_rows:
+        raise ValueError("Native subscription call ledger is required for native rows")
+    calls = subscription_call_state(call_rows)[1] if call_rows else {}
     established = []
-    for case in cases:
+    original_attempts_present = False
+    for case in unchanged:
         fingerprint = evals.case_fingerprint(case, judge_model=evals.DEFAULT_JUDGE_MODEL, runtime_hash=runtime_hash)
         latest = evals.latest_repetition_rows(rows, case["id"], fingerprint)
+        original_attempts_present |= bool(latest)
         if (len(latest) >= evals.case_required_passes(case)
                 and all(row.get("status") == "pass" for row in latest.values())):
             established.append(case)
     records = project_case_records(rows, calls, established, runtime_hash=runtime_hash, now=now)
+    if not records and not original_attempts_present:
+        # Published receipts already retain the original source, native call
+        # identities, usage, times and evidence digests. Reuse that verified
+        # establishment after private raw artifacts expire; never manufacture
+        # replacement actor rows or relabel their historical source.
+        from scripts import agent_eval_source_compatibility as source
+        path = "ci/agent-evals/qualification.json"
+        if source._git("ls-tree", "--name-only", source_ref, "--", path, root=evals.REPO_ROOT).strip():
+            published = json.loads(source._git("show", f"{source_ref}:{path}", root=evals.REPO_ROOT))
+            prior = published.get("establishment")
+            if prior:
+                if published.get("sdk_versions") != versions or published.get("funding") != "chatgpt-plan":
+                    raise ValueError("Published establishment SDK or funding mismatch")
+                compatible = {case["id"] for case in unchanged_establishment_cases(prior["source_commit"], cases)}
+                proof = {**prior, "cases": {key: value for key, value in prior["cases"].items()
+                                            if key in compatible}}
+                validate_establishment(proof, cases, versions=versions, now=now)
+                return proof
     proof = {"source_commit": source_ref, "runtime_fingerprint": runtime_hash, "cases": records}
     validate_establishment(proof, cases, versions=versions, now=now)
     return proof
 
 
+def unchanged_establishment_cases(source_ref, cases):
+    from scripts import agent_eval_source_compatibility as source
+
+    paths = {Path(case["_path"]).relative_to(evals.REPO_ROOT).as_posix(): case for case in cases}
+    tracked = set(source._git("ls-tree", "-r", "--name-only", "-z", source_ref,
+                              root=evals.REPO_ROOT).decode().split("\0"))
+    originals = source._blobs(source_ref, sorted(set(paths) & tracked), root=evals.REPO_ROOT)
+    return [case for path, case in paths.items() if path in originals
+            and json.loads(originals[path]) == {key: value for key, value in case.items() if not key.startswith("_")}]
+
+
 def validate_establishment(proof, cases, *, versions, now):
     if not isinstance(proof, dict) or set(proof) != {"source_commit", "runtime_fingerprint", "cases"}:
         raise ValueError("Invalid original establishment evidence")
-    runtime_hash = establishment_runtime(proof["source_commit"], cases, versions)
-    if proof["runtime_fingerprint"] != runtime_hash or not isinstance(proof["cases"], dict):
+    if not isinstance(proof["cases"], dict):
         raise ValueError("Original establishment source/SDK fingerprint mismatch")
     by_id = {case["id"]: case for case in cases}
     if set(proof["cases"]) - set(by_id):
         raise ValueError("Unknown established case")
+    runtime_hash = establishment_runtime(proof["source_commit"],
+        [by_id[case_id] for case_id in proof["cases"]], versions)
+    if proof["runtime_fingerprint"] != runtime_hash:
+        raise ValueError("Original establishment source/SDK fingerprint mismatch")
     for case_id, record in proof["cases"].items():
         validate_record(record, by_id[case_id], runtime_hash=runtime_hash, now=now)
 
@@ -408,6 +448,7 @@ def verify_receipt(receipt, cases, *, runtime_hash, versions, now=None):
                     raise ValueError("Establishment reused a native attempt or call")
                 seen_attempts.update(attempts)
                 seen_calls.update(calls)
+    historical_calls = set(seen_calls)
     for case in cases:
         record = records[case["id"]]
         if not isinstance(record, dict) or set(record) != {"fingerprint", "repetitions"}:
@@ -435,7 +476,11 @@ def verify_receipt(receipt, cases, *, runtime_hash, versions, now=None):
         # One calibration batch legitimately shares its attempt id across
         # controls/repetitions, while every call is independently scoped.
         seen_calls.update(calls)
-    if len(seen_calls) > allowance["consumed_calls"]:
+    # Establishment carries independently verified original call identities.
+    # The current journal need not recreate those expired historical rows.
+    # Retain global duplicate detection above, and bind this journal's usage
+    # to current actor/calibration calls only.
+    if len(seen_calls - historical_calls) > allowance["consumed_calls"]:
         raise ValueError("Qualified calls exceed the cumulative native ledger")
 
 
