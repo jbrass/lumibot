@@ -46,6 +46,10 @@ LIVE_METHOD_SCOPES = {
     'lumibot/strategies/strategy_executor.py': (
         'StrategyExecutor', 'sync_broker', 'self.broker.IS_BACKTESTING_BROKER'),
     'lumibot/brokers/alpaca.py': ('Alpaca', 'do_polling', None),
+    'lumibot/tools/projectx_helpers.py': tuple(
+        ('ProjectXStreaming', method, None)
+        for method in ('__init__', '_on_market_hub_open', '_on_market_hub_close', 'get_market_quote')
+    ),
 }
 
 
@@ -106,43 +110,53 @@ def entry_digest(node):
                                     separators=(",", ":")).encode()).hexdigest()
 
 
-def _without_unused_live_body(source, owner, method, guard):
+def _without_unused_live_bodies(source, scopes):
     """Preserve exact bytes except a body that no native fixture can execute.
 
     Shared methods retain their signature, docstring, and unchanged immediate
     backtesting return. The catalog's real binding test proves every broker is a
-    BacktestingBroker. Alpaca is never instantiated by any native fixture.
+    BacktestingBroker. The native fixture contract also prevents constructing
+    the ProjectX streaming owner, including during actual native quote reads.
     """
     try:
-        classes = [n for n in ast.parse(source).body if isinstance(n, ast.ClassDef) and n.name == owner]
-        if len(classes) != 1:
-            return None
-        methods = [n for n in classes[0].body if isinstance(n, ast.FunctionDef) and n.name == method]
-        if len(methods) != 1:
-            return None
-        fn = methods[0]
-        body = fn.body
-        prefix_end = fn.lineno
-        if (isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant)
-                and isinstance(body[0].value.value, str)):
-            prefix_end = body[0].end_lineno
-            body = body[1:]
-        if guard:
-            guards = [n for n in body if isinstance(n, ast.If)
-                      and ast.dump(n.test) == ast.dump(ast.parse(guard, mode='eval').body)]
-            if len(guards) != 1:
+        tree = ast.parse(source)
+        if isinstance(scopes[0], str):
+            scopes = (scopes,)
+        ranges = []
+        for owner, method, guard in scopes:
+            classes = [n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == owner]
+            if len(classes) != 1:
                 return None
-            first = guards[0]
-            if not (len(first.body) == 1 and isinstance(first.body[0], ast.Return)
-                    and first.body[0].value is None and not first.orelse):
+            methods = [n for n in classes[0].body if isinstance(n, ast.FunctionDef) and n.name == method]
+            if len(methods) != 1:
                 return None
-            prefix_end = first.end_lineno
-        elif fn.decorator_list:
-            # No decorators exist on the unused adapter poller; don't allow a
-            # newly decorated method to acquire import-time behavior.
+            fn = methods[0]
+            body = fn.body
+            prefix_end = body[0].lineno - 1
+            if (isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant)
+                    and isinstance(body[0].value.value, str)):
+                prefix_end = body[0].end_lineno
+                body = body[1:]
+            if guard:
+                guards = [n for n in body if isinstance(n, ast.If)
+                          and ast.dump(n.test) == ast.dump(ast.parse(guard, mode='eval').body)]
+                if len(guards) != 1:
+                    return None
+                first = guards[0]
+                if not (len(first.body) == 1 and isinstance(first.body[0], ast.Return)
+                        and first.body[0].value is None and not first.orelse):
+                    return None
+                prefix_end = first.end_lineno
+            elif fn.decorator_list:
+                return None
+            ranges.append((prefix_end, fn.end_lineno))
+        ordered = sorted(ranges)
+        if any(start < prior_end for (_prior_start, prior_end), (start, _end) in zip(ordered, ordered[1:])):
             return None
         lines = source.splitlines(keepends=True)
-        return b''.join(lines[:prefix_end]) + b'<unused-live-body>\n' + b''.join(lines[fn.end_lineno:])
+        for start, end in reversed(ordered):
+            lines[start:end] = [b'<unused-live-body>\n']
+        return b''.join(lines)
     except (SyntaxError, IndexError, ValueError):
         return None
 
@@ -181,13 +195,17 @@ def check_change(path, before, after):
         except (SyntaxError, ValueError, UnicodeError):
             pass
     if path in LIVE_METHOD_SCOPES:
-        old = _without_unused_live_body(before, *LIVE_METHOD_SCOPES[path])
-        new = _without_unused_live_body(after, *LIVE_METHOD_SCOPES[path])
+        old = _without_unused_live_bodies(before, LIVE_METHOD_SCOPES[path])
+        new = _without_unused_live_bodies(after, LIVE_METHOD_SCOPES[path])
         if old is not None and old == new:
             return
     if path == 'lumibot/strategies/_strategy.py':
         old = _without_alpaca_benchmark_body(before)
         new = _without_alpaca_benchmark_body(after)
+        if old is not None and old == new:
+            return
+        old = _without_unused_report_directory_creation(before)
+        new = _without_unused_report_directory_creation(after)
         if old is not None and old == new:
             return
     raise ValueError(f'Source change affects model qualification: {path}')
@@ -253,3 +271,36 @@ def compatible_runtime(receipt, receipt_bytes, anchor, *, root=ROOT):
     for path, before in original.items():
         check_change(path, before, (root / path).read_bytes())
     return receipt['runtime_fingerprint']
+
+
+def _without_unused_report_directory_creation(source):
+    """Ignore only mkdir after the reporting guard disabled by every fixture.
+
+    The fixture module remains fully fingerprinted. Its analyze_backtest=False
+    contract is exercised for every native case; changing it requires inference.
+    Keep the entire guard, signature, other report code and shared trading tree.
+    """
+    try:
+        tree = ast.parse(source, type_comments=True)
+        owner = next(n for n in tree.body
+                     if isinstance(n, ast.ClassDef) and n.name == '_Strategy')
+        method = next(n for n in owner.body
+                      if isinstance(n, ast.FunctionDef) and n.name == 'backtest_analysis')
+        def dump(node):
+            return ast.dump(node, include_attributes=False)
+        guard = ast.parse('if not self._analyze_backtest:\n    return').body[0]
+        defaults = ast.parse('if not logdir:\n    logdir = "logs"').body[0]
+        mkdir = ast.parse('os.makedirs(logdir, exist_ok=True)').body[0]
+        if not method.body or dump(method.body[0]) != dump(guard):
+            return None
+        matches = [index for index, node in enumerate(method.body) if dump(node) == dump(mkdir)]
+        if len(matches) > 1:
+            return None
+        if matches:
+            index = matches[0]
+            if index < 1 or dump(method.body[index - 1]) != dump(defaults):
+                return None
+            method.body.pop(index)
+        return dump(tree)
+    except (SyntaxError, StopIteration, IndexError, ValueError):
+        return None
