@@ -79,7 +79,9 @@ class AlpacaBacktesting(DataSourceBacktesting):
     - Daily option bars start at the day's first trade, which can print after the open.
       Use minute bars when fill timing matters.
     - Free keys allow about 200 requests per minute. Requests are throttled below that
-      and HTTP 429 answers wait (``Retry-After`` when present) with a bounded retry.
+      (180 per minute) and HTTP 429 answers wait (``Retry-After`` when present) with a
+      bounded retry. Paid data plans allow far more: pass ``max_requests_per_minute`` (or set
+      ``ALPACA_MAX_REQUESTS_PER_MINUTE``), e.g. 9000 for Algo Trader Plus (10,000 per minute).
     - Stock bars use Alpaca's default feed. Checked 2026-09-23 on a free key: history comes
       back as SIP (all US exchanges, SPY about 60M shares a day versus about 2M on IEX), but
       the latest 15 minutes of SIP are refused ("subscription does not permit querying
@@ -169,6 +171,9 @@ class AlpacaBacktesting(DataSourceBacktesting):
                 - market (str): Indicates the stock exchange or market (e.g., "NYSE"). Defaults to "NYSE".
                 - auto_adjust (bool): Determines whether to auto-adjust data, such as stock splits. Defaults 
                   to True.
+                - max_requests_per_minute (int): Client-side request budget per minute. Defaults to the
+                  ALPACA_MAX_REQUESTS_PER_MINUTE environment variable, else 180 (below the free plan's
+                  200). Raise it for a paid data plan; HTTP 429 answers are still retried either way.
                 - extended_hours (bool): Stock minute history also holds Alpaca's real pre- and post-market
                   bars (04:00-09:30 and 16:00-20:00 ET), the way live Alpaca and Polygon backtests return
                   them, for strategies that rank on premarket moves or volume. Defaults to False (regular
@@ -236,6 +241,11 @@ class AlpacaBacktesting(DataSourceBacktesting):
         self._refreshed_keys = {}
         self._refresh_cache: bool = kwargs.get('refresh_cache', False)
         self._extended_hours: bool = bool(kwargs.get('extended_hours', False))
+        # Request budget: an explicit kwarg, else the environment, else the class default
+        # (free plan). The instance attribute shadows the class constant the throttle reads.
+        requested_rpm = kwargs.get('max_requests_per_minute') or os.environ.get('ALPACA_MAX_REQUESTS_PER_MINUTE')
+        if requested_rpm:
+            self.ALPACA_MAX_REQUESTS_PER_MINUTE = max(1, int(requested_rpm))
         # History never shows the bar that is still forming: a bar is returned only after it
         # has closed, like IBKR, ThetaData and Polygon backtests, in both environment and
         # explicit-config mode. Its final OHLCV would be a lookahead. An explicit False opts in
@@ -838,7 +848,7 @@ class AlpacaBacktesting(DataSourceBacktesting):
         sleeper(seconds)
 
     def _throttle_alpaca_requests(self) -> None:
-        """Keep this process under Alpaca's free-tier limit (about 200 requests per minute)."""
+        """Keep this process under its per-minute request budget (ALPACA_MAX_REQUESTS_PER_MINUTE)."""
         recent = self._state("_alpaca_request_times", deque)
         limit = max(1, int(self.ALPACA_MAX_REQUESTS_PER_MINUTE))
         now = time.monotonic()
