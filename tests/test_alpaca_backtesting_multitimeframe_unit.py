@@ -1192,3 +1192,89 @@ def test_alpaca_history_defaults_to_completed_bars_in_both_modes(monkeypatch, tm
 
     assert AlpacaBacktesting(**window)._remove_incomplete_current_bar is True
     assert AlpacaBacktesting(**window, remove_incomplete_current_bar=False)._remove_incomplete_current_bar is False
+
+
+def _extended_open(day: date, minute_of_day: int) -> float:
+    # Distinct from _minute_open: 900+ marks a bar from outside the regular session.
+    return round(900 + (day - _ENV_WEEK[0]).days + minute_of_day * 0.0001, 4)
+
+
+class _FakeExtendedHoursStockClient(_FakeStockHistoricalClient):
+    """Also serves 1-minute pre-market (08:00-09:29) and post-market (16:00-16:59) bars."""
+
+    def get_stock_bars(self, request):
+        barset = super().get_stock_bars(request)
+        if str(request.timeframe) != "1Min":
+            return barset
+        start, end = _as_new_york(request.start), _as_new_york(request.end)
+        symbol = request.symbol_or_symbols
+        rows = []
+        for day in _FAKE_SESSIONS:
+            midnight = _NY_TZ.localize(datetime.combine(day, datetime.min.time()))
+            for minute_of_day in [*range(8 * 60, 9 * 60 + 30), *range(16 * 60, 17 * 60)]:
+                ts = midnight + timedelta(minutes=minute_of_day)
+                if start <= ts <= end:
+                    o = _extended_open(day, minute_of_day)
+                    rows.append((ts.astimezone(pytz.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"), o, o, o, o, 10))
+        regular = [
+            (bar.timestamp.strftime("%Y-%m-%dT%H:%M:%SZ"), bar.open, bar.high, bar.low, bar.close, bar.volume)
+            for bar in barset.data.get(symbol, [])
+        ]
+        return _bars(symbol, sorted(regular + rows))
+
+
+def test_alpaca_extended_hours_adds_premarket_bars_to_stock_history_only(monkeypatch, tmp_path):
+    """A premarket ranking at 09:29 needs today's premarket bars. Without extended_hours the
+    minute history holds regular-session minutes only, so it ends at yesterday's 15:59."""
+    import lumibot.backtesting.alpaca_backtesting as alpaca_backtesting
+
+    _select_alpaca_through_environment(monkeypatch, tmp_path)
+    monkeypatch.setattr(alpaca_backtesting, "StockHistoricalDataClient", _FakeExtendedHoursStockClient)
+    config = {"API_KEY": "test-key", "API_SECRET": "test-secret", "PAPER": True}
+    window = dict(
+        datetime_start=_NY_TZ.localize(datetime(2026, 8, 3)),
+        datetime_end=_NY_TZ.localize(datetime(2026, 8, 7)),
+        config=config,
+        timestep="minute",
+        history_before_start=True,
+        remove_incomplete_current_bar=True,
+    )
+    day = date(2026, 8, 4)
+    premarket = _NY_TZ.localize(datetime(2026, 8, 4, 9, 29))
+    spy = Asset("SPY")
+
+    regular = AlpacaBacktesting(**window)
+    regular._datetime = premarket
+    bars = regular.get_historical_prices(spy, 10, "minute")
+    assert bars.df.index[-1] == _NY_TZ.localize(datetime(2026, 8, 3, 15, 59))
+
+    source = AlpacaBacktesting(**window, extended_hours=True)
+    source._datetime = premarket
+    df = source.get_historical_prices(spy, 150, "minute").df
+    today = df[df.index.date == day]
+    # Today's premarket, finished by 09:29 (the 09:29 bar is still forming), with real prices.
+    assert len(today) == 89
+    assert today.index[0] == _NY_TZ.localize(datetime(2026, 8, 4, 8, 0))
+    assert today.index[-1] == _NY_TZ.localize(datetime(2026, 8, 4, 9, 28))
+    assert float(today["open"].iloc[-1]) == _extended_open(day, 9 * 60 + 28)
+    # Before it: yesterday's post-market (real bars, not forward-filled), then its session.
+    earlier = df[df.index.date < day]
+    assert earlier.index[-1] == _NY_TZ.localize(datetime(2026, 8, 3, 16, 59))
+    assert _NY_TZ.localize(datetime(2026, 8, 3, 15, 59)) in earlier.index
+    assert df.index.is_monotonic_increasing and not df.index.has_duplicates
+
+    # Regular-session only on request.
+    plain = source.get_historical_prices(spy, 10, "minute", include_after_hours=False).df
+    assert plain.index[-1] == _NY_TZ.localize(datetime(2026, 8, 3, 15, 59))
+
+    # The clock, last price and fills are unchanged: the window series has no extended bars.
+    source._datetime = _NY_TZ.localize(datetime(2026, 8, 4, 9, 30))
+    assert float(source.get_last_price(spy)) == _minute_open(day, 0)
+    window_key = source._get_asset_key(base_asset=spy, quote_asset=source.LUMIBOT_DEFAULT_QUOTE_ASSET, timestep="minute")
+    window_series = source._data_store[window_key]
+    assert not (window_series.index.time < datetime(2026, 8, 4, 9, 30).time()).any()
+    assert not (window_series.index.time >= datetime(2026, 8, 4, 16, 0).time()).any()
+
+    # Daily bars are untouched.
+    daily = source.get_historical_prices(spy, 1, "day").df
+    assert daily.index[-1].date() == date(2026, 8, 3)

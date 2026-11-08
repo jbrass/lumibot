@@ -169,6 +169,12 @@ class AlpacaBacktesting(DataSourceBacktesting):
                 - market (str): Indicates the stock exchange or market (e.g., "NYSE"). Defaults to "NYSE".
                 - auto_adjust (bool): Determines whether to auto-adjust data, such as stock splits. Defaults 
                   to True.
+                - extended_hours (bool): Stock minute history also holds Alpaca's real pre- and post-market
+                  bars (04:00-09:30 and 16:00-20:00 ET), the way live Alpaca and Polygon backtests return
+                  them, for strategies that rank on premarket moves or volume. Defaults to False (regular
+                  session only). Only history is affected: the bars are never filled, and the clock,
+                  get_last_price and order fills stay on regular-session minutes. Pass
+                  include_after_hours=False to get_historical_prices for regular-session bars only.
                 - remove_incomplete_current_bar (bool): Return only bars that have closed by the simulated
                   time. Defaults to True in both environment and explicit-config mode, the contract IBKR,
                   ThetaData and Polygon backtests follow. Pass False only to opt in to the old behavior:
@@ -229,6 +235,7 @@ class AlpacaBacktesting(DataSourceBacktesting):
         self._data_store: dict[str, pd.DataFrame] = {}
         self._refreshed_keys = {}
         self._refresh_cache: bool = kwargs.get('refresh_cache', False)
+        self._extended_hours: bool = bool(kwargs.get('extended_hours', False))
         # History never shows the bar that is still forming: a bar is returned only after it
         # has closed, like IBKR, ThetaData and Polygon backtests, in both environment and
         # explicit-config mode. Its final OHLCV would be a lookahead. An explicit False opts in
@@ -560,6 +567,7 @@ class AlpacaBacktesting(DataSourceBacktesting):
         # _extend_history=False is for the lookups that read the bar starting now (get_last_price
         # and the broker's fill); they never need bars from before the window.
         reach_back = _extend_history and bool(getattr(self, "_history_before_start", False))
+        source = df
         view = self._resample_ohlcv_dataframe(df, resample_rule) if resample_rule is not None else df
         current_index = self._newest_bar_position(
             view.index,
@@ -578,7 +586,28 @@ class AlpacaBacktesting(DataSourceBacktesting):
                 timestep=timestep,
             )
             if extended is not None:
+                source = extended
                 view = self._resample_ohlcv_dataframe(extended, resample_rule) if resample_rule is not None else extended
+                current_index = self._newest_bar_position(
+                    view.index,
+                    search_datetime,
+                    timestep,
+                    remove_incomplete_current_bar,
+                )
+        # Pre- and post-market bars join history only (_extend_history=False is the clock,
+        # get_last_price and the fill, which stay on regular-session minutes).
+        if (
+                getattr(self, "_extended_hours", False)
+                and include_after_hours
+                and _extend_history
+                and source_timestep == "minute"
+                and str(getattr(asset, "asset_type", "")).lower() == "stock"
+        ):
+            outside = self._extended_hours_bars(asset, quote)
+            if not outside.empty:
+                source = pd.concat([source, outside])
+                source = source[~source.index.duplicated(keep="first")].sort_index()
+                view = self._resample_ohlcv_dataframe(source, resample_rule) if resample_rule is not None else source
                 current_index = self._newest_bar_position(
                     view.index,
                     search_datetime,
@@ -1652,6 +1681,54 @@ class AlpacaBacktesting(DataSourceBacktesting):
             session_minutes = self._get_trading_times_for_timestep(pcal=calendar, timestep="minute")
             df = df[df["timestamp"].isin(session_minutes)]
         df = df[(df["timestamp"] >= segment_start) & (df["timestamp"] < segment_end)].sort_values("timestamp")
+
+        cache_dir = os.path.join(LUMIBOT_CACHE_FOLDER, self.CACHE_SUBFOLDER)
+        os.makedirs(cache_dir, exist_ok=True)
+        df.to_csv(os.path.join(cache_dir, f"{key}.csv"), index=False)
+        df = df.set_index("timestamp")
+        store[key] = df
+        if refresh:
+            refreshed[key] = True
+        return df
+
+    def _extended_hours_bars(self, asset: Asset, quote: Asset) -> pd.DataFrame:
+        """Alpaca's real 1-minute stock bars outside the regular session, for the data window.
+
+        The window's minute series holds regular-session minutes only (reindexed onto the
+        market calendar and filled), which the clock and fills rely on. These bars are the
+        rest of what Alpaca returns for the same request (pre-market from 04:00, post-market
+        to 20:00 ET), kept as they are: nothing is reindexed or filled, so a minute without
+        trades has no bar. Cached on disk next to the window, keyed ``..._EXTENDED``.
+        """
+        key = self._get_asset_key(base_asset=asset, quote_asset=quote, timestep="minute") + "_EXTENDED"
+        store = self._state("_data_store", dict)
+        refreshed = self._state("_refreshed_keys", dict)
+        refresh = bool(getattr(self, "_refresh_cache", False)) and key not in refreshed
+        if not refresh and (key in store or self._load_ohlcv_into_data_store(key)):
+            return store[key]
+
+        start, end = self._data_datetime_start, self._data_datetime_end
+        client, request = self._history_request(
+            base_asset=asset,
+            quote_asset=quote,
+            timestep="minute",
+            data_datetime_start=start,
+            data_datetime_end=end,
+            auto_adjust=self._auto_adjust,
+        )
+        try:
+            bars = fetch_alpaca_bars(
+                client, request, lambda query: self._alpaca_request(client.get_stock_bars, query, what=key),
+                refresh=refresh,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Failed to fetch extended-hours bars for {key}: {exc}")
+
+        df = self._bars_to_frame(bars)
+        if not df.empty:
+            session_minutes = self._get_trading_times_for_timestep(pcal=self._trading_days, timestep="minute")
+            df = df[~df["timestamp"].isin(session_minutes)]
+        df = df[(df["timestamp"] >= start) & (df["timestamp"] <= end)].sort_values("timestamp")
 
         cache_dir = os.path.join(LUMIBOT_CACHE_FOLDER, self.CACHE_SUBFOLDER)
         os.makedirs(cache_dir, exist_ok=True)
