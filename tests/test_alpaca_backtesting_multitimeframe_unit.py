@@ -1586,3 +1586,30 @@ def test_plain_alpaca_backtest_has_no_routed_source(monkeypatch, tmp_path):
     source = AlpacaBacktesting(datetime_start=start, datetime_end=_NY_TZ.localize(datetime(2026, 8, 8)), config=None)
     assert source._other_source_routes == {}
     assert source._other_source_for(Asset("VIX", asset_type=Asset.AssetType.INDEX)) is None
+
+
+def test_alpaca_request_budget_is_configurable_for_paid_data_plans(monkeypatch, tmp_path):
+    """The client-side throttle defaults to the free plan (180/min); a paid plan raises it."""
+    _select_alpaca_through_environment(monkeypatch, tmp_path)
+    monkeypatch.delenv("ALPACA_MAX_REQUESTS_PER_MINUTE", raising=False)
+    window = dict(
+        datetime_start=_NY_TZ.localize(datetime(2026, 8, 3)),
+        datetime_end=_NY_TZ.localize(datetime(2026, 8, 7)),
+    )
+
+    assert AlpacaBacktesting(**window).ALPACA_MAX_REQUESTS_PER_MINUTE == 180
+    assert AlpacaBacktesting(**window, max_requests_per_minute=9000).ALPACA_MAX_REQUESTS_PER_MINUTE == 9000
+    monkeypatch.setenv("ALPACA_MAX_REQUESTS_PER_MINUTE", "5000")
+    assert AlpacaBacktesting(**window).ALPACA_MAX_REQUESTS_PER_MINUTE == 5000
+    assert AlpacaBacktesting(**window, max_requests_per_minute=300).ALPACA_MAX_REQUESTS_PER_MINUTE == 300
+    assert AlpacaBacktesting.ALPACA_MAX_REQUESTS_PER_MINUTE == 180  # the class default is untouched
+
+    # The throttle reads the instance budget: 3 per minute sleeps before the 4th request.
+    source = AlpacaBacktesting(**window, max_requests_per_minute=3)
+    sleeps = []
+    source._sleep = sleeps.append
+    for _ in range(3):
+        source._throttle_alpaca_requests()
+    assert sleeps == []
+    source._throttle_alpaca_requests()
+    assert len(sleeps) == 1 and 59 < sleeps[0] <= 60.1
